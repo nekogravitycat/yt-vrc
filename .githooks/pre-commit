@@ -1,0 +1,84 @@
+#!/bin/sh
+#
+# Blocks a commit unless staged Go files are gofmt-clean and the whole module passes the lint gate
+# (.golangci.yml) and go test. Enable with `make hooks`.
+#
+# Bypass with `git commit --no-verify` when you knowingly need to.
+
+set -e
+
+GO="${GO:-go}"
+GOLANGCI_LINT="${GOLANGCI_LINT:-golangci-lint}"
+
+red() { printf '\033[31m%s\033[0m\n' "$1"; }
+yellow() { printf '\033[33m%s\033[0m\n' "$1"; }
+green() { printf '\033[32m%s\033[0m\n' "$1"; }
+bold() { printf '\033[1m%s\033[0m\n' "$1"; }
+
+fail() {
+	red "pre-commit: $1"
+	exit 1
+}
+
+if ! command -v "$GO" >/dev/null 2>&1; then
+	fail "'$GO' not found in PATH."
+fi
+
+# --- gofmt (staged Go files only) ---------------------------------------------
+bold "pre-commit: gofmt"
+
+# ACMR skips deletions, whose paths no longer exist in the working tree.
+staged_go=$(git diff --cached --name-only --diff-filter=ACMR -z -- '*.go' |
+	tr '\0' '\n' | grep -v '^vendor/' || true)
+
+if [ -n "$staged_go" ]; then
+	# gofmt reads the working tree, so a file staged in a formatted state but
+	# since re-edited into an unformatted one is still reported. That is the
+	# safer direction to err in: it never lets unformatted code slip through.
+	unformatted=$(printf '%s\n' "$staged_go" | xargs gofmt -l)
+	if [ -n "$unformatted" ]; then
+		red "pre-commit: the following files are not gofmt-clean:"
+		printf '%s\n' "$unformatted" | sed 's/^/  /'
+		printf '\n'
+		printf 'Fix with:\n  gofmt -w %s\n' "$(printf '%s' "$unformatted" | tr '\n' ' ')"
+		exit 1
+	fi
+fi
+
+# --- lint gate ----------------------------------------------------------------
+# This replaces a separate `go vet` pass: govet is one of the linters .golangci.yml enables, and
+# running it twice only costs time. The gate covers the whole module, not just staged files — a
+# change that breaks a caller elsewhere is exactly what a staged-file-only check would miss.
+bold "pre-commit: golangci-lint run"
+
+# Missing tool is a hard failure, not a skip. A gate that silently disables itself on the one
+# machine that lacks the binary is worse than no gate: it reports success for an unchecked commit.
+if ! command -v "$GOLANGCI_LINT" >/dev/null 2>&1; then
+	red "pre-commit: '$GOLANGCI_LINT' not found in PATH."
+	printf '\n'
+	# The go install line is spelled out because make is not present on every dev machine here.
+	printf 'Install the pinned version with:\n  make lint-tools\nor directly:\n  %s install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@%s\n' \
+		"$GO" "$(sed -n 's/^GOLANGCI_LINT_VERSION ?= *//p' Makefile 2>/dev/null | tr -d '\r')"
+	exit 1
+fi
+
+# A version mismatch only warns. The pinned version defines what the gate MEANS, but blocking on it
+# would turn a routine tool upgrade into a wall no commit gets past — the failure mode this whole
+# setup exists to avoid. If an upgraded linter does report something new, this line explains why.
+# tr strips a trailing CR: this workspace mixes LF and CRLF checkouts, and one would make the
+# comparison below mismatch and print the warning on every single commit.
+pinned=$(sed -n 's/^GOLANGCI_LINT_VERSION ?= *//p' Makefile 2>/dev/null | tr -d '\r' || true)
+if [ -n "$pinned" ]; then
+	installed=$("$GOLANGCI_LINT" version --short 2>/dev/null || true)
+	if [ -n "$installed" ] && [ "v$installed" != "$pinned" ]; then
+		yellow "pre-commit: golangci-lint is v$installed but this repo pins $pinned (make lint-tools)."
+	fi
+fi
+
+"$GOLANGCI_LINT" run || fail "lint gate reported problems."
+
+# --- go test ------------------------------------------------------------------
+bold "pre-commit: go test ./..."
+"$GO" test ./... || fail "tests failed."
+
+green "pre-commit: all checks passed."
