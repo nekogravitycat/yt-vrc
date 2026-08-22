@@ -73,11 +73,11 @@ function Get-Redirect($path) { (& curl.exe -s -o NUL -w "%{redirect_url}" "$base
 # delivered as a playable message video. Real playback is distinguished
 # by where the redirect points.
 function Test-Played($path) {
-    # Follow every hop: a pasted URL redirects once for path cleaning
-    # before reaching the playlist, so the first Location is not the
-    # answer. A failure lands on a message video under /m/.
-    $eff = & curl.exe -sL -o NUL -w "%{url_effective}" "$base/$path"
-    return ($eff -notmatch "/m/") -and ($eff -match "master\.m3u8|\.mp4")
+    # Playlists are served inline now, so there is no redirect target to
+    # inspect. Both success and failure return 200 with a playlist; they
+    # differ in where the segments live -- a message video points under /m/.
+    $body = & curl.exe -sL "$base/$path"
+    return ($body -match "#EXTM3U") -and ($body -notmatch "/m/")
 }
 function Test-Blocked {
     $t = & curl.exe -s "$base/$VideoId`?debug=1"
@@ -182,33 +182,47 @@ try {
     $endpoints = @{ "h"="help"; "s"="status"; "l"="list"; "u"="not-implemented";
                     "nonsense"="unrecognised"; "aaaaaaaaaaa"="missing video" }
     foreach ($e in $endpoints.GetEnumerator()) {
-        $redir = Get-Redirect $e.Key
-        $isMsg = $redir -match "/m/[0-9a-f]+_hls/master.m3u8"
-        Check "$($e.Value) -> message video" $isMsg "redirect was '$redir'"
+        $body = & curl.exe -sL "$base/$($e.Key)"
+        $isMsg = ($body -match "#EXTM3U") -and ($body -match "/m/[0-9a-f]+_hls/")
+        Check "$($e.Value) -> message video" $isMsg "body was not a message playlist"
         if ($isMsg) {
             $p = & ffprobe -v error -show_entries format=duration `
-                 -show_entries stream=codec_name,codec_type,channels -of default=nw=1 $redir 2>&1
+                 -show_entries stream=codec_name,codec_type,channels -of default=nw=1 "$base/$($e.Key)" 2>&1
             Check "  $($e.Value) has video+audio" `
                   (($p -match "codec_name=h264") -and ($p -match "codec_name=aac")) "$p"
         }
     }
 
     Section "M2 - message video shape (spec 4.3.3)"
-    $hr = Get-Redirect "h"
-    $p  = & ffprobe -v error -show_entries format=duration -show_entries stream=width,height,channels `
-          -of default=nw=1 $hr 2>&1
+    $p = & ffprobe -v error -show_entries format=duration -show_entries stream=width,height,channels `
+         -of default=nw=1 "$base/h" 2>&1
     Check "resolution is 1280x720" (($p -match "width=1280") -and ($p -match "height=720")) "$p"
     Check "has stereo audio track" ($p -match "channels=2") "silent track missing - some players fail without one"
     $mdur = [double](($p | Select-String "duration=(.+)").Matches.Groups[1].Value)
     Check "duration in 10-15s band" (($mdur -ge 10) -and ($mdur -le 15.5)) "duration=$mdur"
+
+    Section "AVPro compatibility"
+    if (-not $skipVideo) {
+        $hdr = & curl.exe -s -o NUL -D - "$base/$VideoId"
+        Check "video URL answers 200, not a redirect" ($hdr -match "200 OK") "not a 200 response"
+        Check "video URL declares HLS content type" ($hdr -match "(?i)application/vnd.apple.mpegurl") "wrong content type"
+        $pl = & curl.exe -s "$base/$VideoId"
+        Check "playlist is EXT-X-VERSION 3" ($pl -match "EXT-X-VERSION:3") "AVPro prefers v3"
+        Check "segment URIs are absolute" ($pl -match "(?m)^/$VideoId") "segments not rewritten"
+    }
 
     Section "M2 - mp4 variant and debug view"
     Check "help as mp4"  ((Get-FinalCode "h.mp4") -eq "200") "got $(Get-FinalCode 'h.mp4')"
     $dbg = & curl.exe -s "$base/s?debug=1"
     Check "debug returns text" ($dbg -match "Service Status") "$dbg"
 
-    Section "Status codes still classified (spec 10)"
-    Check "missing video logs 404"   ((Get-Code "aaaaaaaaaaa") -eq "302" -or (Get-Code "aaaaaaaaaaa") -eq "404") "got $(Get-Code 'aaaaaaaaaaa')"
+    Section "Error classification (spec 10)"
+    # Message videos answer 200 by design: a player will not render the
+    # body of a 4xx, so an error video returning 404 would show nothing.
+    # The classification lives in the log and in ?debug=1 instead.
+    Check "error still answers playable 200" ((Get-Code "aaaaaaaaaaa") -eq "200") "got $(Get-Code 'aaaaaaaaaaa')"
+    $dbg = & curl.exe -s "$base/aaaaaaaaaaa?debug=1"
+    Check "debug view classifies the error" ($dbg -match "Video Unavailable") "$dbg"
     $logged = Get-Content $log -Raw
     Check "failure written to log" ($logged -match "prepare failed") "no prepare-failed entry in $log"
 }

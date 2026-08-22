@@ -89,16 +89,19 @@ func (s *Server) serveVideo(w http.ResponseWriter, r *http.Request, route Route)
 		s.deliver(w, r, presenter.PrepareError(route.VideoID, err), route.Spec, statusFor(err))
 		return
 	}
-	entry := ffmpeg.MessageEntrypoint(asset.Spec.Container)
-	if asset.Spec.Container == video.ContainerMP4 {
-		entry = "video.mp4"
-	}
-	// Deterministic, but kept short so a dropped artifact is re-prepared
-	// rather than redirected to for a year.
 	w.Header().Set("Cache-Control", "public, max-age=60")
-	// Redirect so the player resolves segment URLs against the
-	// artifact directory rather than the request path.
-	http.Redirect(w, r, "/"+string(asset.Key)+"/"+entry, http.StatusFound)
+
+	// Serve the playlist inline rather than redirecting to it. AVPro
+	// chooses its backend partly from the request URL, and a 302 whose
+	// body is text/html reads to it as an unplayable format -- browsers
+	// only succeed here because they follow redirects and sniff types.
+	// Segment URIs are rewritten to absolute paths so they still resolve
+	// against the artifact directory (spec §13.1 item 2).
+	if asset.Spec.Container == video.ContainerHLS {
+		s.servePlaylist(w, r, s.Play.Open, asset.Key, "/"+string(asset.Key)+"/")
+		return
+	}
+	s.serveFrom(w, r, s.Play.Open, asset.Key, "video.mp4")
 }
 
 // deliver renders a view and points the player at it.
@@ -128,9 +131,17 @@ func (s *Server) deliver(w http.ResponseWriter, r *http.Request, v message.View,
 		writeViewText(w, v)
 		return
 	}
-	http.Redirect(w, r,
-		"/"+messagePrefix+"/"+string(asset.Key)+"/"+ffmpeg.MessageEntrypoint(spec.Container),
-		http.StatusFound)
+	// Deliberately 200, whatever the classification. The body is the
+	// only thing the user can perceive, and a player refuses to render
+	// the body of a 4xx -- an error message video that will not play
+	// tells them nothing. The classification reaches the structured log
+	// and ?debug=1 instead (spec §10, docs/implementation.md §7.3).
+	if spec.Container == video.ContainerHLS {
+		s.servePlaylist(w, r, s.Messages.Open, asset.Key,
+			"/"+messagePrefix+"/"+string(asset.Key)+"/")
+		return
+	}
+	s.serveFrom(w, r, s.Messages.Open, asset.Key, ffmpeg.MessageEntrypoint(spec.Container))
 }
 
 type opener func(key video.CacheKey, name string) (io.ReadSeekCloser, time.Time, error)
@@ -219,3 +230,38 @@ func (d Defaults) spec() video.OutputSpec {
 }
 
 func errorIs(err, target error) bool { return errors.Is(err, target) }
+
+// servePlaylist serves an HLS playlist with its segment URIs rewritten
+// to absolute paths.
+//
+// ffmpeg writes segment names relative to the playlist ("seg_00000.ts"),
+// which only resolves correctly when the playlist is fetched from inside
+// the artifact directory. Serving it at the video URL instead means the
+// player would resolve them against the wrong base, so the URIs are made
+// absolute on the way out.
+func (s *Server) servePlaylist(w http.ResponseWriter, r *http.Request, open opener, key video.CacheKey, prefix string) {
+	f, modTime, err := open(key, ffmpeg.PlaylistName)
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	defer f.Close()
+
+	raw, err := io.ReadAll(f)
+	if err != nil {
+		http.Error(w, "read failed", http.StatusInternalServerError)
+		return
+	}
+	lines := strings.Split(string(raw), "\n")
+	for i, line := range lines {
+		t := strings.TrimSpace(line)
+		if t == "" || strings.HasPrefix(t, "#") {
+			continue
+		}
+		lines[i] = prefix + t
+	}
+	body := strings.Join(lines, "\n")
+
+	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+	http.ServeContent(w, r, ffmpeg.PlaylistName, modTime, strings.NewReader(body))
+}

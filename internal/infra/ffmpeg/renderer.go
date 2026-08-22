@@ -155,7 +155,6 @@ func (m *MessageRenderer) encode(ctx context.Context, frame, dir string, spec vi
 			"-f", "hls",
 			"-hls_time", "5",
 			"-hls_playlist_type", "vod",
-			"-hls_flags", "independent_segments",
 			"-hls_list_size", "0",
 			"-hls_segment_filename", filepath.Join(dir, "seg_%05d.ts"),
 			filepath.Join(dir, PlaylistName))

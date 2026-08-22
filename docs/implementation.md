@@ -352,3 +352,51 @@ metadata」。這對 metadata 成立，但對本實作的 `Resolver.Resolve` **�
 實機驗證（`scripts/verify.ps1`）：6 個併發請求同一支未快取影片 →
 記錄中 `resolved`、`downloaded`、`packaged` 各 1 次。**達成 spec §12 M5 的
 驗收條件**「5 個併發請求同一影片僅觸發一次 yt-dlp」。
+
+---
+
+## 10. AVPro 播放失敗的修正（2026-08-22）
+
+### 10.1 症狀
+
+VRChat 內 AVPro 回報 `Media cannot be played, maybe due to invalid format`，
+但相同網址於瀏覽器可正常播放。伺服器記錄**無任何錯誤**——請求成功、產物正確。
+
+### 10.2 三個原因
+
+瀏覽器會自動跟隨轉址並嗅探內容型別，AVPro 兩者都不做，因此差異只在交付方式：
+
+| # | 問題 | 修正 |
+|---|---|---|
+| 1 | 影片端點回傳 **302，且主體為 `text/html`** | 改為**直接內嵌回傳 playlist**，不再轉址 |
+| 2 | 網址**無副檔名**（`/dQw4w9WgXcQ`），AVPro 依網址判斷後端 | 同上；現在直接回傳 `application/vnd.apple.mpegurl` |
+| 3 | `EXT-X-VERSION:6` | 移除 `-hls_flags independent_segments` 後降為 **v3**，相容性最佳 |
+
+`independent_segments` 原本是 spec §6.4.3 為中途續接而設；該機制已因 §3 的
+架構修訂而不存在，故可安全移除。
+
+### 10.3 連帶調整
+
+playlist 直接於影片網址回傳後，ffmpeg 寫入的相對 segment 名稱
+（`seg_00000.ts`）會以錯誤的基準解析，因此 `servePlaylist` 於送出時將其
+改寫為絕對路徑 `/{cache_key}/seg_00000.ts`。
+
+### 10.4 訊息影片一律回傳 200
+
+先前為 302 導向，狀態碼可自由設定。改為內嵌回傳後，**非 200 的狀態會使
+播放器拒絕算繪主體**——一支播不出來的錯誤訊息影片毫無意義。
+
+因此所有訊息影片一律回傳 `200`，錯誤分類改由結構化記錄與 `?debug=1` 提供。
+這比 §7.3 的舊做法更貼近 spec §10「回應主體恆為媒體」的原則，但完全放棄了
+「狀態碼仍應正確」的部分。
+
+### 10.5 驗收腳本新增 AVPro 相容性檢查
+
+| 檢查 | 內容 |
+|---|---|
+| 不得轉址 | 影片網址須直接回應 200 |
+| 內容型別 | `application/vnd.apple.mpegurl` |
+| HLS 版本 | `EXT-X-VERSION:3` |
+| segment 路徑 | 已改寫為絕對路徑 |
+
+全套驗收現為 **50 項**。

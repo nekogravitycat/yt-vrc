@@ -54,7 +54,9 @@ func (p *HLSPackager) Package(ctx context.Context, res *video.Resolution, srcVid
 		"-f", "hls",
 		"-hls_time", fmt.Sprint(p.SegmentSeconds),
 		"-hls_playlist_type", "vod",
-		"-hls_flags", "independent_segments",
+		// EXT-X-INDEPENDENT-SEGMENTS is deliberately not set: it forces
+		// EXT-X-VERSION:6, and AVPro is happiest with version 3. It was
+		// only ever needed for the mid-stream resume this design dropped.
 		"-hls_list_size", "0",
 		"-hls_segment_filename", filepath.Join(destDir, "seg_%05d.ts"),
 		filepath.Join(destDir, PlaylistName),
