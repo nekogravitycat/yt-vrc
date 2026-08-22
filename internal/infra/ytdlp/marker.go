@@ -62,16 +62,17 @@ func (m *Manager) binaryFor(version string) string {
 func (m *Manager) setMarker(name, version string) error {
 	path := filepath.Join(m.Root, name)
 	tmp := path + ".tmp"
-	os.Remove(tmp)
+	_ = os.Remove(tmp) // clear a stale tmp from a previous crash, if any
 
 	target := filepath.Join(versionsDir, version)
 	if err := os.Symlink(target, tmp); err == nil {
 		if err := os.Rename(tmp, path); err == nil {
-			// Drop the other form so the two can never disagree.
-			os.Remove(path + ".txt")
+			// Best-effort: markerVersion prefers the symlink, so a leftover
+			// .txt is inert, not a source of disagreement.
+			_ = os.Remove(path + ".txt")
 			return nil
 		}
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 	}
 
 	tmpTxt := path + ".txt.tmp"
@@ -79,9 +80,14 @@ func (m *Manager) setMarker(name, version string) error {
 		return err
 	}
 	if err := os.Rename(tmpTxt, path+".txt"); err != nil {
-		os.Remove(tmpTxt)
+		_ = os.Remove(tmpTxt)
 		return err
 	}
-	os.Remove(path)
+	// CRITICAL: a leftover symlink from an earlier, symlink-capable run
+	// would take precedence over the .txt just written (markerVersion
+	// tries Readlink first) and point at a stale or deleted version.
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) && m.Log != nil {
+		m.Log.Error("remove stale marker symlink", "path", path, "err", err)
+	}
 	return nil
 }

@@ -54,5 +54,5 @@ func (s *HealthStore) Save(samples []health.Sample) {
 	if err := os.WriteFile(tmp, b, 0o644); err != nil {
 		return
 	}
-	os.Rename(tmp, s.path)
+	_ = os.Rename(tmp, s.path) // best-effort, consistent with the rest of Save
 }

@@ -161,7 +161,7 @@ func (s *FSStore) evict() {
 	s.mu.Unlock()
 
 	for _, a := range dropped {
-		os.RemoveAll(filepath.Join(s.root, string(a.Key)))
+		_ = os.RemoveAll(filepath.Join(s.root, string(a.Key))) // best-effort; index is already updated either way
 		if s.OnEvict != nil {
 			s.OnEvict(a)
 		}
@@ -219,7 +219,7 @@ func (s *FSStore) Open(key video.CacheKey, name string) (io.ReadSeekCloser, time
 	}
 	info, err := f.Stat()
 	if err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, time.Time{}, err
 	}
 	return f, info.ModTime(), nil

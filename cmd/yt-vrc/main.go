@@ -227,7 +227,11 @@ func run() error {
 			// gate as normal startup.
 			return err
 		}
-		defer gate.Close()
+		defer func() {
+			if err := gate.Close(); err != nil {
+				log.Error("gate close", "err", err)
+			}
+		}()
 		open, reason := gate.IsOpen(ctx)
 		log.Info("availability gate", "open", open, "source", reason.Source, "detail", reason.Detail)
 	}
@@ -239,7 +243,9 @@ func run() error {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		httpSrv.Shutdown(shutdownCtx)
+		if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+			log.Error("http shutdown", "err", err)
+		}
 	}()
 
 	log.Info("listening",
@@ -377,6 +383,6 @@ func clearDir(dir string) {
 		return
 	}
 	for _, e := range entries {
-		os.RemoveAll(filepath.Join(dir, e.Name()))
+		_ = os.RemoveAll(filepath.Join(dir, e.Name())) // best-effort
 	}
 }

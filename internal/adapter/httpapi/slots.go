@@ -155,5 +155,5 @@ func (t *slotTable) save(snapshot map[string]*slotEntry) {
 	if err := os.WriteFile(tmp, b, 0o644); err != nil {
 		return
 	}
-	os.Rename(tmp, t.path)
+	_ = os.Rename(tmp, t.path) // best-effort, consistent with the rest of save
 }

@@ -18,10 +18,10 @@ func writeEnv(t *testing.T, body string) string {
 func TestLoadDotEnvParsesTheFormsPeopleActuallyWrite(t *testing.T) {
 	p := writeEnv(t, "# a comment\n\nPLAIN=one\n  SPACED = two \nexport EXPORTED=three\nQUOTED=\"four\"\nSINGLE='five'\nEMPTY=\nnovalue\n")
 	t.Setenv("PLAIN", "")
-	os.Unsetenv("PLAIN")
+	_ = os.Unsetenv("PLAIN")
 	for _, k := range []string{"PLAIN", "SPACED", "EXPORTED", "QUOTED", "SINGLE", "EMPTY"} {
 		t.Setenv(k, "")
-		os.Unsetenv(k)
+		_ = os.Unsetenv(k)
 	}
 
 	if err := LoadDotEnv(p); err != nil {

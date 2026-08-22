@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 )
 
@@ -58,7 +57,7 @@ type probeOut struct {
 // probeCodecs builds the RFC 6381 codecs attribute from the real output,
 // so the master playlist describes what was actually produced.
 func probeCodecs(ctx context.Context, ffprobePath, dir string) (string, int, int, error) {
-	segs, err := filepath.Glob(filepath.Join(dir, "seg_*.ts"))
+	segs, err := filepath.Glob(filepath.Join(dir, segmentGlob))
 	if err != nil || len(segs) == 0 {
 		return "", 0, 0, fmt.Errorf("no segments to probe in %s", dir)
 	}
@@ -107,7 +106,7 @@ func avcCodec(profile string, level int) string {
 // estimateBandwidth reports the peak segment bitrate, which is what
 // BANDWIDTH is defined to carry.
 func estimateBandwidth(dir string, durationSec float64) int {
-	segs, _ := filepath.Glob(filepath.Join(dir, "seg_*.ts"))
+	segs, _ := filepath.Glob(filepath.Join(dir, segmentGlob))
 	var total, largest int64
 	for _, s := range segs {
 		if fi, err := os.Stat(s); err == nil {
@@ -135,13 +134,4 @@ func estimateBandwidth(dir string, durationSec float64) int {
 		return 2000000
 	}
 	return peak
-}
-
-// parseLevel is used where ffprobe reports level as a string.
-func parseLevel(s string) int {
-	n, err := strconv.Atoi(strings.TrimSpace(s))
-	if err != nil {
-		return 0
-	}
-	return n
 }

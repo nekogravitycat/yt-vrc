@@ -145,7 +145,7 @@ func (l *EventLog) load() {
 	if err != nil {
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
 	for sc.Scan() {
@@ -194,8 +194,8 @@ func (l *EventLog) appendLine(e event.Event) {
 	if err != nil {
 		return
 	}
-	defer f.Close()
-	f.Write(append(b, '\n'))
+	defer func() { _ = f.Close() }()
+	_, _ = f.Write(append(b, '\n')) // best-effort; rewrite() periodically reconciles from l.recent
 }
 
 func (l *EventLog) rewrite(events []event.Event) {
@@ -210,13 +210,17 @@ func (l *EventLog) rewrite(events []event.Event) {
 		if err != nil {
 			continue
 		}
-		w.Write(append(b, '\n'))
+		_, _ = w.Write(append(b, '\n')) // per-line marshal errors are skipped, not fatal
 	}
-	w.Flush()
+	// Flush and Close are checked: renaming a short-written tmp file over
+	// l.path would corrupt it, unlike appendLine's best-effort single write.
+	if err := w.Flush(); err != nil {
+		return
+	}
 	if err := f.Close(); err != nil {
 		return
 	}
-	os.Rename(tmp, l.path)
+	_ = os.Rename(tmp, l.path)
 }
 
 // Recent returns the newest events first.

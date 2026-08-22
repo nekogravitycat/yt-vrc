@@ -52,7 +52,7 @@ func newFakeGitHub(t *testing.T, latest string, versions ...string) *fakeGitHub 
 			http.NotFound(w, r)
 			return
 		}
-		fmt.Fprintf(w, `{"tag_name":%q}`, g.latest)
+		_, _ = fmt.Fprintf(w, `{"tag_name":%q}`, g.latest)
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		// /{owner}/{repo}/releases/download/{version}/{file}
@@ -77,9 +77,9 @@ func newFakeGitHub(t *testing.T, latest string, versions ...string) *fakeGitHub 
 				h := sha256.Sum256(rel.body)
 				sum = hex.EncodeToString(h[:])
 			}
-			fmt.Fprintf(w, "%s  yt-dlp\n%s  yt-dlp.exe\n", sum, sum)
+			_, _ = fmt.Fprintf(w, "%s  yt-dlp\n%s  yt-dlp.exe\n", sum, sum)
 		case "yt-dlp":
-			w.Write(rel.body)
+			_, _ = w.Write(rel.body)
 		default:
 			http.NotFound(w, r)
 		}

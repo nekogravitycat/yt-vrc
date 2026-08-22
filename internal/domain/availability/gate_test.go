@@ -209,7 +209,7 @@ func TestStartLoadsPersistedOverride(t *testing.T) {
 	if err := g.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
-	defer g.Close()
+	defer func() { _ = g.Close() }()
 
 	if open, _ := g.IsOpen(ctx); !open {
 		t.Fatal("an override saved before a restart must still apply after it")
@@ -270,7 +270,7 @@ func TestModePersistsAcrossRestart(t *testing.T) {
 	if err := g2.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
-	defer g2.Close()
+	defer func() { _ = g2.Close() }()
 	if g2.CurrentMode() != ModeOpen {
 		t.Fatalf("mode not restored on Start, got %q", g2.CurrentMode())
 	}
@@ -301,7 +301,7 @@ func TestTransitionsAreReported(t *testing.T) {
 	if err := g.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
-	defer g.Close()
+	defer func() { _ = g.Close() }()
 
 	s.set(false)
 	c.advance(11 * time.Minute)

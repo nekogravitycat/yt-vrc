@@ -272,7 +272,7 @@ func (s *Server) serveFrom(w http.ResponseWriter, r *http.Request, open opener, 
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	w.Header().Set("Cache-Control", cacheControl)
 
@@ -309,19 +309,21 @@ func statusFor(err error) int {
 	}
 }
 
+// writeViewText is best-effort: a write failure here means the client
+// already disconnected, and there is no response left to send instead.
 func writeViewText(w io.Writer, v message.View) {
-	io.WriteString(w, "["+string(v.Kind)+"] "+v.Title+"\n")
+	_, _ = io.WriteString(w, "["+string(v.Kind)+"] "+v.Title+"\n")
 	if v.Subtitle != "" {
-		io.WriteString(w, v.Subtitle+"\n")
+		_, _ = io.WriteString(w, v.Subtitle+"\n")
 	}
 	for _, row := range v.Rows {
-		io.WriteString(w, "  "+row.Label+"\t"+row.Value+"\n")
+		_, _ = io.WriteString(w, "  "+row.Label+"\t"+row.Value+"\n")
 	}
 	for _, line := range v.Lines {
-		io.WriteString(w, "  "+line+"\n")
+		_, _ = io.WriteString(w, "  "+line+"\n")
 	}
 	if v.Footer != "" {
-		io.WriteString(w, "\n"+v.Footer+"\n")
+		_, _ = io.WriteString(w, "\n"+v.Footer+"\n")
 	}
 }
 
@@ -370,7 +372,7 @@ func (s *Server) servePlaylist(w http.ResponseWriter, r *http.Request, open open
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	raw, err := io.ReadAll(f)
 	if err != nil {

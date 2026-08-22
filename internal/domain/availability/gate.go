@@ -198,7 +198,7 @@ func (g *Gate) SetMode(m AccessMode) {
 	// writers (SetMode, applyOverride) can't land out of order and
 	// silently restore stale state after a restart.
 	if g.ModeStore != nil {
-		g.ModeStore.Save(m)
+		_ = g.ModeStore.Save(m) // best-effort; a restart falls back to ModeDefault (see CLAUDE.md)
 	}
 }
 
@@ -258,7 +258,7 @@ func (g *Gate) applyOverride(o Override) {
 	}
 	// NOTE: persist while locked — same ordering guarantee as SetMode.
 	if g.Overrides != nil {
-		g.Overrides.Save(o)
+		_ = g.Overrides.Save(o) // best-effort; same fallback as ModeStore above
 	}
 	hook := g.OnTransition
 	g.mu.Unlock()

@@ -81,10 +81,12 @@ func TestSlotTableIsBounded(t *testing.T) {
 }
 
 func TestPathSlotIsStablePerPath(t *testing.T) {
-	if pathSlot("/nonsense") != pathSlot("/nonsense") {
+	a := pathSlot("/nonsense")
+	b := pathSlot("/nonsense")
+	if a != b {
 		t.Fatal("the same unrecognised path must map to the same slot")
 	}
-	if pathSlot("/nonsense") == pathSlot("/other") {
+	if a == pathSlot("/other") {
 		t.Fatal("different paths must not share a slot")
 	}
 }

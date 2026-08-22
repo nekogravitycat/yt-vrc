@@ -57,11 +57,11 @@ func (m *Manager) Install(ctx context.Context, version string, verify port.Toolc
 
 	dir := m.versionDir(version)
 	staging := dir + ".tmp"
-	os.RemoveAll(staging)
+	_ = os.RemoveAll(staging) // clear a stale staging dir from a previous failed attempt, if any
 	if err := os.MkdirAll(staging, 0o755); err != nil {
 		return fail(res, StageDownloading, err, start), err
 	}
-	defer os.RemoveAll(staging)
+	defer func() { _ = os.RemoveAll(staging) }()
 
 	step(StageDownloading)
 	res.Stage = StageDownloading
@@ -102,7 +102,7 @@ func (m *Manager) Install(ctx context.Context, version string, verify port.Toolc
 
 	step(StageSwitching)
 	res.Stage = StageSwitching
-	os.RemoveAll(dir)
+	_ = os.RemoveAll(dir) // a failure surfaces below: Rename onto a non-empty dir fails too
 	if err := os.Rename(staging, dir); err != nil {
 		return fail(res, StageSwitching, err, start), err
 	}
@@ -188,7 +188,7 @@ func (m *Manager) download(ctx context.Context, version, dest string) (string, e
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("downloading %s: %s", u, resp.Status)
 	}
@@ -230,7 +230,7 @@ func (m *Manager) verifyChecksum(ctx context.Context, version, sum string) error
 	if err != nil {
 		return fmt.Errorf("fetching checksums: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("fetching checksums: %s", resp.Status)
 	}
@@ -275,6 +275,6 @@ func (m *Manager) pruneOldVersions(keep ...string) {
 		if kept[e.Name()] {
 			continue
 		}
-		os.RemoveAll(filepath.Join(m.Root, versionsDir, e.Name()))
+		_ = os.RemoveAll(filepath.Join(m.Root, versionsDir, e.Name())) // best-effort prune
 	}
 }

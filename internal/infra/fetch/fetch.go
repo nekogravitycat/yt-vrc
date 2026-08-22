@@ -66,7 +66,7 @@ func (f *Fetcher) Fetch(ctx context.Context, t video.Track, dest string, onProgr
 	if err != nil {
 		return err
 	}
-	defer out.Close()
+	defer func() { _ = out.Close() }() // Sync below is what must succeed; Close after is best-effort
 	if err := out.Truncate(total); err != nil {
 		return err
 	}
@@ -153,7 +153,7 @@ func (f *Fetcher) chunkOnce(ctx context.Context, url string, out *os.File, start
 	if err != nil {
 		return 0, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// CRITICAL: a 200 means the server ignored Range and would stream at
 	// the throttled rate — reject it, don't silently accept.
@@ -182,8 +182,8 @@ func (f *Fetcher) probe(ctx context.Context, raw string) (string, int64, error) 
 	if err != nil {
 		return "", 0, err
 	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, io.LimitReader(resp.Body, 8))
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 8)) // drain for keep-alive reuse; best-effort
 
 	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
 		return "", 0, fmt.Errorf("probe failed: %s", resp.Status)

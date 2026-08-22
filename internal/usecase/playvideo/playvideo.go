@@ -278,7 +278,11 @@ func (u *UseCase) prepare(ctx context.Context, id video.ID, spec video.OutputSpe
 	if err != nil {
 		return nil, err
 	}
-	defer os.RemoveAll(work)
+	defer func() {
+		if err := os.RemoveAll(work); err != nil {
+			u.Log.Error("cleanup temp work dir", "dir", work, "err", err)
+		}
+	}()
 
 	srcVideo := filepath.Join(work, "video.mp4")
 	srcAudio := filepath.Join(work, "audio.m4a")
@@ -309,7 +313,9 @@ func (u *UseCase) prepare(ctx context.Context, id video.ID, spec video.OutputSpe
 	pkgStart := time.Now()
 	asset, err := pkg.Package(ctx, res, srcVideo, srcAudio, dir)
 	if err != nil {
-		os.RemoveAll(dir)
+		if rmErr := os.RemoveAll(dir); rmErr != nil {
+			u.Log.Error("cleanup failed package dir", "dir", dir, "err", rmErr)
+		}
 		return nil, err
 	}
 	asset.Key = key

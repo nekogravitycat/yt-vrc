@@ -63,7 +63,7 @@ func (m *MessageRenderer) Render(ctx context.Context, v message.View, spec video
 		return nil, err
 	}
 	if err := m.PNG.RenderPNG(v, f); err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, err
 	}
 	if err := f.Close(); err != nil {
@@ -71,10 +71,10 @@ func (m *MessageRenderer) Render(ctx context.Context, v message.View, spec video
 	}
 
 	if err := m.encode(ctx, frame, dir, spec); err != nil {
-		os.RemoveAll(dir)
+		_ = os.RemoveAll(dir)
 		return nil, err
 	}
-	os.Remove(frame)
+	_ = os.Remove(frame) // scratch input to encode; the rendered dir is what's kept
 
 	size, _ := dirSize(dir)
 	asset := &video.MediaAsset{
@@ -114,7 +114,7 @@ func (m *MessageRenderer) existing(dir, key string, spec video.OutputSpec) (*vid
 	}
 	size, _ := dirSize(dir)
 	now := time.Now()
-	os.Chtimes(dir, now, now) // refresh recency for pruning
+	_ = os.Chtimes(dir, now, now) // refresh recency for pruning; best-effort
 	return &video.MediaAsset{
 		Key:          video.CacheKey(key),
 		Duration:     time.Duration(m.Seconds) * time.Second,
@@ -194,7 +194,7 @@ func (m *MessageRenderer) Open(key video.CacheKey, name string) (io.ReadSeekClos
 	}
 	info, err := f.Stat()
 	if err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, time.Time{}, err
 	}
 	return f, info.ModTime(), nil
@@ -243,6 +243,6 @@ func (m *MessageRenderer) prune() {
 			kept++
 			continue
 		}
-		os.RemoveAll(filepath.Join(m.Dir, a.name))
+		_ = os.RemoveAll(filepath.Join(m.Dir, a.name)) // best-effort eviction
 	}
 }
