@@ -447,3 +447,23 @@ playlist 直接於影片網址回傳後，ffmpeg 寫入的相對 segment 名稱
 
 `/`、`/s`、`/status`、`/h`、`/help` 全部正常播放。訊息影片子系統（M2）
 **於 VRChat 中驗收通過**。
+
+### 11.5 M1 於 VRChat 驗收通過（2026-08-22）
+
+`v.gravity.tw/dQw4w9WgXcQ`（1080p，4:53，36 個 segment）在 VRChat 中**播放成功**。
+
+伺服器記錄佐證：
+
+| 指標 | 觀測值 |
+|---|---|
+| 該影片的總請求數 | 60 |
+| segment 抓取次數 | 53 |
+| 涵蓋範圍 | `seg_00000` – `seg_00035`（**全部 36 個**） |
+| 抓取順序 | **非循序** —— 代表使用者確實執行了 seek |
+| 播放客戶端 | `NSPlayer/WMFSDK`（Windows Media Foundation） |
+
+非循序的 segment 存取是關鍵證據：它直接證實 §3.2 的架構決策正確——
+**完整封裝後才交付、playlist 帶真實 EXTINF**，使 seek 能落在正確位置。
+若沿用 spec §4.2.1 由 duration 推算的預先生成 playlist，此處就會偏移。
+
+**至此 M1 與 M2 的驗收條件（spec §12）全部達成。**

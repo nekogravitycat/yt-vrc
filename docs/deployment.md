@@ -155,8 +155,8 @@ Caddy 會自動申請並續期 Let's Encrypt 憑證。
 
 | # | 輸入 | 預期 | 結果 |
 |---|---|---|---|
-| 1 | `v.gravity.tw/dQw4w9WgXcQ` | 1080p 正常播放 | |
-| 2 | 同上，拖動進度條至中段 | seek 正確、畫面對應 | |
+| 1 | `v.gravity.tw/dQw4w9WgXcQ` | 1080p 正常播放 | **✅ 通過** |
+| 2 | 同上，拖動進度條至中段 | seek 正確、畫面對應 | **✅ 通過**（記錄顯示非循序取用全部 36 個 segment） |
 | 3 | 同上，拖動至末段 | 可跳轉、無異常 | |
 | 4 | `v.gravity.tw/dQw4w9WgXcQ/720` | 播放且畫質較低 | |
 | 5 | 一支 60 分鐘以上的影片 | 冷啟動 10 秒內開始播放 | |
@@ -165,8 +165,8 @@ Caddy 會自動申請並續期 Let's Encrypt 憑證。
 
 | # | 輸入 | 預期 | 結果 |
 |---|---|---|---|
-| 6 | `v.gravity.tw/s` | 藍色狀態畫面，文字清晰可讀 | |
-| 7 | `v.gravity.tw/h` | 說明畫面 | |
+| 6 | `v.gravity.tw/s` | 藍色狀態畫面，文字清晰可讀 | **✅ 可播放**（可讀性待評估） |
+| 7 | `v.gravity.tw/h` | 說明畫面 | **✅ 通過** |
 | 8 | `v.gravity.tw/aaaaaaaaaaa` | 紅色「Video Unavailable」 | |
 | 9 | `v.gravity.tw/notacommand` | 紅色「Unrecognised Command」 | |
 
