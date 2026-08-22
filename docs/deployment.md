@@ -183,6 +183,28 @@ Caddy 會自動申請並續期 Let's Encrypt 憑證。
 | 5d | `v.gravity.tw/s` | 「Availability: open · manual」 | |
 | 5e | `v.gravity.tw/off` | 綠色「Override Cleared」，之後 5a 又回到離線 | |
 
+### 6.1b M4 驗收（熱更新與健康度）
+
+**前提**：必須以 `YTDLP_MODE=managed` 啟動，否則 `/u` 會回「yt-dlp Is Not
+Managed」。首次啟動會下載最新版 yt-dlp 至 `data/ytdlp/`。
+
+```powershell
+$env:YTDLP_MODE = "managed"
+go run .\cmd\yt-vrc
+```
+
+| # | 輸入 | 預期 | 結果 |
+|---|---|---|---|
+| 5f | `v.gravity.tw/s` | 出現 yt-dlp 版本與版齡、解析成功率兩列 | |
+| 5g | `v.gravity.tw/u` | 黃色「Upgrade Started」，顯示階段 | |
+| 5h | 數秒後再輸入 `/u` | 顯示進度，或已完成的結果 | |
+| 5i | 更新期間輸入任一影片網址 | 黃色「Updating」，**不是**「Service Offline」 | |
+| 5j | `v.gravity.tw/u/back` | 綠色「Rolled Back」，版本回到前一版 | |
+| 5k | 檢查 `data/ytdlp/` | `versions/` 下有兩個版本目錄，`current` 與 `previous` 指標存在 | |
+
+**已是最新版時** `/u` 應回藍色「Already Up To Date」而非啟動一次無謂的下載。
+要測真正的升級，可先手動把 `current` 指標改指向一個舊版本目錄。
+
 ### 6.2 M2 驗收
 
 | # | 輸入 | 預期 | 結果 |

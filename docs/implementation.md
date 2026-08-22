@@ -29,7 +29,7 @@
 |---|---|---|
 | `FFMPEG_PATH` | `ffmpeg` | ffmpeg 執行檔 |
 | `FFPROBE_PATH` | `ffprobe` | ffprobe 執行檔 |
-| `YTDLP_MODE` | `managed` | `managed` = 版本化目錄（spec §4.5.2）；`path` = 直接使用 PATH 上的 yt-dlp（開發用） |
+| `YTDLP_MODE` | `path` | `managed` = 版本化目錄（spec §4.5.2）；`path` = 直接使用 PATH 上的 yt-dlp。**預設為 `path`**（開發機的常態），容器部署須顯式設為 `managed`——見 §16.8 |
 
 ### 1.2 ToolchainManager 的跨平台處理
 
@@ -41,6 +41,10 @@ spec §4.5.2 以 symlink 做原子切換。Windows 建立 symlink 需要管理�
 - Windows：`current.txt` 純文字指標檔（寫入 `.tmp` 後 `os.Rename`，同樣是原子操作）
 
 兩者都滿足 spec §4.5.2「程式不快取解析結果，每次執行時重新解析」的要求。
+
+**M4 實作時的修正**：後端不再依平台選擇，而是**嘗試建立 symlink、失敗才退回
+文字指標檔**。在 Windows 上失敗的是權限而非平台，開發者模式開啟的機器應該
+拿到比較好的那一種。見 §16.5。
 
 ---
 
@@ -583,3 +587,143 @@ spec 要求超過 30 分鐘的影片以滑動視窗保留 segment，其餘可淘
 | `EVENT_LOG_ENTRIES` | `500` | `events.jsonl` 保留筆數 |
 | `MESSAGE_SLOTS` | `200` | slot 表上限 |
 | `YTDLP_CLIENTS` | `default,mweb,tv_embedded` | client fallback 鏈 |
+
+---
+
+## 16. M4 熱更新與健康度（2026-08-22）
+
+### 16.1 已實作
+
+| 元件 | 路徑 | 備註 |
+|---|---|---|
+| 健康度模型 | `internal/domain/health/` | 滾動視窗、成功率／中位數、spec §4.6 六項門檻評分 |
+| `ToolchainManager` 介面 | `internal/domain/port/toolchain.go` | 含 `ToolchainVerifier`（煙霧測試策略） |
+| 版本化目錄與原子切換 | `internal/infra/ytdlp/manager.go`、`marker.go`、`install.go` | spec §4.5.2、§4.5.3 |
+| 煙霧測試 | `internal/infra/ytdlp/smoketest.go` | 對固定影片清單實際 resolve |
+| 非受管模式 | `internal/infra/ytdlp/pathmanager.go` | `YTDLP_MODE=path` 時 `/u` 明確拒絕 |
+| 升級／回滾流程 | `internal/usecase/upgrade/` | 背景執行、維護模式、排空 |
+| 主動探測 | `internal/usecase/healthcheck/` | spec §4.6 的定期解析 |
+| 健康度持久化 | `internal/infra/state/health.go` | `/data/state/health.json`（spec §7.1） |
+| 磁碟可用空間 | `internal/infra/diskfree/` | Windows／Unix 兩份 build tag 實作 |
+| `/u`、`/u/back` 端點 | `internal/adapter/httpapi/command.go` | |
+
+### 16.2 決策：`/u` 背景執行而非阻塞
+
+一次升級需下載約 30 MB 並實際解析 3 支影片，估計 20–60 秒。若阻塞至完成，
+這個請求必須同時活過**兩個尚未量測的上限**——AVPro 的影片載入逾時
+（spec §13.1 第 4 項，至今未知）與 Cloudflare 免費方案的 100 秒來源逾時。
+播放器一旦放棄，使用者就無從得知版本到底換了沒有。
+
+因此 `/u` 立即回傳黃色「Upgrade Started」訊息影片，工作在背景進行；再次輸入
+`/u` 顯示目前階段（draining／checking／downloading／verifying／smoke test／
+switching），完成後 90 秒內顯示結果。**這沿用 spec §4.2.3 已為 MP4 冷啟動
+建立的「重新輸入同一網址看進度」互動模式**，不是新發明的語意。
+
+`resultLinger` 定為 90 秒：夠走回影片面板讀完結果，又短到 `/u` 仍是一個動詞
+而非一份報表。
+
+### 16.3 決策：新增 `/u/back` 手動回滾（超出 spec §4.1.3）
+
+spec §6.3.4 定義了 `Rollback()` 卻沒有對應端點。但煙霧測試只能證明
+「新版能解析這 3 支影片」；若新版通過測試卻在實際使用中出問題，沒有端點就
+只能離開 VR 去碰檔案系統。回滾本身只是切換一個指標檔，成本極低。
+
+**回滾不因煙霧測試失敗而中止。** 回滾正是「現行版本壞掉」時要用的手段，
+若因為舊版也測不過就拒絕，等於完全沒有退路——YouTube 端的破壞會讓所有版本
+同時失敗。測試結果只記錄為警告。
+
+`/u/back` 亦接受 `/u/rollback`、`/u/undo`。
+
+### 16.4 決策：主動探測每次只輪詢一支影片
+
+spec §4.6 要求每 6 小時對固定影片清單執行解析。若每次都跑完整份清單，
+以 3 支影片計為每支每天 4 次解析——而 §8.2 的實測正是「同一支影片當日
+十餘次解析」會觸發 `Sign in to confirm you're not a bot`。
+
+改為**每次 tick 只探測一支，輪流推進**，同一支影片降至約每天 1.3 次。
+探測只做 resolve 不下載，流量遠小於 §8.2 的觸發條件。
+
+探測結果與使用者請求的解析共用同一個滾動視窗（spec §4.6 要求兩者都納入）。
+
+### 16.5 跨平台的 current 指標：嘗試 symlink 再退回
+
+implementation.md §1.2 原本規劃依平台選擇後端。實作改為**嘗試建立 symlink，
+失敗才退回 `current.txt`**——在 Windows 上失敗的是權限而不是平台，開發者模式
+開啟的機器應該拿到比較好的那一種。兩種形式都以「寫入 `.tmp` 後 `rename`」
+達成原子性，讀取時 symlink 優先，寫入成功後刪除另一種形式以免兩者不一致。
+
+### 16.6 下載改為 SHA-256 校驗（強化 spec §4.5.3 步驟 5）
+
+spec 要求「驗證檔案大小與可執行性」。但被截斷的代理回應同樣有合理的大小、
+同樣可執行。改為比對 release 一併發布的 `SHA2-256SUMS`，並額外執行
+`--version` 確認回報的版號與 tag 相符（nightly 版號較長，故接受互為前綴）。
+
+### 16.7 `/s` 版面重排
+
+新增的 yt-dlp 版本與解析成功率必須進入 `/s`，但畫面只容得下約 6 行
+（`headerH` 132 + subtitle 74，行高 56，下限 600 px）。因此：
+
+- **移除** 「Default output」一列，改併入副標題（它是靜態設定，從不變動）
+- **磁碟可用空間只在低於門檻時才佔一列**——沒在告警的空間不值得一行
+- 標題列顏色改為跟隨**最差的指標**而非只看閘門：這是整個畫面唯一能隔著
+  房間讀到的部分
+
+「no samples yet」與「0%」刻意區分：全新啟動的服務是**沒有證據**，
+不等於證據顯示它壞了。
+
+### 16.8 `YTDLP_MODE=path` 下的行為
+
+開發機預設 `path`（走 PATH 上的 yt-dlp）。此模式下：
+
+- `/s` 照常顯示版本、版齡與「有新版可用」——這些資訊仍然有用
+- `/u` 回傳橘色「yt-dlp Is Not Managed」，說明服務不會替換一個不是它安裝的
+  二進位檔，而不是在下載流程深處失敗
+
+容器部署應設 `YTDLP_MODE=managed`。首次啟動會下載最新版至 volume
+（spec §9.1「不打包進映像」）；**bootstrap 失敗不阻擋啟動**，僅記錄錯誤並
+退回 PATH——因為 GitHub 一時不通而讓整個服務起不來，比起讓管理端點活著
+解釋問題要糟。
+
+### 16.9 Resolver 改用 `Locate` 回呼
+
+`ytdlp.Resolver` 原本持有固定的 `BinPath`。改為可選的 `Locate func() string`，
+每次解析重新呼叫。這是 spec §4.5.2「程式不快取解析結果」在呼叫端的落實——
+否則熱更新要等到下次重啟才生效，正是版本化目錄要避免的事。
+
+### 16.10 排空與維護模式
+
+- 維護旗標以 `atomic.Bool` 實作（spec §6.4.4），影片端點在**檢查閘門之前**
+  先看它：更新中的不可用是可以等的，回「服務離線」會把使用者導向 `/on` 去
+  修一個沒壞的東西
+- 排空以輪詢 `ActiveJobs()` 實作而非條件變數：這個等待每年只發生幾次，
+  不值得在請求路徑上加同步
+- **排空逾時不中止升級**。已經啟動的工作握著它當時取得的執行檔路徑，
+  切換只影響下一次 resolve
+
+### 16.11 尚未完成
+
+M4 的程式碼已通過 `go build`、`go vet`、Linux 交叉編譯與現有全部測試，
+但**以下驗證尚未進行**：
+
+1. **新程式碼沒有單元測試**——`health` 的門檻與視窗、`ytdlp.Manager` 的
+   安裝／煙霧測試失敗不切換／回滾、`upgrade` 的併發 Trigger 與維護旗標
+   生命週期。`ytdlp.Manager` 需要先加入三個測試接縫（`Version` 回呼、
+   `APIBase`、`DownloadBase`）才能在不碰網路、不執行真實二進位檔的情況下測試
+2. **`scripts/verify.ps1` 未加入 M4 檢查**（目前仍為 72 項）
+3. **從未執行過真實的熱更新**——spec §12 的 M4 驗收條件
+   「容器不重啟的情況下完成 yt-dlp 版本升級與回滾」尚未達成。需以
+   `YTDLP_MODE=managed` 實際跑一次 `/u` 與 `/u/back`
+
+### 16.12 新增的設定
+
+| 變數 | 預設 | 說明 |
+|---|---|---|
+| `YTDLP_MODE` | `path` | `managed` 啟用版本化目錄與 `/u`；容器應設此值 |
+| `YTDLP_ASSET` | 依平台 | Windows `yt-dlp.exe`，其餘 `yt-dlp`（zipapp）。**不要在 Alpine 上用 `yt-dlp_linux`**，它連結 glibc，在 musl 上起不來 |
+| `YTDLP_AUTO_UPGRADE` | `false` | 排程檢查是否也自動執行升級 |
+| `YTDLP_CHECK_INTERVAL` | `24h` | 版本檢查週期；啟動時先檢查一次 |
+| `YTDLP_STALE_DAYS` | `30` | 版齡警示門檻；嚴重門檻為其 3 倍 |
+| `UPGRADE_DRAIN_TIMEOUT` | `60s` | 排空等待上限（spec §4.5.3 步驟 2） |
+| `UPGRADE_TIMEOUT` | `10m` | 單次升級的總上限 |
+| `HEALTH_PROBE_INTERVAL` | `6h` | 主動探測週期 |
+| `HEALTH_PROBE_VIDEOS` | `dQw4w9WgXcQ,NJ1tne9u8YM,BGXOYfZMR0w` | 探測與煙霧測試共用的影片清單 |

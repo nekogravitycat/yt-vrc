@@ -17,6 +17,12 @@ import (
 
 type Resolver struct {
 	BinPath string
+	// Locate, when set, supersedes BinPath and is consulted on every
+	// resolve. A hot upgrade takes effect by moving a marker on disk
+	// (spec §4.5.2), so caching the path here would keep the old
+	// version live until the next restart -- the exact thing the
+	// versioned directory exists to avoid.
+	Locate  func() string
 	Proxy   string // optional egress proxy for metadata only (spec §3.1)
 	Timeout time.Duration
 	// Clients is the ordered list of YouTube player clients to try.
@@ -36,6 +42,16 @@ type Resolver struct {
 
 // DefaultClients is the fallback chain used when none is configured.
 var DefaultClients = []string{"default", "mweb", "tv_embedded"}
+
+// bin resolves the executable to run for this attempt.
+func (r *Resolver) bin() string {
+	if r.Locate != nil {
+		if p := r.Locate(); p != "" {
+			return p
+		}
+	}
+	return r.BinPath
+}
 
 func (r *Resolver) clients() []string {
 	if len(r.Clients) == 0 {
@@ -130,7 +146,7 @@ func (r *Resolver) resolveWith(ctx context.Context, id video.ID, spec video.Outp
 	}
 	args = append(args, "https://www.youtube.com/watch?v="+id.String())
 
-	cmd := exec.CommandContext(ctx, r.BinPath, args...)
+	cmd := exec.CommandContext(ctx, r.bin(), args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

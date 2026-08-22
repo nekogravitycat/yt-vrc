@@ -12,12 +12,14 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/nekogravitycat/yt-vrc/internal/adapter/httpapi"
 	"github.com/nekogravitycat/yt-vrc/internal/domain/availability"
 	"github.com/nekogravitycat/yt-vrc/internal/domain/event"
+	"github.com/nekogravitycat/yt-vrc/internal/domain/health"
 	"github.com/nekogravitycat/yt-vrc/internal/domain/port"
 	"github.com/nekogravitycat/yt-vrc/internal/domain/video"
 	"github.com/nekogravitycat/yt-vrc/internal/infra/config"
@@ -28,7 +30,9 @@ import (
 	"github.com/nekogravitycat/yt-vrc/internal/infra/state"
 	"github.com/nekogravitycat/yt-vrc/internal/infra/store"
 	"github.com/nekogravitycat/yt-vrc/internal/infra/ytdlp"
+	"github.com/nekogravitycat/yt-vrc/internal/usecase/healthcheck"
 	"github.com/nekogravitycat/yt-vrc/internal/usecase/playvideo"
+	"github.com/nekogravitycat/yt-vrc/internal/usecase/upgrade"
 )
 
 // version is overridden at build time with -ldflags.
@@ -73,15 +77,31 @@ func run() error {
 			Summary: "evicted to stay under the cache limit", Detail: a.Title})
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	toolchain := buildToolchain(ctx, cfg, log)
+
+	healthStore, err := state.NewHealthStore(cfg.StateDir())
+	if err != nil {
+		return err
+	}
+	recorder := &health.Recorder{Persist: healthStore.Save}
+	recorder.Restore(healthStore.Load())
+
+	resolver := &ytdlp.Resolver{
+		// Locate, not a fixed path: a hot upgrade moves a marker on
+		// disk and the next resolve must pick it up (spec §4.5.2).
+		Locate:  toolchain.BinaryPath,
+		Proxy:   os.Getenv("RESOLVER_PROXY"),
+		Timeout: cfg.ResolveTimeout,
+		Clients: cfg.YtdlpClients,
+		Log:     log,
+	}
+
 	play := &playvideo.UseCase{
-		Resolver: &ytdlp.Resolver{
-			BinPath: cfg.YtdlpPath,
-			Proxy:   os.Getenv("RESOLVER_PROXY"),
-			Timeout: cfg.ResolveTimeout,
-			Clients: cfg.YtdlpClients,
-			Log:     log,
-		},
-		Fetcher: fetch.New(cfg.FetchWorkers, cfg.FetchChunkBytes),
+		Resolver: resolver,
+		Fetcher:  fetch.New(cfg.FetchWorkers, cfg.FetchChunkBytes),
 		Packagers: map[video.Container]port.Packager{
 			video.ContainerHLS: &ffmpeg.HLSPackager{
 				FFmpegPath:     cfg.FFmpegPath,
@@ -95,6 +115,37 @@ func run() error {
 		PrepareTimeout: cfg.PrepareTimeout,
 		TempDir:        tmp,
 		MaxJobs:        cfg.MaxConcurrentJobs,
+		Health:         recorder,
+	}
+
+	probeVideos := parseVideoIDs(cfg.HealthProbeVideos, log)
+	upgrader := &upgrade.UseCase{
+		Tool: toolchain,
+		Verifier: &ytdlp.SmokeTester{
+			Videos:  probeVideos,
+			Quality: cfg.DefaultQuality,
+			Timeout: cfg.ResolveTimeout,
+			Proxy:   os.Getenv("RESOLVER_PROXY"),
+			Clients: cfg.YtdlpClients,
+			Log:     log,
+		},
+		Drain:         play.Drain,
+		DrainTimeout:  cfg.UpgradeDrainTimeout,
+		Timeout:       cfg.UpgradeTimeout,
+		CheckInterval: cfg.YtdlpCheckInterval,
+		Auto:          cfg.YtdlpAutoUpgrade,
+		Events:        events,
+		Log:           log,
+	}
+
+	probe := &healthcheck.Probe{
+		Resolver: resolver,
+		Recorder: recorder,
+		Videos:   probeVideos,
+		Quality:  cfg.DefaultQuality,
+		Interval: cfg.HealthProbeInterval,
+		Events:   events,
+		Log:      log,
 	}
 
 	gate, err := buildGate(cfg, log, events)
@@ -129,6 +180,11 @@ func run() error {
 		Events:          events,
 		OverrideTTL:     cfg.GateOverrideTTL,
 		CacheLimitBytes: cfg.CacheMaxBytes,
+		Upgrade:         upgrader,
+		Toolchain:       toolchain,
+		Health:          recorder,
+		Thresholds:      thresholds(cfg),
+		DataDir:         cfg.DataDir,
 	}
 	// Nil rather than a typed nil: the HTTP layer checks the interface
 	// against nil to decide whether the gate applies at all.
@@ -146,9 +202,6 @@ func run() error {
 		WriteTimeout:      cfg.PrepareTimeout + time.Minute,
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
 	if gate != nil {
 		if err := gate.Start(ctx); err != nil {
 			// A source that will not start is worth failing loudly for:
@@ -161,6 +214,9 @@ func run() error {
 		log.Info("availability gate", "open", open, "source", reason.Source, "detail", reason.Detail)
 	}
 
+	go upgrader.Run(ctx)
+	go probe.Run(ctx)
+
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -170,13 +226,70 @@ func run() error {
 
 	log.Info("listening",
 		"addr", cfg.ListenAddr, "version", version,
-		"data", cfg.DataDir, "ffmpeg", cfg.FFmpegPath, "ytdlp", cfg.YtdlpPath)
+		"data", cfg.DataDir, "ffmpeg", cfg.FFmpegPath,
+		"ytdlp", toolchain.BinaryPath(), "ytdlp_managed", toolchain.Managed())
 
 	if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
 	log.Info("stopped")
 	return nil
+}
+
+// buildToolchain decides how yt-dlp is obtained (spec §4.5.2).
+//
+// managed mode owns a versioned directory on the volume and can replace
+// the binary while running; path mode uses whatever is on PATH, which is
+// how the dev machine runs and why /u refuses there rather than
+// replacing a binary this service did not install.
+func buildToolchain(ctx context.Context, cfg *config.Config, log *slog.Logger) port.ToolchainManager {
+	if !strings.EqualFold(cfg.YtdlpMode, "managed") {
+		return &ytdlp.PathManager{Bin: cfg.YtdlpPath}
+	}
+	m := &ytdlp.Manager{
+		Root:     filepath.Join(cfg.DataDir, "ytdlp"),
+		Asset:    cfg.YtdlpAsset,
+		Fallback: cfg.YtdlpPath,
+		Log:      log,
+	}
+	// Deliberately non-fatal. The image ships no yt-dlp (spec §9.1), so
+	// a fresh volume needs this download -- but refusing to start
+	// because GitHub was briefly unreachable would take down a service
+	// whose management endpoints could have explained the problem.
+	if err := m.Ensure(ctx); err != nil {
+		log.Error("yt-dlp bootstrap failed; falling back to PATH", "err", err, "fallback", cfg.YtdlpPath)
+	}
+	return m
+}
+
+// thresholds turns the configurable part of spec §4.6 into domain
+// thresholds. Only the staleness point is configurable; the rest are
+// fixed because they describe the service rather than the deployment.
+func thresholds(cfg *config.Config) health.Thresholds {
+	t := health.DefaultThresholds
+	if cfg.YtdlpStaleDays > 0 {
+		t.StaleAge = time.Duration(cfg.YtdlpStaleDays) * 24 * time.Hour
+		if t.CriticalAge < t.StaleAge {
+			t.CriticalAge = 3 * t.StaleAge
+		}
+	}
+	return t
+}
+
+// parseVideoIDs validates the probe and smoke-test list, dropping and
+// reporting anything malformed rather than failing startup over a typo
+// in a diagnostic setting.
+func parseVideoIDs(raw []string, log *slog.Logger) []video.ID {
+	out := make([]video.ID, 0, len(raw))
+	for _, s := range raw {
+		id, err := video.ParseID(strings.TrimSpace(s))
+		if err != nil {
+			log.Warn("ignoring invalid health probe video id", "value", s)
+			continue
+		}
+		out = append(out, id)
+	}
+	return out
 }
 
 // buildGate assembles the availability gate from whatever sources are

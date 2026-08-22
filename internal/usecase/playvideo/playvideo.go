@@ -35,6 +35,9 @@ type UseCase struct {
 	// requests for one video, and this stops a burst of *different*
 	// videos turning into a burst of yt-dlp calls from one IP.
 	MaxJobs int
+	// Health receives the outcome of every resolve, feeding the rolling
+	// success rate /s reports (spec §4.6). Optional.
+	Health port.ResolveRecorder
 
 	// Two layers of de-duplication (spec §4.7.3). This is not merely an
 	// optimisation: YouTube rate-limits repeated resolution of one
@@ -85,6 +88,27 @@ func (u *UseCase) semaphore() chan struct{} {
 
 // ActiveJobs reports how many preparations are running, for /s.
 func (u *UseCase) ActiveJobs() int { return len(u.semaphore()) }
+
+// Drain waits until no preparation is running, so a yt-dlp swap does
+// not land underneath a job that is midway through using it
+// (spec §4.5.3 step 2).
+//
+// Polling rather than signalling is deliberate: the wait happens once
+// per upgrade, and a condition variable here would add synchronisation
+// to the request path to serve a path that runs a few times a year.
+func (u *UseCase) Drain(ctx context.Context) error {
+	const poll = 250 * time.Millisecond
+	for {
+		if u.ActiveJobs() == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(poll):
+		}
+	}
+}
 
 // Prepare returns a ready artifact for id, packaging it if the cache
 // misses. Concurrent callers for the same artifact share one job.
@@ -214,6 +238,9 @@ func (u *UseCase) resolve(ctx context.Context, id video.ID, spec video.OutputSpe
 	ch := u.resolveGroup.DoChan(key, func() (any, error) {
 		start := time.Now()
 		res, err := u.Resolver.Resolve(context.WithoutCancel(ctx), id, spec)
+		if u.Health != nil {
+			u.Health.RecordResolve(err == nil, time.Since(start), false)
+		}
 		if err != nil {
 			return nil, err
 		}

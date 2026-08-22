@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/nekogravitycat/yt-vrc/internal/domain/availability"
+	"github.com/nekogravitycat/yt-vrc/internal/domain/health"
 	"github.com/nekogravitycat/yt-vrc/internal/domain/message"
 	"github.com/nekogravitycat/yt-vrc/internal/domain/video"
 )
@@ -115,13 +116,14 @@ func Help(version string) message.View {
 		Kind:     message.KindStatus,
 		Title:    "yt-vrc — Help",
 		Subtitle: "Paste a YouTube link, or use a command",
+		// Six lines is what the frame holds, so commands are paired
+		// rather than listed one per line.
 		Lines: []string{
-			"/{id}   play · /{id}/720 cap quality · /{id}.mp4 force MP4",
-			"/s   status         /l   list cache",
-			"/h   this help      /e   recent events",
-			"/on  force online   /off automatic again",
-			"/i/{id} info        /d/{id} drop from cache",
-			"/p   purge cache (asks for confirmation)",
+			"/{id}  play · /{id}/720 quality · /{id}.mp4 MP4",
+			"/s status       /l list cache    /e recent events",
+			"/h this help    /u update yt-dlp /u/back undo it",
+			"/on force online                 /off automatic",
+			"/i/{id} info    /d/{id} drop     /p purge cache",
 		},
 		Footer: "v" + version + " · a full youtube.com or youtu.be URL also works",
 	}
@@ -141,11 +143,32 @@ type StatusData struct {
 	MaxJobs    int
 	Gate       availability.Reason
 	Sources    []availability.SourceStatus
+
+	// Toolchain and health (spec §4.6).
+	YtdlpVersion string
+	YtdlpErr     string
+	YtdlpAge     time.Duration
+	YtdlpAgeOK   bool
+	YtdlpLatest  string
+	Managed      bool
+	Upgrading    bool
+	Resolve      health.Stats
+	DiskFree     int64
+	Report       health.Report
 }
 
 // Status summarises the service (spec §4.6).
+//
+// The frame holds about six rows, so this is a ranking exercise rather
+// than a dump: what is shown is what changes, what breaks, and what a
+// user can act on from inside VRChat. Static configuration is not on
+// that list and lives in the subtitle.
 func Status(d StatusData) message.View {
-	v := message.View{Kind: message.KindStatus, Title: "Service Status", Subtitle: "yt-vrc " + d.Version}
+	v := message.View{
+		Kind:     message.KindStatus,
+		Title:    "Service Status",
+		Subtitle: fmt.Sprintf("yt-vrc %s · default %dp %s", d.Version, d.Default.Quality, strings.ToUpper(string(d.Default.Container))),
+	}
 
 	gate := "closed"
 	if d.Gate.Open {
@@ -158,9 +181,6 @@ func Status(d StatusData) message.View {
 	// video endpoint stop working, and the only one a user can change
 	// from inside VRChat.
 	v.AddRow("Availability", gate)
-	if !d.Gate.Open {
-		v.Kind = message.KindWarning
-	}
 	for _, src := range d.Sources {
 		state := "offline"
 		switch {
@@ -175,16 +195,82 @@ func Status(d StatusData) message.View {
 		v.AddRow("  "+src.Name, state)
 	}
 
-	v.AddRow("Default output", fmt.Sprintf("%dp %s", d.Default.Quality, strings.ToUpper(string(d.Default.Container))))
+	v.AddRow("yt-dlp", ytdlpSummary(d))
+	v.AddRow("Resolves", resolveSummary(d))
+
 	cache := fmt.Sprintf("%d items · %s", d.CacheItems, humanBytes(d.CacheBytes))
 	if d.CacheLimit > 0 {
 		cache += fmt.Sprintf(" / %s", humanBytes(d.CacheLimit))
+		if d.Report.Cache != health.LevelOK {
+			cache += " (full)"
+		}
 	}
 	v.AddRow("Cache", cache)
 	v.AddRow("Jobs", fmt.Sprintf("%d of %d running", d.ActiveJobs, d.MaxJobs))
+	// Disk earns a row only when it is running out. Free space is not
+	// interesting until it is the reason artifacts start truncating,
+	// and the frame has no room for rows that are always fine.
+	if d.Report.Disk != health.LevelOK {
+		v.AddRow("Disk free", humanBytes(d.DiskFree)+" (low)")
+	}
 
-	v.Footer = "/l cache · /e events · /h help"
+	// The header colour is the only part of this frame readable across
+	// a room, so it tracks the worst metric rather than just the gate.
+	switch {
+	case d.Report.Overall == health.LevelCritical:
+		v.Kind = message.KindError
+	case !d.Gate.Open, d.Report.Overall == health.LevelWarning:
+		v.Kind = message.KindWarning
+	}
+
+	v.Footer = "/l cache · /e events · /u upgrade · /h help"
+	if d.Upgrading {
+		v.Kind = message.KindProgress
+		v.Footer = "an upgrade is running · /u for progress"
+	}
 	return v
+}
+
+func ytdlpSummary(d StatusData) string {
+	if d.YtdlpVersion == "" {
+		if d.YtdlpErr != "" {
+			return "unavailable: " + truncate(d.YtdlpErr, 40)
+		}
+		return "unknown"
+	}
+	s := d.YtdlpVersion
+	if d.YtdlpAgeOK {
+		s += fmt.Sprintf(" · %dd old", int(d.YtdlpAge.Hours()/24))
+	}
+	switch {
+	case d.YtdlpLatest != "" && d.YtdlpLatest != d.YtdlpVersion:
+		// Only worth saying when something can be done about it.
+		if d.Managed {
+			s += " · /u to update"
+		} else {
+			s += " · " + d.YtdlpLatest + " available"
+		}
+	case !d.Managed:
+		s += " · unmanaged"
+	}
+	return s
+}
+
+func resolveSummary(d StatusData) string {
+	rate := d.Resolve.SuccessRate()
+	if rate < 0 {
+		// Distinct from 0%: nothing has been asked of yt-dlp yet, which
+		// is not the same as everything having failed.
+		return "no samples yet"
+	}
+	s := fmt.Sprintf("%.0f%% of %d", rate*100, d.Resolve.Samples)
+	if d.Resolve.Median > 0 {
+		s += fmt.Sprintf(" · %s median", d.Resolve.Median.Round(100*time.Millisecond))
+	}
+	if d.Report.Latency != health.LevelOK {
+		s += " (slow)"
+	}
+	return s
 }
 
 // PurgeConfirm hands out the token that authorises a purge.

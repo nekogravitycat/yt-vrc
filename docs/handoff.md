@@ -1,6 +1,6 @@
 # 專案現況與交接
 
-**更新於**：2026-08-22
+**更新於**：2026-08-22（M4 程式碼完成）
 **用途**：讓新的工作階段快速上手。閱讀順序建議為本文件 → `implementation.md` → `spec.md`。
 
 ---
@@ -23,15 +23,32 @@
 | M1 播放路徑 | **完成，VRChat 驗收通過** | 播放與 seek 均已實測（implementation.md §11.5） |
 | M2 訊息影片 | **完成，VRChat 驗收通過** | 顯示文字為英文 |
 | M3 上線閘門 | **完成，待 VRChat 實測** | Discord 實作未經真實憑證驗證（implementation.md §12.4） |
-| M4 熱更新與健康度 | 未開始 | 下一個工作項目 |
+| M4 熱更新與健康度 | **程式碼完成，完全未經驗證** | 見 §2.1——沒有單元測試、驗收腳本未涵蓋、從未跑過一次真實升級 |
 | M5 韌性與快取 | **完成**（滑動視窗刻意廢除） | singleflight、`MAX_CONCURRENT_JOBS`、LRU、client fallback、`/l` `/e` `/p` `/d` `/i` 全數完成；廢除理由見 implementation.md §14.2 |
 | M6 MP4 與預熱 | 未開始 | 訊息影片已支援 MP4，但影片本體的 MP4 packager 未做 |
 
 另已修正 implementation.md §11.3 的訊息影片網址問題（穩定 slot 路徑，見 §13）。
 
-程式碼規模：30 個 Go 檔、約 4,500 行。測試：`internal/adapter/httpapi`、
+程式碼規模：48 個 Go 檔、約 7,700 行。測試：`internal/adapter/httpapi`、
 `internal/domain/availability`、`internal/infra/store`、`internal/usecase/playvideo`，
-`-race` 下全過。`scripts/verify.ps1` 共 72 項，全過。
+`-race` 下全過。`scripts/verify.ps1` 共 72 項，全過（**尚未涵蓋 M4**）。
+
+### 2.1 M4 的驗證缺口（動手前先讀）
+
+M4 的程式碼通過 `go build`、`go vet`、Linux 交叉編譯與現有全部測試，
+但**沒有任何一行 M4 的行為被驗證過**：
+
+1. **新程式碼零單元測試** —— `internal/domain/health`、`internal/infra/ytdlp`
+   （manager／marker／install／smoketest）、`internal/usecase/upgrade`、
+   `internal/usecase/healthcheck` 全部沒有測試檔
+2. **`ytdlp.Manager` 目前不可測** —— 它會真的打 GitHub、真的執行下載回來的
+   二進位檔。要測必須先加三個接縫：`Version` 回呼（取代 `binaryVersion`）、
+   `APIBase`、`DownloadBase`
+3. **從未執行過真實升級** —— spec §12 的 M4 驗收條件
+   「容器不重啟的情況下完成 yt-dlp 版本升級與回滾」**未達成**
+4. **`scripts/verify.ps1` 未加入 M4 檢查**
+
+換句話說：M4 目前的狀態是「寫完了」，不是「能用」。
 
 ---
 
@@ -171,14 +188,18 @@ HiNet IP 完成。
 
 依序：
 
-1. **取得 Discord Bot 憑證並實測 M3** —— `internal/infra/signal/discord.go`
+1. **補齊 M4 的測試與驗證**（見 §2.1）—— 這是目前最大的風險：熱更新是唯一
+   會**替換掉正在服務的執行檔**的功能，而它一次都沒跑過。先加測試接縫與
+   單元測試，再以 `YTDLP_MODE=managed` 實跑一次 `/u` 與 `/u/back`
+2. **取得 Discord Bot 憑證並實測 M3** —— `internal/infra/signal/discord.go`
    已照介面寫好但**從未跑過**。需要 Developer Portal 啟用 Presence Intent，
    且 Bot 與被監測使用者同在一個 guild
-2. **VRChat 內實測閘門與新端點** —— `/on`、`/off`、`/e`、`/p`、`/i`、`/d`
-   的訊息影片都只在瀏覽器驗證過
-3. **Dockerfile** —— 需含新版 deno（yt-dlp 解 `n` 參數挑戰用；目前分塊下載
-   已不依賴它，但缺少會使部分格式無法取得）
-4. **M4 熱更新與健康度** —— ToolchainManager、`/u`、煙霧測試、主動探測
+3. **VRChat 內實測閘門與新端點** —— `/on`、`/off`、`/e`、`/p`、`/i`、`/d`、
+   `/u` 的訊息影片都只在瀏覽器驗證過
+4. **Dockerfile** —— 需含 `python3`（yt-dlp zipapp 的執行環境）與新版 deno
+   （解 `n` 參數挑戰用；分塊下載已不依賴它，但缺少會使部分格式無法取得），
+   並設 `YTDLP_MODE=managed`。**不要用 `yt-dlp_linux`**：它連結 glibc，
+   在 Alpine（musl）上起不來
 5. **M6 MP4 路徑與預熱** —— `/w`、`/r`，以及影片本體的 MP4 packager
 
 ---
@@ -193,13 +214,20 @@ internal/
     availability/               Signal 介面 ★ 核心解耦點、Gate 聚合與去抖動
     message/                    View 與內容雜湊
     event/                      /e 與 /s 讀的事件型別
+    health/                     滾動解析視窗與 spec §4.6 的門檻評分
     port/                       Resolver / MediaFetcher / Packager / AssetStore
-  usecase/playvideo/            解析→下載→封裝，含雙層 singleflight 與併發上限
+                                / ToolchainManager / ToolchainVerifier
+  usecase/
+    playvideo/                  解析→下載→封裝，含雙層 singleflight 與併發上限
+    upgrade/                    yt-dlp 熱更新：背景執行、維護模式、排空
+    healthcheck/                主動探測（輪流一次一支影片）
   adapter/
     httpapi/                    路徑解析（spec §4.1.4）、HTTP handler、訊息 slot 表
     presenter/                  領域結果 → View
   infra/
-    ytdlp/                      Resolver 實作（--dump-single-json）
+    ytdlp/                      Resolver（--dump-single-json）、版本化目錄與
+                                原子切換、煙霧測試、非受管模式
+    diskfree/                   磁碟可用空間（Windows／Unix 兩份實作）
     fetch/                      並行分塊下載器 ★ spec 中沒有，但為必要
     ffmpeg/                     HLS packager、訊息影片 renderer
     render/                     PNG 版面（嵌入 Noto Sans TC）
@@ -229,6 +257,15 @@ internal/
   會靜默地讓服務整個停擺
 - **命令端點的媒體走穩定 slot 路徑** —— `/m/status_hls/…`，內容雜湊只用於
   磁碟去重。被 slot 指到的產物不可被淘汰（見 implementation.md §13）
+- **Resolver 不持有固定的 yt-dlp 路徑** —— 改用 `Locate` 回呼每次重新解析
+  current 指標，否則熱更新要等重啟才生效（implementation.md §16.9）
+- **`/u` 是背景執行** —— 立即回應，再次輸入看進度，完成後 90 秒內顯示結果。
+  阻塞版本必須同時活過 AVPro 與 Cloudflare 兩個未知／已知的逾時
+  （implementation.md §16.2）
+- **主動探測每次只跑一支影片** —— 跑完整份清單會逼近 §3.3 的每支影片速率
+  限制（implementation.md §16.4）
+- **維護模式在閘門之前檢查** —— 更新中的不可用是可以等的；回「服務離線」
+  會把使用者導向 `/on` 去修一個沒壞的東西
 
 ### 9.2 AVPro 的硬性要求（實測，詳見 implementation.md §10、§11）
 

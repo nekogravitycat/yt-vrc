@@ -74,6 +74,21 @@ type Config struct {
 	// clients (spec §3.2). Empty means yt-dlp's own default only.
 	YtdlpClients []string
 
+	// Hot upgrade and health (spec §4.5, §4.6).
+	//
+	// YtdlpAsset is the release file to install; the plain zipapp needs
+	// a python3 alongside it but runs anywhere, whereas the
+	// self-contained yt-dlp_linux build is linked against glibc and
+	// will not start on Alpine.
+	YtdlpAsset          string
+	YtdlpAutoUpgrade    bool
+	YtdlpCheckInterval  time.Duration
+	YtdlpStaleDays      int
+	UpgradeDrainTimeout time.Duration
+	UpgradeTimeout      time.Duration
+	HealthProbeInterval time.Duration
+	HealthProbeVideos   []string
+
 	LogLevel string
 }
 
@@ -112,6 +127,21 @@ func Load() (*Config, error) {
 		DiscordActivityName: env("DISCORD_ACTIVITY_NAME", "VRChat"),
 
 		YtdlpClients: envList("YTDLP_CLIENTS", nil),
+
+		YtdlpAsset:         os.Getenv("YTDLP_ASSET"),
+		YtdlpAutoUpgrade:   envBool("YTDLP_AUTO_UPGRADE", false),
+		YtdlpCheckInterval: envDur("YTDLP_CHECK_INTERVAL", 24*time.Hour),
+		YtdlpStaleDays:     envInt("YTDLP_STALE_DAYS", 30),
+		// 60s matches spec §4.5.3 step 2. Overrunning it is survivable:
+		// a job already holding the old binary keeps using it, and only
+		// the next resolve sees the swap.
+		UpgradeDrainTimeout: envDur("UPGRADE_DRAIN_TIMEOUT", 60*time.Second),
+		UpgradeTimeout:      envDur("UPGRADE_TIMEOUT", 10*time.Minute),
+		HealthProbeInterval: envDur("HEALTH_PROBE_INTERVAL", 6*time.Hour),
+		// Phase 0 verified these; they double as the upgrade smoke test
+		// (spec §4.5.3 step 6, §4.6).
+		HealthProbeVideos: envList("HEALTH_PROBE_VIDEOS",
+			[]string{"dQw4w9WgXcQ", "NJ1tne9u8YM", "BGXOYfZMR0w"}),
 	}
 	if v, ok := os.LookupEnv("FAKE_SIGNAL_ONLINE"); ok {
 		c.FakeSignalSet = true

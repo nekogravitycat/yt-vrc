@@ -9,7 +9,10 @@ import (
 
 	"github.com/nekogravitycat/yt-vrc/internal/adapter/presenter"
 	"github.com/nekogravitycat/yt-vrc/internal/domain/event"
+	"github.com/nekogravitycat/yt-vrc/internal/domain/health"
 	"github.com/nekogravitycat/yt-vrc/internal/domain/video"
+	"github.com/nekogravitycat/yt-vrc/internal/infra/diskfree"
+	"github.com/nekogravitycat/yt-vrc/internal/usecase/upgrade"
 )
 
 // serveCommand handles the management endpoints.
@@ -52,6 +55,9 @@ func (s *Server) serveCommand(w http.ResponseWriter, r *http.Request, route Rout
 	case "info":
 		s.info(w, r, route, spec)
 
+	case "upgrade":
+		s.upgrade(w, r, route, spec)
+
 	default:
 		// Defined in spec §4.1.3 but scheduled for a later milestone.
 		s.deliver(w, r, route.Command, presenter.NotImplemented(route.Command), spec, http.StatusNotImplemented)
@@ -73,6 +79,7 @@ func (s *Server) statusView(r *http.Request) presenter.StatusData {
 		CacheLimit: s.CacheLimitBytes,
 		ActiveJobs: s.Play.ActiveJobs(),
 		MaxJobs:    s.Play.MaxJobs,
+		Managed:    true,
 	}
 	if s.Gate != nil {
 		_, d.Gate = s.Gate.IsOpen(r.Context())
@@ -81,7 +88,84 @@ func (s *Server) statusView(r *http.Request) presenter.StatusData {
 		d.Gate.Open = true
 		d.Gate.Source = "gate disabled"
 	}
+
+	if s.Toolchain != nil {
+		d.Managed = s.Toolchain.Managed()
+		v, err := s.Toolchain.CurrentVersion(r.Context())
+		if err != nil {
+			// Worth saying out loud. Every video request goes through
+			// this binary, so "cannot even ask its version" is the whole
+			// story, not a footnote.
+			d.YtdlpErr = err.Error()
+		} else {
+			d.YtdlpVersion = v
+			d.YtdlpAge, d.YtdlpAgeOK = health.ParseVersionAge(v, time.Now())
+		}
+	}
+	if s.Upgrade != nil {
+		d.YtdlpLatest, _ = s.Upgrade.Latest()
+		d.Upgrading, _ = s.Upgrade.Maintenance()
+	}
+	if s.Health != nil {
+		d.Resolve = s.Health.Stats()
+	}
+	if s.DataDir != "" {
+		d.DiskFree = diskfree.Bytes(s.DataDir)
+	}
+	d.Report = health.Evaluate(health.Input{
+		ToolVersion:  d.YtdlpVersion,
+		ToolAge:      d.YtdlpAge,
+		ToolAgeKnown: d.YtdlpAgeOK,
+		Resolve:      d.Resolve,
+		CacheBytes:   d.CacheBytes,
+		CacheLimit:   d.CacheLimit,
+		DiskFree:     d.DiskFree,
+	}, s.thresholds())
 	return d
+}
+
+func (s *Server) thresholds() health.Thresholds {
+	if s.Thresholds == (health.Thresholds{}) {
+		return health.DefaultThresholds
+	}
+	return s.Thresholds
+}
+
+// upgrade handles /u and /u/back (spec §4.5).
+//
+// It answers immediately and lets the work run behind it; re-entering
+// the URL reports progress and then the outcome. See upgrade.State for
+// why this is not a blocking request.
+func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, route Route, spec video.OutputSpec) {
+	if s.Upgrade == nil {
+		s.deliver(w, r, "upgrade", presenter.NotImplemented("u"), spec, http.StatusNotImplemented)
+		return
+	}
+
+	kind := upgrade.KindUpgrade
+	for _, a := range route.Args {
+		if arg, _ := splitExt(strings.ToLower(a)); arg == "back" || arg == "rollback" || arg == "undo" {
+			kind = upgrade.KindRollback
+		}
+	}
+
+	if s.Toolchain != nil && !s.Toolchain.Managed() {
+		s.deliver(w, r, "upgrade", presenter.UpgradeUnmanaged(s.Toolchain.BinaryPath()), spec, http.StatusNotImplemented)
+		return
+	}
+	if kind == upgrade.KindRollback && s.Toolchain != nil && s.Toolchain.PreviousVersion() == "" {
+		s.deliver(w, r, "upgrade", presenter.RollbackUnavailable(), spec, http.StatusConflict)
+		return
+	}
+
+	state, started := s.Upgrade.Trigger(r.Context(), kind)
+	if state.Running {
+		s.deliver(w, r, "upgrade", presenter.UpgradeProgress(state, started), spec, http.StatusAccepted)
+		return
+	}
+	// Not running and not started: a recent run's result is still the
+	// most useful thing to show.
+	s.deliver(w, r, "upgrade", presenter.UpgradeOutcome(state), spec, http.StatusOK)
 }
 
 func (s *Server) enableGate(w http.ResponseWriter, r *http.Request, spec video.OutputSpec) {

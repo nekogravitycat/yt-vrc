@@ -15,10 +15,13 @@ import (
 	"github.com/nekogravitycat/yt-vrc/internal/adapter/presenter"
 	"github.com/nekogravitycat/yt-vrc/internal/domain/availability"
 	"github.com/nekogravitycat/yt-vrc/internal/domain/event"
+	"github.com/nekogravitycat/yt-vrc/internal/domain/health"
 	"github.com/nekogravitycat/yt-vrc/internal/domain/message"
+	"github.com/nekogravitycat/yt-vrc/internal/domain/port"
 	"github.com/nekogravitycat/yt-vrc/internal/domain/video"
 	"github.com/nekogravitycat/yt-vrc/internal/infra/ffmpeg"
 	"github.com/nekogravitycat/yt-vrc/internal/usecase/playvideo"
+	"github.com/nekogravitycat/yt-vrc/internal/usecase/upgrade"
 )
 
 // MessageService renders views to playable media and serves them back.
@@ -49,6 +52,19 @@ type Server struct {
 	OverrideTTL time.Duration
 	// CacheLimitBytes is reported by /s; enforcement lives in the store.
 	CacheLimitBytes int64
+
+	// Upgrade drives /u and puts the service into maintenance while a
+	// version swap is in flight. Nil leaves /u reporting unavailable.
+	Upgrade *upgrade.UseCase
+	// Toolchain answers "which yt-dlp is live" for /s. Nil means the
+	// version is simply not reported.
+	Toolchain port.ToolchainManager
+	// Health is the rolling resolve window /s scores (spec §4.6).
+	Health *health.Recorder
+	// Thresholds are the alert points those scores are measured against.
+	Thresholds health.Thresholds
+	// DataDir is the volume whose free space /s watches.
+	DataDir string
 
 	slotsOnce sync.Once
 	slots     *slotTable
@@ -160,6 +176,18 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) serveVideo(w http.ResponseWriter, r *http.Request, route Route) {
+	// Maintenance is checked before the gate: during a version swap the
+	// service is unavailable for a reason the user can wait out, and
+	// saying "offline" instead would send them to /on to fix something
+	// that is not broken (spec §10).
+	if s.Upgrade != nil {
+		if active, stage := s.Upgrade.Maintenance(); active {
+			st := s.Upgrade.State()
+			s.deliver(w, r, "maintenance", presenter.Maintenance(stage, st.StartedAt), route.Spec, http.StatusServiceUnavailable)
+			return
+		}
+	}
+
 	// The gate covers video only. Management endpoints stay reachable
 	// so the service can be diagnosed and reopened from inside VRChat
 	// (spec §4.4.1).
