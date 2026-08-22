@@ -19,6 +19,18 @@ import (
 func PrepareError(id video.ID, err error) message.View {
 	v := message.View{Kind: message.KindError, Subtitle: id.String(), Footer: "/h for help"}
 	switch {
+	case errors.Is(err, video.ErrBotDetected):
+		v.Title = "Blocked by YouTube"
+		v.Kind = message.KindWarning
+		v.Lines = []string{
+			"YouTube is rate-limiting this server as automated traffic.",
+			"This affects every video, not just this one.",
+			"It usually clears on its own after a while.",
+		}
+		v.Footer = "/s for status"
+	case errors.Is(err, video.ErrAgeRestricted):
+		v.Title = "Age Restricted"
+		v.Lines = []string{"This video is age restricted and cannot be played."}
 	case errors.Is(err, video.ErrNotFound):
 		v.Title = "Video Unavailable"
 		v.Lines = []string{"This video is private, deleted, or does not exist.", "Check the link and try again."}

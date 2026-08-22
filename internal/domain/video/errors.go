@@ -11,5 +11,10 @@ var (
 	ErrLiveStream     = errors.New("live streams are not supported")
 	ErrNeedsRecode    = errors.New("format requires transcoding")
 	ErrResolveFailed  = errors.New("resolve failed")
-	ErrPackageFailed  = errors.New("packaging failed")
+	// ErrBotDetected means YouTube is rate-limiting this egress IP.
+	// It is a property of the address, not of the video, so retrying
+	// other videos will not help (spec §3.2).
+	ErrBotDetected   = errors.New("blocked as automated traffic")
+	ErrAgeRestricted = errors.New("age restricted")
+	ErrPackageFailed = errors.New("packaging failed")
 )

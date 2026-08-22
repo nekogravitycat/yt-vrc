@@ -134,6 +134,16 @@ func (r *Resolver) Resolve(ctx context.Context, id video.ID, spec video.OutputSp
 func classifyError(stderr string, err error) error {
 	s := strings.ToLower(stderr)
 	switch {
+	// Checked first: this fires on any video once the egress IP is
+	// flagged, so it must not be mistaken for the video being missing.
+	case strings.Contains(s, "not a bot"),
+		strings.Contains(s, "sign in to confirm"):
+		return fmt.Errorf("%w", video.ErrBotDetected)
+	case strings.Contains(s, "age"), strings.Contains(s, "inappropriate for some users"):
+		if strings.Contains(s, "confirm your age") || strings.Contains(s, "age-restricted") {
+			return fmt.Errorf("%w", video.ErrAgeRestricted)
+		}
+		fallthrough
 	case strings.Contains(s, "unavailable"),
 		strings.Contains(s, "private video"),
 		strings.Contains(s, "has been removed"),
