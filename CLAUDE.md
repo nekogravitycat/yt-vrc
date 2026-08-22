@@ -155,40 +155,60 @@ additions worth knowing while developing:
 
 ## Configuration reference
 
-All via environment variables (or a gitignored `.env` in the working
-directory — `config.Load()` reads it before the real environment, and an
-already-set environment variable always wins; see `.env.example`).
+Settings are split across two files plus the real environment, in this
+precedence order (highest wins): **real environment variable** > `.env`
+> `config.yaml` > built-in default. `config.Load()` (`internal/infra/config`)
+loads `.env` first (`LoadDotEnv`, setting only keys not already in the
+environment — see the fact above), then `config.yaml` (`loadFileConfig`,
+strict-decoded: an unrecognized key is a load error, not a silent
+no-op), then resolves each field through the same `env()`/`envInt()`/...
+ladder either way — a `config.yaml` value is just a different default
+for that ladder, so an env var of the same name still overrides it.
+Both files are optional and gitignored; `.env.example` and
+`config.example.yaml` are the checked-in templates (the latter's example
+values are the program's actual built-in defaults, so copying it verbatim
+changes nothing).
+
+**`.env`** — secrets and facts specific to *this* machine/deployment
+(never versioned, values differ per install):
 
 | Variable | Default | Notes |
 |---|---|---|
 | `LISTEN_ADDR` | `:8080` | |
 | `PUBLIC_BASE_URL` | `http://localhost:8080` | |
 | `DATA_DIR` | `./data` | everything that must survive a restart lives here |
-| `DEFAULT_QUALITY` / `MAX_QUALITY` | `1080` / `1080` | quality cap, clamped |
-| `DEFAULT_CONTAINER` | `hls` | `hls` or `mp4` |
-| `HLS_SEGMENT_SECONDS` | `6` | nominal only — real lengths vary |
 | `FFMPEG_PATH` / `FFPROBE_PATH` | `ffmpeg` / `ffprobe` | |
 | `YTDLP_PATH` | `yt-dlp` | used when `YTDLP_MODE=path` |
 | `YTDLP_MODE` | `path` | `managed` = versioned dir + `/u`; **containers must set `managed`** |
 | `YTDLP_ASSET` | platform default | e.g. `yt-dlp.exe`; never `yt-dlp_linux` on Alpine (glibc, won't run on musl) |
-| `YTDLP_CLIENTS` | `default,mweb,tv_embedded` | fallback chain, only retried on retryable errors |
 | `YTDLP_JS_RUNTIMES` | empty (yt-dlp default) | container sets `node` — yt-dlp enables only `deno` by default |
+| `RESOLVER_PROXY` | empty | `socks5://` or `http://`, routes resolve traffic only; may embed credentials, so it's not a `config.yaml` value |
+| `DISCORD_BOT_TOKEN` / `DISCORD_USER_ID` | — | both required to register the Discord signal at all |
+| `ADMIN_IPS` | empty (unrestricted) | comma-separated; gates `/on /off /p /d /u /mode /l /e /i` |
+| `WHITELIST_IPS` | empty | comma-separated; who `/mode/whitelist` admits |
+| `FAKE_SIGNAL_ONLINE` | unset | dev-only stand-in signal; set `true`/`false` to enable |
+
+**`config.yaml`** — tunable behavior that means the same thing regardless
+of which machine this runs on (versioned; keys are `snake_case`, e.g.
+`gate_enabled`, `resolve_limit_per_video`):
+
+| Variable | Default | Notes |
+|---|---|---|
+| `DEFAULT_QUALITY` / `MAX_QUALITY` | `1080` / `1080` | quality cap, clamped |
+| `DEFAULT_CONTAINER` | `hls` | `hls` or `mp4` |
+| `HLS_SEGMENT_SECONDS` | `6` | nominal only — real lengths vary |
+| `YTDLP_CLIENTS` | `default,mweb,tv_embedded` | fallback chain, only retried on retryable errors |
 | `FETCH_WORKERS` / `FETCH_CHUNK_BYTES` | `8` / `4MB` | parallel chunked downloader; worker count matters a lot for cold-start |
 | `MESSAGE_SECONDS` / `MESSAGE_CACHE_ENTRIES` | `15` / `200` | message-video length / render cache size |
 | `RESOLVE_TIMEOUT` / `PREPARE_TIMEOUT` / `MAX_DURATION` | `30s` / `10m` / `4h` | |
 | `MAX_CONCURRENT_JOBS` | `3` | full at limit = immediate refusal, no queueing |
-| `CACHE_MAX_BYTES` / `CACHE_TARGET_RATIO` | `50GB` / `0.8` | LRU eviction; accepts `50GB`/`500MB` suffixes |
+| `CACHE_MAX_BYTES` / `CACHE_TARGET_RATIO` | `5GB` / `0.8` | LRU eviction; accepts `50GB`/`500MB` suffixes |
 | `EVENT_LOG_ENTRIES` / `MESSAGE_SLOTS` | `500` / `200` | |
 | `GATE_ENABLED` | `true` | `false` removes the availability check entirely |
 | `GATE_GRACE_PERIOD` | `10m` | offline debounce |
 | `GATE_OVERRIDE_TTL` | `4h` | `/on` default duration |
 | `GATE_POLL_INTERVAL` | `30s` | background re-evaluation; needed because debounce measures from last *observed* online moment |
-| `ADMIN_IPS` | empty (unrestricted) | comma-separated; gates `/on /off /p /d /u /mode /l /e /i` |
-| `WHITELIST_IPS` | empty | comma-separated; who `/mode/whitelist` admits |
-| `DISCORD_BOT_TOKEN` / `DISCORD_USER_ID` | — | both required to register the Discord signal at all |
 | `DISCORD_ACTIVITY_NAME` | `VRChat` | activity name matched in presence |
-| `FAKE_SIGNAL_ONLINE` | unset | dev-only stand-in signal; set `true`/`false` to enable |
-| `RESOLVER_PROXY` | empty | `socks5://` or `http://`, routes resolve traffic only |
 | `RESOLVE_LIMIT_PER_VIDEO` / `_GLOBAL` / `_WINDOW` | `5` / `40` / `1h` | outgoing resolve budget, keyed by video ID (not quality) |
 | `YTDLP_AUTO_UPGRADE` | `false` | scheduled check always runs; this controls whether it also executes |
 | `YTDLP_CHECK_INTERVAL` / `YTDLP_STALE_DAYS` | `24h` / `30` | staleness warning at 1x, critical at 3x |
@@ -260,7 +280,13 @@ trustworthy header once clients can reach the origin directly.
 
 **Docker**: `docker compose up -d --build`, credentials via a host `.env`
 consumed by compose (never baked into the image — `.dockerignore` is a
-strict allowlist for exactly this reason). Base image is Alpine 3.24.1,
+strict allowlist for exactly this reason). `config.yaml` isn't copied
+into the image either; a container has no need for the file at all
+since every `config.yaml`-tunable key is still overridable by a real
+environment variable (see Configuration reference) — set it directly in
+compose's `environment:` block, no volume mount required, unless a
+deployment genuinely wants to version a full `config.yaml` (then mount
+it at the container's working directory). Base image is Alpine 3.24.1,
 not older — yt-dlp requires JS runtime versions (node ≥22, deno ≥2.3) that
 only 3.24+ ships; `YTDLP_JS_RUNTIMES=node` is mandatory even with node
 installed, since yt-dlp enables only `deno` by default. `HEALTHCHECK`

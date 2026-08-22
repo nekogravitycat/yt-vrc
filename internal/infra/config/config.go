@@ -107,89 +107,99 @@ type Config struct {
 
 func Load() (*Config, error) {
 	// .env supplements the environment; an explicit env var always wins
-	// (see LoadDotEnv).
+	// (see LoadDotEnv). config.yaml supplies the built-in default for
+	// its own keys below -- an env var of the same name still wins over
+	// it, same precedence as .env.
 	if err := LoadDotEnv(DotEnvFile); err != nil {
 		return nil, fmt.Errorf("reading %s: %w", DotEnvFile, err)
 	}
+	fc, err := loadFileConfig(ConfigYAMLFile)
+	if err != nil {
+		return nil, fmt.Errorf("reading %s: %w", ConfigYAMLFile, err)
+	}
 
 	c := &Config{
-		ListenAddr:          env("LISTEN_ADDR", ":8080"),
-		PublicBaseURL:       strings.TrimRight(env("PUBLIC_BASE_URL", "http://localhost:8080"), "/"),
-		DataDir:             env("DATA_DIR", "./data"),
-		HLSSegmentSeconds:   envInt("HLS_SEGMENT_SECONDS", 6),
-		FFmpegPath:          env("FFMPEG_PATH", "ffmpeg"),
-		FFprobePath:         env("FFPROBE_PATH", "ffprobe"),
-		YtdlpPath:           env("YTDLP_PATH", "yt-dlp"),
-		YtdlpMode:           env("YTDLP_MODE", "path"),
-		FetchWorkers:        envInt("FETCH_WORKERS", 8),
-		FetchChunkBytes:     int64(envInt("FETCH_CHUNK_BYTES", 4<<20)),
-		MessageSeconds:      envInt("MESSAGE_SECONDS", 15),
-		MessageCacheEntries: envInt("MESSAGE_CACHE_ENTRIES", 200),
-		ResolveTimeout:      envDur("RESOLVE_TIMEOUT", 30*time.Second),
-		PrepareTimeout:      envDur("PREPARE_TIMEOUT", 10*time.Minute),
-		MaxDuration:         envDur("MAX_DURATION", 4*time.Hour),
-		LogLevel:            env("LOG_LEVEL", "info"),
-
-		MaxConcurrentJobs: envInt("MAX_CONCURRENT_JOBS", 3),
-		CacheMaxBytes:     envBytes("CACHE_MAX_BYTES", 50<<30),
-		CacheTargetRatio:  envFloat("CACHE_TARGET_RATIO", 0.8),
-		EventLogEntries:   envInt("EVENT_LOG_ENTRIES", 500),
-		MessageSlotsLimit: envInt("MESSAGE_SLOTS", 200),
-
-		GateEnabled:      envBool("GATE_ENABLED", true),
-		GateGracePeriod:  envDur("GATE_GRACE_PERIOD", 10*time.Minute),
-		GateOverrideTTL:  envDur("GATE_OVERRIDE_TTL", 4*time.Hour),
-		GatePollInterval: envDur("GATE_POLL_INTERVAL", 30*time.Second),
-
-		AdminIPs:     envList("ADMIN_IPS", nil),
-		WhitelistIPs: envList("WHITELIST_IPS", nil),
-
-		DiscordBotToken:     os.Getenv("DISCORD_BOT_TOKEN"),
-		DiscordUserID:       os.Getenv("DISCORD_USER_ID"),
-		DiscordActivityName: env("DISCORD_ACTIVITY_NAME", "VRChat"),
-
-		YtdlpClients:    envList("YTDLP_CLIENTS", nil),
+		// .env only: deployment-specific facts and secrets never live in
+		// config.yaml (see CLAUDE.md's Configuration reference).
+		ListenAddr:      env("LISTEN_ADDR", ":8080"),
+		PublicBaseURL:   strings.TrimRight(env("PUBLIC_BASE_URL", "http://localhost:8080"), "/"),
+		DataDir:         env("DATA_DIR", "./data"),
+		FFmpegPath:      env("FFMPEG_PATH", "ffmpeg"),
+		FFprobePath:     env("FFPROBE_PATH", "ffprobe"),
+		YtdlpPath:       env("YTDLP_PATH", "yt-dlp"),
+		YtdlpMode:       env("YTDLP_MODE", "path"),
+		YtdlpAsset:      os.Getenv("YTDLP_ASSET"),
 		YtdlpJSRuntimes: os.Getenv("YTDLP_JS_RUNTIMES"),
+		DiscordBotToken: os.Getenv("DISCORD_BOT_TOKEN"),
+		DiscordUserID:   os.Getenv("DISCORD_USER_ID"),
+		AdminIPs:        envList("ADMIN_IPS", nil),
+		WhitelistIPs:    envList("WHITELIST_IPS", nil),
+
+		// config.yaml, then env override: behavior tuning that's the
+		// same regardless of which machine this is deployed on.
+		HLSSegmentSeconds:   envInt("HLS_SEGMENT_SECONDS", intDefault(fc.HLSSegmentSeconds, 6)),
+		FetchWorkers:        envInt("FETCH_WORKERS", intDefault(fc.FetchWorkers, 8)),
+		FetchChunkBytes:     envBytes("FETCH_CHUNK_BYTES", bytesDefault(fc.FetchChunkBytes, 4<<20)),
+		MessageSeconds:      envInt("MESSAGE_SECONDS", intDefault(fc.MessageSeconds, 15)),
+		MessageCacheEntries: envInt("MESSAGE_CACHE_ENTRIES", intDefault(fc.MessageCacheEntries, 200)),
+		ResolveTimeout:      envDur("RESOLVE_TIMEOUT", durDefault(fc.ResolveTimeout, 30*time.Second)),
+		PrepareTimeout:      envDur("PREPARE_TIMEOUT", durDefault(fc.PrepareTimeout, 10*time.Minute)),
+		MaxDuration:         envDur("MAX_DURATION", durDefault(fc.MaxDuration, 4*time.Hour)),
+		LogLevel:            env("LOG_LEVEL", strDefault(fc.LogLevel, "info")),
+
+		MaxConcurrentJobs: envInt("MAX_CONCURRENT_JOBS", intDefault(fc.MaxConcurrentJobs, 3)),
+		CacheMaxBytes:     envBytes("CACHE_MAX_BYTES", bytesDefault(fc.CacheMaxBytes, 5<<30)),
+		CacheTargetRatio:  envFloat("CACHE_TARGET_RATIO", floatDefault(fc.CacheTargetRatio, 0.8)),
+		EventLogEntries:   envInt("EVENT_LOG_ENTRIES", intDefault(fc.EventLogEntries, 500)),
+		MessageSlotsLimit: envInt("MESSAGE_SLOTS", intDefault(fc.MessageSlotsLimit, 200)),
+
+		GateEnabled:      envBool("GATE_ENABLED", boolDefault(fc.GateEnabled, true)),
+		GateGracePeriod:  envDur("GATE_GRACE_PERIOD", durDefault(fc.GateGracePeriod, 10*time.Minute)),
+		GateOverrideTTL:  envDur("GATE_OVERRIDE_TTL", durDefault(fc.GateOverrideTTL, 4*time.Hour)),
+		GatePollInterval: envDur("GATE_POLL_INTERVAL", durDefault(fc.GatePollInterval, 30*time.Second)),
+
+		DiscordActivityName: env("DISCORD_ACTIVITY_NAME", strDefault(fc.DiscordActivityName, "VRChat")),
+
+		YtdlpClients: envList("YTDLP_CLIENTS", listDefault(fc.YtdlpClients, nil)),
 
 		// 5/day is well under the measured ~12/day trigger, comfortably
 		// above singleflight-collapsed normal use.
-		ResolveLimitPerVideo: envInt("RESOLVE_LIMIT_PER_VIDEO", 5),
-		ResolveLimitGlobal:   envInt("RESOLVE_LIMIT_GLOBAL", 40),
-		ResolveLimitWindow:   envDur("RESOLVE_LIMIT_WINDOW", time.Hour),
+		ResolveLimitPerVideo: envInt("RESOLVE_LIMIT_PER_VIDEO", intDefault(fc.ResolveLimitPerVideo, 5)),
+		ResolveLimitGlobal:   envInt("RESOLVE_LIMIT_GLOBAL", intDefault(fc.ResolveLimitGlobal, 40)),
+		ResolveLimitWindow:   envDur("RESOLVE_LIMIT_WINDOW", durDefault(fc.ResolveLimitWindow, time.Hour)),
 
-		YtdlpAsset:         os.Getenv("YTDLP_ASSET"),
-		YtdlpAutoUpgrade:   envBool("YTDLP_AUTO_UPGRADE", false),
-		YtdlpCheckInterval: envDur("YTDLP_CHECK_INTERVAL", 24*time.Hour),
-		YtdlpStaleDays:     envInt("YTDLP_STALE_DAYS", 30),
+		YtdlpAutoUpgrade:   envBool("YTDLP_AUTO_UPGRADE", boolDefault(fc.YtdlpAutoUpgrade, false)),
+		YtdlpCheckInterval: envDur("YTDLP_CHECK_INTERVAL", durDefault(fc.YtdlpCheckInterval, 24*time.Hour)),
+		YtdlpStaleDays:     envInt("YTDLP_STALE_DAYS", intDefault(fc.YtdlpStaleDays, 30)),
 		// Overrunning is survivable: in-flight jobs keep the old binary;
 		// only the next resolve sees the swap.
-		UpgradeDrainTimeout: envDur("UPGRADE_DRAIN_TIMEOUT", 60*time.Second),
-		UpgradeTimeout:      envDur("UPGRADE_TIMEOUT", 10*time.Minute),
-		HealthProbeInterval: envDur("HEALTH_PROBE_INTERVAL", 6*time.Hour),
+		UpgradeDrainTimeout: envDur("UPGRADE_DRAIN_TIMEOUT", durDefault(fc.UpgradeDrainTimeout, 60*time.Second)),
+		UpgradeTimeout:      envDur("UPGRADE_TIMEOUT", durDefault(fc.UpgradeTimeout, 10*time.Minute)),
+		HealthProbeInterval: envDur("HEALTH_PROBE_INTERVAL", durDefault(fc.HealthProbeInterval, 6*time.Hour)),
 		// Phase 0 verified these; they double as the upgrade smoke test
 		// (spec §4.5.3 step 6, §4.6).
 		HealthProbeVideos: envList("HEALTH_PROBE_VIDEOS",
-			[]string{"dQw4w9WgXcQ", "NJ1tne9u8YM", "BGXOYfZMR0w"}),
+			listDefault(fc.HealthProbeVideos, []string{"dQw4w9WgXcQ", "NJ1tne9u8YM", "BGXOYfZMR0w"})),
 	}
 	if v, ok := os.LookupEnv("FAKE_SIGNAL_ONLINE"); ok {
 		c.FakeSignalSet = true
 		c.FakeSignalOnline = v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
 	}
 
-	dq, err := video.ParseQuality(env("DEFAULT_QUALITY", "1080"))
+	dq, err := video.ParseQuality(env("DEFAULT_QUALITY", strDefault(fc.DefaultQuality, "1080")))
 	if err != nil {
 		return nil, fmt.Errorf("DEFAULT_QUALITY: %w", err)
 	}
 	c.DefaultQuality = dq
 
-	mq, err := video.ParseQuality(env("MAX_QUALITY", "1080"))
+	mq, err := video.ParseQuality(env("MAX_QUALITY", strDefault(fc.MaxQuality, "1080")))
 	if err != nil {
 		return nil, fmt.Errorf("MAX_QUALITY: %w", err)
 	}
 	c.MaxQuality = mq
 	c.DefaultQuality = c.DefaultQuality.Clamp(c.MaxQuality)
 
-	dc, ok := video.ParseContainer(env("DEFAULT_CONTAINER", "hls"))
+	dc, ok := video.ParseContainer(env("DEFAULT_CONTAINER", strDefault(fc.DefaultContainer, "hls")))
 	if !ok {
 		return nil, fmt.Errorf("DEFAULT_CONTAINER must be hls or mp4")
 	}
@@ -261,9 +271,23 @@ func envList(k string, def []string) []string {
 // envBytes accepts a plain byte count or a suffixed size such as 50GB,
 // because writing out 53687091200 by hand invites typos.
 func envBytes(k string, def int64) int64 {
-	v := strings.TrimSpace(os.Getenv(k))
+	v := os.Getenv(k)
 	if v == "" {
 		return def
+	}
+	n, ok := parseBytes(v)
+	if !ok {
+		return def
+	}
+	return n
+}
+
+// parseBytes is the shared suffix parser behind envBytes and config.yaml's
+// byte-size fields (fetch_chunk_bytes, cache_max_bytes).
+func parseBytes(v string) (int64, bool) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0, false
 	}
 	mult := int64(1)
 	upper := strings.ToUpper(v)
@@ -279,9 +303,9 @@ func envBytes(k string, def int64) int64 {
 	}
 	n, err := strconv.ParseInt(v, 10, 64)
 	if err != nil {
-		return def
+		return 0, false
 	}
-	return n * mult
+	return n * mult, true
 }
 
 func envDur(k string, def time.Duration) time.Duration {

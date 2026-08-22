@@ -110,20 +110,28 @@ follow the same gate as playback.
 
 ## Configuration
 
-Everything is set via environment variables, or a gitignored `.env` in
-the working directory (a real environment variable always wins over the
-file — see `.env.example`). Common settings:
+Settings are split across two optional, gitignored files plus the real
+environment (a real environment variable always wins over both files):
 
-| Variable | Default | Description |
-|---|---|---|
-| `LISTEN_ADDR` | `:8080` | Listen address |
-| `DATA_DIR` | `./data` | Root directory for all state |
-| `DEFAULT_QUALITY` / `MAX_QUALITY` | `1080` / `1080` | Default and maximum video quality |
-| `FETCH_WORKERS` | `8` | Parallelism for chunked downloads |
-| `FFMPEG_PATH` / `YTDLP_PATH` | `ffmpeg` / `yt-dlp` | External tool locations |
-| `GATE_ENABLED` | `true` | `false` removes the availability check entirely |
-| `ADMIN_IPS` | empty | Restricts `/on /off /p /d /u /mode /l /e /i` — see Access control |
-| `WHITELIST_IPS` | empty | Who `/mode/whitelist` admits |
+- **`.env`** — secrets and facts specific to this machine/deployment.
+  Copy `.env.example` to `.env` and fill in.
+- **`config.yaml`** — tunable behavior, the same regardless of which
+  machine this runs on. Copy `config.example.yaml` to `config.yaml` to
+  customize; its example values are the program's actual defaults, so a
+  missing file behaves identically.
+
+Common settings:
+
+| Variable | Default | Description | File |
+|---|---|---|---|
+| `LISTEN_ADDR` | `:8080` | Listen address | `.env` |
+| `DATA_DIR` | `./data` | Root directory for all state | `.env` |
+| `DEFAULT_QUALITY` / `MAX_QUALITY` | `1080` / `1080` | Default and maximum video quality | `config.yaml` |
+| `FETCH_WORKERS` | `8` | Parallelism for chunked downloads | `config.yaml` |
+| `FFMPEG_PATH` / `YTDLP_PATH` | `ffmpeg` / `yt-dlp` | External tool locations | `.env` |
+| `GATE_ENABLED` | `true` | `false` removes the availability check entirely | `config.yaml` |
+| `ADMIN_IPS` | empty | Restricts `/on /off /p /d /u /mode /l /e /i` — see Access control | `.env` |
+| `WHITELIST_IPS` | empty | Who `/mode/whitelist` admits | `.env` |
 
 For the complete list, see `CLAUDE.md`.
 

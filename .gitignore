@@ -2,6 +2,7 @@
 /bin/
 *.exe
 .env
+/config.yaml
 
 .cloudflared/
 *.pem

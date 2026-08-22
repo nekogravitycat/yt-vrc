@@ -1,0 +1,85 @@
+# Tunable, non-sensitive settings -- behavior that means the same thing
+# regardless of which machine this is deployed on. Copy to config.yaml to
+# customize (config.yaml is gitignored; this file is the checked-in
+# template and stays in sync with the program's built-in defaults, so a
+# missing key here behaves exactly like a missing config.yaml).
+#
+# Deployment-specific facts and anything sensitive (PUBLIC_BASE_URL,
+# DATA_DIR, tool paths, DISCORD_BOT_TOKEN, ADMIN_IPS, ...) belong in .env
+# instead -- see .env.example. A real environment variable always wins
+# over both files.
+
+# Quality cap. MAX_QUALITY bounds DEFAULT_QUALITY (clamped, not rejected).
+default_quality: "1080"
+max_quality: "1080"
+# "hls" or "mp4".
+default_container: hls
+
+# Nominal only -- ffmpeg's real segment lengths vary 2-11.5s regardless.
+hls_segment_seconds: 6
+
+# Parallel chunked downloader (internal/infra/fetch). Sequential GETs to
+# googlevideo are throttled to ~300KB/s; this is not a perf knob, it's
+# the difference between working and not.
+fetch_workers: 8
+fetch_chunk_bytes: 4MB
+
+# Message-video length and how many rendered frames to keep cached.
+message_seconds: 15
+message_cache_entries: 200
+
+resolve_timeout: 30s
+prepare_timeout: 10m
+max_duration: 4h
+
+# Full at this limit = immediate refusal, no queueing.
+max_concurrent_jobs: 3
+
+# LRU eviction target; accepts suffixes (KB/MB/GB/TB).
+cache_max_bytes: 5GB
+cache_target_ratio: 0.8
+
+event_log_entries: 500
+message_slots: 200
+
+# Fail-closed: with this on and no signal source configured, only /on
+# opens the gate.
+gate_enabled: true
+# Offline debounce, measured from the last observed online moment.
+gate_grace_period: 10m
+# Default duration of a manual /on override.
+gate_override_ttl: 4h
+# Background re-evaluation interval.
+gate_poll_interval: 30s
+
+# Discord activity name matched for the presence signal.
+discord_activity_name: VRChat
+
+# YouTube player client fallback chain, only retried on retryable errors.
+# Leave empty to use yt-dlp's own default only.
+ytdlp_clients: [default, mweb, tv_embedded]
+
+# Outgoing resolve budget -- the only guard against YouTube rate-limiting
+# repeated resolution of one video. 5/day is comfortably under the
+# measured ~12/day trigger.
+resolve_limit_per_video: 5
+resolve_limit_global: 40
+resolve_limit_window: 1h
+
+# Scheduled staleness check always runs; this controls whether it also
+# executes the upgrade.
+ytdlp_auto_upgrade: false
+ytdlp_check_interval: 24h
+# Staleness warning at 1x this, critical at 3x.
+ytdlp_stale_days: 30
+# Overrunning is survivable: in-flight jobs keep the old binary, only the
+# next resolve sees the swap.
+upgrade_drain_timeout: 60s
+upgrade_timeout: 10m
+
+# Active probing checks one video per tick, round-robin, to avoid the
+# per-video resolve limit. Doubles as the upgrade smoke test.
+health_probe_interval: 6h
+health_probe_videos: [dQw4w9WgXcQ, NJ1tne9u8YM, BGXOYfZMR0w]
+
+log_level: info
