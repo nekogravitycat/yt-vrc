@@ -112,7 +112,16 @@ func (u *UseCase) Trigger(ctx context.Context, kind Kind) (State, bool) {
 	now := time.Now()
 
 	u.mu.Lock()
-	if u.state.Running || u.state.Fresh(now) {
+	// A run in flight blocks anything else: the two kinds move the same
+	// pointer, and letting a rollback race a half-finished switch is how
+	// a volume ends up pointing at a staging directory.
+	//
+	// A *finished* run only short-circuits the same kind. Re-entering /u
+	// means "show me what happened"; /u/back after an upgrade means the
+	// opposite, and the linger window is exactly when someone decides
+	// the new version is bad. Swallowing it there would lock the escape
+	// hatch for the ninety seconds it exists for (implementation.md §16.3).
+	if u.state.Running || (u.state.Fresh(now) && u.state.Kind == kind) {
 		s := u.state
 		u.mu.Unlock()
 		return s, false

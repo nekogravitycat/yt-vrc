@@ -73,6 +73,19 @@ Cloudflare Dashboard → **Zero Trust** → Networks → Tunnels →
 
 儲存後即時生效，無需重啟服務。
 
+### 3.3a 憑證
+
+`DISCORD_BOT_TOKEN` 與 `DISCORD_USER_ID` 寫在專案根目錄的 `.env`（已在
+`.gitignore`），`config.Load()` 會在讀環境變數前載入它，**已設定的環境變數
+永遠優先**。範本見 `.env.example`。
+
+Developer Portal 只需開 **Presence Intent**；guild 權限一個都不需要（presence
+來自 Gateway intent，不是 permission），邀請連結用 `permissions=0`。Bot 必須
+與被監測的使用者同在一個 guild，且該使用者的 Discord 用戶端要開「將偵測到的
+活動顯示為狀態訊息」、線上狀態不能是隱形。
+
+容器部署**不要把 `.env` 打進映像**——憑證走真實環境變數或 secret。
+
 ### 3.4 啟動服務本體
 
 通道由 Windows 服務常駐，因此只需啟動 yt-vrc：
@@ -175,13 +188,22 @@ Caddy 會自動申請並續期 Let's Encrypt 憑證。
 
 ### 6.1a M3 驗收（上線閘門）
 
+**Discord 訊號本身已驗過**（implementation.md §17.7）：`/s` 顯示
+`open · discord`、`discord online · playing VRChat`，事件記錄有
+`gate opened (discord)`，影片正常交付。
+
 | # | 輸入 | 預期 | 結果 |
 |---|---|---|---|
-| 5a | `v.gravity.tw/dQw4w9WgXcQ`（未先 `/on`） | 灰色「Service Offline」，可播放 | |
+| 5a | `v.gravity.tw/dQw4w9WgXcQ`（Discord 判定離線時） | 灰色「Service Offline」，可播放 | |
 | 5b | `v.gravity.tw/on` | 綠色「Service Forced Online」，顯示到期時間 | |
 | 5c | 重試 5a | 正常播放 | |
 | 5d | `v.gravity.tw/s` | 「Availability: open · manual」 | |
-| 5e | `v.gravity.tw/off` | 綠色「Override Cleared」，之後 5a 又回到離線 | |
+| 5e | `v.gravity.tw/off` | 綠色「Override Cleared」 | |
+
+**5a 與 5e 的語意已隨 Discord 上線而改變。** 這兩條原本寫在沒有訊號來源的
+年代：那時 `/off` 之後閘門必定關閉。現在 `/off` 只是把控制權交還給 Discord，
+作者正在玩的時候影片仍會播。要看到灰色離線畫面，必須關掉 VRChat 並等過
+`GATE_GRACE_PERIOD`（預設 10 分鐘）。
 
 ### 6.1b M4 驗收（熱更新與健康度）
 
@@ -193,14 +215,21 @@ $env:YTDLP_MODE = "managed"
 go run .\cmd\yt-vrc
 ```
 
-| # | 輸入 | 預期 | 結果 |
-|---|---|---|---|
-| 5f | `v.gravity.tw/s` | 出現 yt-dlp 版本與版齡、解析成功率兩列 | |
-| 5g | `v.gravity.tw/u` | 黃色「Upgrade Started」，顯示階段 | |
-| 5h | 數秒後再輸入 `/u` | 顯示進度，或已完成的結果 | |
-| 5i | 更新期間輸入任一影片網址 | 黃色「Updating」，**不是**「Service Offline」 | |
-| 5j | `v.gravity.tw/u/back` | 綠色「Rolled Back」，版本回到前一版 | |
-| 5k | 檢查 `data/ytdlp/` | `versions/` 下有兩個版本目錄，`current` 與 `previous` 指標存在 | |
+下表的**每一項都已在 HTTP 層驗過**（implementation.md §17.4），包含一次真實的
+2026.07.04 → 2026.08.19 升級與回滾，不重啟即生效。VRChat 內尚未確認的只有
+「這些訊息影片在 AVPro 中播不播得出來」。
+
+| # | 輸入 | 預期 | HTTP 驗證 | VRChat |
+|---|---|---|---|---|
+| 5f | `v.gravity.tw/s` | 出現 yt-dlp 版本與版齡、解析成功率兩列 | ✅ | |
+| 5g | `v.gravity.tw/u` | 黃色「Upgrade Started」，顯示階段 | ✅ | |
+| 5h | 數秒後再輸入 `/u` | 顯示進度，或已完成的結果 | ✅ 12s 完成，煙霧測試 3/3 | |
+| 5i | 更新期間輸入任一影片網址 | 黃色「Updating」，**不是**「Service Offline」 | ✅ | |
+| 5j | `v.gravity.tw/u/back` | 綠色「Rolled Back」，版本回到前一版 | ✅ 9s 完成 | |
+| 5k | 檢查 `data/ytdlp/` | `versions/` 下有兩個版本目錄，`current` 與 `previous` 指標存在 | ✅ | — |
+
+**`/u/back` 在剛升級完的 90 秒內曾被靜默吞掉**，已修（implementation.md §17.3c）。
+若在舊版本上測 5j，會看到 5g 的升級報告又播一次而不是回滾。
 
 **已是最新版時** `/u` 應回藍色「Already Up To Date」而非啟動一次無謂的下載。
 要測真正的升級，可先手動把 `current` 指標改指向一個舊版本目錄。

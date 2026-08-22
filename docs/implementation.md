@@ -700,19 +700,14 @@ spec 要求「驗證檔案大小與可執行性」。但被截斷的代理回應
 - **排空逾時不中止升級**。已經啟動的工作握著它當時取得的執行檔路徑，
   切換只影響下一次 resolve
 
-### 16.11 尚未完成
+### 16.11 驗證缺口（已於 §17 補齊）
 
-M4 的程式碼已通過 `go build`、`go vet`、Linux 交叉編譯與現有全部測試，
-但**以下驗證尚未進行**：
+M4 首次提交時只通過 `go build`、`go vet` 與既有測試，沒有任何一行 M4 的
+行為被驗證過：新程式碼零單元測試、`ytdlp.Manager` 因為會真的打 GitHub
+與執行下載回來的二進位檔而不可測、`scripts/verify.ps1` 未涵蓋、
+spec §12 的 M4 驗收條件從未達成。
 
-1. **新程式碼沒有單元測試**——`health` 的門檻與視窗、`ytdlp.Manager` 的
-   安裝／煙霧測試失敗不切換／回滾、`upgrade` 的併發 Trigger 與維護旗標
-   生命週期。`ytdlp.Manager` 需要先加入三個測試接縫（`Version` 回呼、
-   `APIBase`、`DownloadBase`）才能在不碰網路、不執行真實二進位檔的情況下測試
-2. **`scripts/verify.ps1` 未加入 M4 檢查**（目前仍為 72 項）
-3. **從未執行過真實的熱更新**——spec §12 的 M4 驗收條件
-   「容器不重啟的情況下完成 yt-dlp 版本升級與回滾」尚未達成。需以
-   `YTDLP_MODE=managed` 實際跑一次 `/u` 與 `/u/back`
+**這些缺口已全數補上，見 §17。**
 
 ### 16.12 新增的設定
 
@@ -727,3 +722,133 @@ M4 的程式碼已通過 `go build`、`go vet`、Linux 交叉編譯與現有全�
 | `UPGRADE_TIMEOUT` | `10m` | 單次升級的總上限 |
 | `HEALTH_PROBE_INTERVAL` | `6h` | 主動探測週期 |
 | `HEALTH_PROBE_VIDEOS` | `dQw4w9WgXcQ,NJ1tne9u8YM,BGXOYfZMR0w` | 探測與煙霧測試共用的影片清單 |
+
+---
+
+## 17. M4 驗證（2026-08-22）
+
+§16.11 列出的四個缺口全數補上，spec §12 的 M4 驗收條件達成。
+
+### 17.1 `ytdlp.Manager` 的三個測試接縫
+
+新增欄位 `APIBase`、`DownloadBase`、`Version`：前兩者讓測試把 GitHub 換成
+`httptest` 伺服器，第三個取代對 `binaryVersion` 的直接呼叫。
+
+沒有這三個接縫，`go test` 會**真的**打 GitHub、**真的**執行下載回來的二進位
+檔。這正是「替換掉正在服務中的執行檔」那條路徑，是這個專案裡最不該被
+一次隨手的測試執行誤觸的東西。
+
+### 17.2 新增的測試
+
+| 套件 | 涵蓋 |
+|---|---|
+| `internal/domain/health` | 滾動視窗與淘汰、成功率與中位數（失敗不計入延遲）、六項門檻、`Overall` 取最差、版號年齡解析 |
+| `internal/infra/ytdlp`（manager、install） | 安裝順序、SHA-256 不符中止、版號不符中止、nightly 後綴容忍、煙霧測試失敗**不切換**、no-change 短路、指標指向空目錄時重裝、回滾（含煙霧測試失敗仍放行）、無前一版拒絕、prune 後仍可回滾、`BinaryPath` 每次重讀 |
+| `internal/infra/ytdlp`（marker） | 兩種指標形式只能存在其一、暫存檔不殘留、二進位遺失時 `resolveMarker` 拒絕但版號仍可讀 |
+| `internal/infra/ytdlp`（resolver、pathmanager） | 錯誤分類、可重試判定、`Locate` 每次重解析、非受管模式拒絕安裝與回滾 |
+| `internal/usecase/upgrade` | 8 個併發 Trigger 只跑一次、維護旗標涵蓋整段執行且失敗後仍解除、結果殘留視窗、排空先於切換、排空逾時不中止、呼叫者取消不中斷、自動升級的三個前提、事件記錄 |
+| `internal/usecase/healthcheck` | 每次只探測一支並輪流推進、結果納入視窗、失敗寫入事件、`Run` 隨 context 結束 |
+| `internal/infra/config` | `.env` 解析與「環境變數優先」 |
+
+全部在 `-race` 下通過。
+
+### 17.3 測試抓到的兩個 bug
+
+兩個都在寫測試的當下才浮現，都不是測試寫錯。
+
+**（a）年齡限制被誤判為 bot 偵測**（`ytdlp/resolver.go`）
+
+yt-dlp 對年齡限制影片的訊息是 `Sign in to confirm your age`，而 bot 偵測那條
+的比對字串是 `sign in to confirm`，排在前面就先吃掉了。後果有兩層：使用者
+看到橘色「YouTube 擋住我們，會自己恢復」，但這支影片其實永遠不會好；而且
+`ErrBotDetected` 是可重試的，於是整條 client fallback 鏈跑滿三次解析——正是
+§14.1 明言不該對「影片本身的事實」做的事。
+
+修法是把年齡限制用具體片語（`confirm your age`、`age-restricted`、
+`inappropriate for some users`）比對，並排在 bot 偵測**之前**。
+
+**（b）網路逾時被誤判為影片不存在**（同一個 `switch`）
+
+舊碼有一條裸的 `strings.Contains(s, "age")`。`unable to download web**page**`
+裡有 `age`，於是逾時走進年齡分支、內層比對失敗、`fallthrough` 到
+`ErrNotFound`：使用者被告知「影片已刪除」，而且因為 `ErrNotFound` 不可重試，
+fallback 鏈也不會啟動。該條件已刪除。
+
+**（c）`/u/back` 在升級後的 90 秒內被靜默吞掉**（`usecase/upgrade`）
+
+`Trigger` 原本只看 `state.Fresh(now)`，不分種類。於是一次 `/u` 完成後的
+`resultLinger` 期間，`/u/back` 會被當成「你剛剛才問過，這是結果」而不執行，
+畫面顯示同一份升級成功報告——完全看不出指令沒生效。
+
+而那 90 秒正是會想回滾的時間窗：升級完 → 看結果 → 覺得不對 → 輸入
+`/u/back`。§16.3 把 `/u/back` 定位成「不必離開 VR 的逃生門」，這個 bug 讓
+逃生門在最需要它的那一刻鎖上。
+
+修法：**執行中**的工作仍然阻擋任何一種（兩者移動同一個指標，讓回滾去搶一個
+切到一半的狀態，就是volume 指向暫存目錄的來源）；**已完成**的結果只短路
+同一種。重複 `/u` 仍是「給我看結果」，重複 `/u/back` 也是（回滾兩次會往前走）。
+
+連帶修正 presenter：`/u/back` 進行中顯示「Rollback Started／Running」、失敗
+顯示「Rollback Failed」，不再一律說 Upgrade。
+
+### 17.4 真實升級與回滾
+
+以 `YTDLP_MODE=managed`、全新 volume 實跑。
+
+| 階段 | 觀測 |
+|---|---|
+| 空 volume 啟動 | bootstrap 下載 2026.08.19 至 `versions/`，寫 `current.txt`（symlink 建立失敗後退回，如 §16.5 設計） |
+| 已是最新版時 `/u` | 藍色「Already Up To Date」，不下載 |
+| 手動把 current 指向 2026.07.04 後 `/s` | 橘色、`49d old`、`/u to update` |
+| 真實升級 `/u` | 12 秒完成，煙霧測試 3/3，`current`→2026.08.19、`previous`→2026.07.04 |
+| 升級期間請求影片 | 黃色「Updating」+ 階段名，**不是**「Service Offline」（§16.10 的排序正確） |
+| **不重啟**查 `/s` | 立刻顯示 2026.08.19 —— `BinaryPath` 每次重讀指標生效 |
+| `/u/back` | 9 秒完成，兩個指標對調，`/s` 回到橘色 |
+| 非受管模式（`YTDLP_MODE=path`）的 `/u`、`/u/back` | 橘色「yt-dlp Is Not Managed」 |
+
+**spec §12「容器不重啟的情況下完成 yt-dlp 版本升級與回滾」至此達成。**
+
+### 17.5 `verify.ps1` 的 M4 檢查
+
+新增三節：`/s` 的版本與成功率兩列、非受管模式的 `/u` 與 `/u/back` 拒絕，
+以及一個獨立的受管實例（自有連接埠與 volume）驗 bootstrap 安裝、指標**只**
+存在一種形式、`/s` 不再顯示 unmanaged、最新版時 `/u` 為 no-change，以及
+`/u/back` 在該 `/u` 結果仍在殘留視窗內時**以回滾的身分回應**而非重播升級
+結果。§17.3c 的完整回歸（跨越殘留視窗真的啟動一次回滾）留在單元測試——
+端對端要做到需要 volume 裡有兩個版本，代價是每次驗收多一次 30 MB 下載與
+三支影片的煙霧測試。
+
+腳本現為 **84 項**。
+
+### 17.6 `.env` 載入（新增）
+
+`config.Load()` 於讀取環境變數**之前**先讀工作目錄下的 `.env`，**已設定的
+環境變數永遠優先**。存在的理由只有一個：`DISCORD_BOT_TOKEN` 是這個服務唯一
+需要、而人無法憑記憶重打的值，不該每次啟動都手輸入或貼進聊天視窗。
+
+檔案缺席不是錯誤——`.env` 是開發機提供憑證的方式，不是部署的方式；容器仍
+以真實環境變數供應，且檔案不得蓋過它。範本見 `.env.example`（`.env` 本身
+已在 `.gitignore`）。
+
+**連帶影響 `verify.ps1`**：驗收腳本啟動的實例改以 `-WorkingDirectory $dataDir`
+執行。否則「fail-closed、無訊號來源」那一節會從 repo 根目錄撿到 `.env`，
+拿到真的 Discord 來源，整節測試失去意義。
+
+### 17.7 M3 Discord 訊號實測（§12.4 的缺口）
+
+取得真實憑證後實測通過：
+
+| 檢查 | 結果 |
+|---|---|
+| Gateway 連線 | `connected: true` |
+| **初始 presence 快照** | 服務在使用者已經在玩時啟動，仍立即判定 online |
+| 閘門僅靠 discord 開啟 | `/s` 顯示 `open · discord`、`discord online · playing VRChat`；事件記錄 `gate opened (discord)` |
+| 影片經開啟的閘門交付 | 正常，resolve 2.3 s |
+
+其中**初始快照**是 §12.4 特別擔心的一項：`PRESENCE_UPDATE` 在這個情境下
+根本不會觸發，能判定 online 只可能是 `GUILD_CREATE` 的快照生效。若那段沒
+寫對，閘門會一直關到使用者下次切換活動為止。
+
+Bot 端設定：只需在 Developer Portal 開 **Presence Intent**；guild 權限**一個
+都不需要**（presence 來自 Gateway intent，不是 permission），邀請連結的
+`permissions=0` 即可。Bot 必須與被監測使用者同在一個 guild。

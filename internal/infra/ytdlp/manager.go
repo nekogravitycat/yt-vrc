@@ -44,6 +44,18 @@ type Manager struct {
 	// Repo is the GitHub repository releases are read from.
 	Repo string
 
+	// The three fields below are seams, and exist so this type can be
+	// tested at all. Without them a test has to reach the real GitHub
+	// and execute the binary it downloads, which is precisely the code
+	// path that must not be exercised by accident: it replaces the
+	// executable a running service resolves with.
+	//
+	// APIBase and DownloadBase point at GitHub by default; Version
+	// defaults to running the candidate's --version.
+	APIBase      string
+	DownloadBase string
+	Version      func(ctx context.Context, bin string) (string, error)
+
 	mu sync.Mutex // serialises installs; reads of the marker need none
 }
 
@@ -74,6 +86,29 @@ func (m *Manager) repo() string {
 		return m.Repo
 	}
 	return defaultRepo
+}
+
+func (m *Manager) apiBase() string {
+	if m.APIBase != "" {
+		return strings.TrimRight(m.APIBase, "/")
+	}
+	return "https://api.github.com"
+}
+
+func (m *Manager) downloadBase() string {
+	if m.DownloadBase != "" {
+		return strings.TrimRight(m.DownloadBase, "/")
+	}
+	return "https://github.com"
+}
+
+// version asks a binary what it is, through the seam so a test can
+// answer without executing anything.
+func (m *Manager) version(ctx context.Context, bin string) (string, error) {
+	if m.Version != nil {
+		return m.Version(ctx, bin)
+	}
+	return binaryVersion(ctx, bin)
 }
 
 func (m *Manager) client() *http.Client {
@@ -108,7 +143,7 @@ func (m *Manager) PreviousVersion() string {
 // directory name: the two disagreeing is exactly the situation worth
 // surfacing.
 func (m *Manager) CurrentVersion(ctx context.Context) (string, error) {
-	return binaryVersion(ctx, m.BinaryPath())
+	return m.version(ctx, m.BinaryPath())
 }
 
 func binaryVersion(ctx context.Context, bin string) (string, error) {
@@ -158,7 +193,7 @@ func (m *Manager) Ensure(ctx context.Context) error {
 func (m *Manager) CheckLatest(ctx context.Context) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	u := "https://api.github.com/repos/" + m.repo() + "/releases/latest"
+	u := m.apiBase() + "/repos/" + m.repo() + "/releases/latest"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return "", err

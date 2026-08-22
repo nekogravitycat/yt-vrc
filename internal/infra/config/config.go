@@ -93,6 +93,13 @@ type Config struct {
 }
 
 func Load() (*Config, error) {
+	// Credentials come from a gitignored .env on the dev machine and
+	// from the real environment everywhere else; the file never wins
+	// over an explicitly-set variable (see LoadDotEnv).
+	if err := LoadDotEnv(DotEnvFile); err != nil {
+		return nil, fmt.Errorf("reading %s: %w", DotEnvFile, err)
+	}
+
 	c := &Config{
 		ListenAddr:          env("LISTEN_ADDR", ":8080"),
 		PublicBaseURL:       strings.TrimRight(env("PUBLIC_BASE_URL", "http://localhost:8080"), "/"),

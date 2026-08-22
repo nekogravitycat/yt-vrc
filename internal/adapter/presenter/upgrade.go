@@ -16,10 +16,17 @@ import (
 // enter the same URL again.
 func UpgradeProgress(s upgrade.State, started bool) message.View {
 	v := message.View{Kind: message.KindProgress}
+	// Name the verb that is actually running. The two move the same
+	// pointer in opposite directions, and someone who typed /u/back
+	// needs to see that it took, not a screen that says "Upgrade".
+	what := "Upgrade"
+	if s.Kind == upgrade.KindRollback {
+		what = "Rollback"
+	}
 	if started {
-		v.Title = "Upgrade Started"
+		v.Title = what + " Started"
 	} else {
-		v.Title = "Upgrade Running"
+		v.Title = what + " Running"
 	}
 	v.Subtitle = "yt-dlp"
 	v.AddRow("Stage", s.Stage)
@@ -67,7 +74,11 @@ func UpgradeOutcome(s upgrade.State) message.View {
 		return v
 
 	default:
-		v := message.View{Kind: message.KindError, Title: "Upgrade Failed", Subtitle: "yt-dlp is unchanged"}
+		failed := "Upgrade Failed"
+		if s.Kind == upgrade.KindRollback {
+			failed = "Rollback Failed"
+		}
+		v := message.View{Kind: message.KindError, Title: failed, Subtitle: "yt-dlp is unchanged"}
 		v.AddRow("Stopped at", r.Stage)
 		if r.From != "" {
 			v.AddRow("Still on", r.From)

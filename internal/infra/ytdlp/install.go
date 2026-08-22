@@ -77,7 +77,7 @@ func (m *Manager) Install(ctx context.Context, version string, verify port.Toolc
 	if err := m.verifyChecksum(ctx, version, sum); err != nil {
 		return fail(res, StageVerifying, err, start), err
 	}
-	got, err := binaryVersion(ctx, staged)
+	got, err := m.version(ctx, staged)
 	if err != nil {
 		return fail(res, StageVerifying, err, start), err
 	}
@@ -180,7 +180,7 @@ func fail(res *port.UpgradeResult, stage string, err error, start time.Time) *po
 
 // download fetches the release asset, returning its SHA-256.
 func (m *Manager) download(ctx context.Context, version, dest string) (string, error) {
-	u := fmt.Sprintf("https://github.com/%s/releases/download/%s/%s", m.repo(), version, m.asset())
+	u := fmt.Sprintf("%s/%s/releases/download/%s/%s", m.downloadBase(), m.repo(), version, m.asset())
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return "", err
@@ -222,7 +222,7 @@ func (m *Manager) download(ctx context.Context, version, dest string) (string, e
 // SHA2-256SUMS. Size and executability (spec §4.5.3 step 5) do not
 // distinguish a truncated proxy response from a good one; a hash does.
 func (m *Manager) verifyChecksum(ctx context.Context, version, sum string) error {
-	u := fmt.Sprintf("https://github.com/%s/releases/download/%s/SHA2-256SUMS", m.repo(), version)
+	u := fmt.Sprintf("%s/%s/releases/download/%s/SHA2-256SUMS", m.downloadBase(), m.repo(), version)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return err

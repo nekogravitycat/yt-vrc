@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  M1, M2, M3 and the completed parts of M5 acceptance checks for yt-vrc.
+  M1 through M5 acceptance checks for yt-vrc.
 .DESCRIPTION
   Starts the server on a scratch data directory, exercises every
   endpoint, and verifies the produced media with ffprobe.
@@ -67,7 +67,7 @@ $env:GATE_ENABLED = "true"
 Remove-Item (Join-Path $env:DATA_DIR "state\override.json") -ErrorAction SilentlyContinue
 $log = Join-Path $dataDir "server.log"
 $proc = Start-Process -FilePath $exe -RedirectStandardOutput $log `
-        -RedirectStandardError (Join-Path $dataDir "server.err") -PassThru -WindowStyle Hidden
+        -RedirectStandardError (Join-Path $dataDir "server.err") -WorkingDirectory $dataDir -PassThru -WindowStyle Hidden
 Start-Sleep -Seconds 2
 Check "server listening" (-not $proc.HasExited) "process exited; see $log"
 
@@ -189,7 +189,7 @@ try {
     }
 
     Section "M2 - every endpoint returns playable media"
-    $endpoints = @{ "h"="help"; "s"="status"; "l"="list"; "u"="not-implemented";
+    $endpoints = @{ "h"="help"; "s"="status"; "l"="list"; "u"="upgrade";
                     "nonsense"="unrecognised"; "aaaaaaaaaaa"="missing video" }
     foreach ($e in $endpoints.GetEnumerator()) {
         $body = & curl.exe -sL "$base/$($e.Key)"
@@ -263,7 +263,7 @@ try {
     Remove-Item Env:FAKE_SIGNAL_ONLINE
     $closedLog = Join-Path $dataDir "closed.log"
     $closedProc = Start-Process -FilePath $exe -RedirectStandardOutput $closedLog `
-                  -RedirectStandardError (Join-Path $dataDir "closed.err") -PassThru -WindowStyle Hidden
+                  -RedirectStandardError (Join-Path $dataDir "closed.err") -WorkingDirectory $dataDir -PassThru -WindowStyle Hidden
     Start-Sleep -Seconds 2
     $cbase = "http://localhost:$closedPort"
     try {
@@ -299,6 +299,93 @@ try {
     Check "cache is empty after purge" ($dbg -match "Nothing cached") "$dbg"
     $dbg = & curl.exe -s "$base/d/$VideoId`?debug=1"
     Check "/d on a missing video says so" ($dbg -match "Nothing to Drop") "$dbg"
+
+    Section "M4 - health on /s (spec 4.6)"
+    $dbg = & curl.exe -s "$base/s?debug=1"
+    Check "status reports the yt-dlp version and its age" ($dbg -match "(?m)^\s+yt-dlp\s+\d{4}\.\d{2}\.\d{2}.*old") "$dbg"
+    # "no samples yet" and "0%" are deliberately different: a service
+    # nobody has used has no evidence against it.
+    Check "status reports the resolve window" ($dbg -match "(?m)^\s+Resolves\s+(no samples yet|\d+%)") "$dbg"
+
+    Section "M4 - /u refuses an unmanaged toolchain (implementation.md 16.8)"
+    # The dev default is YTDLP_MODE=path. A service must not replace a
+    # binary it did not install, and must say so plainly rather than
+    # failing somewhere deep in a download.
+    $dbg = & curl.exe -s "$base/u?debug=1"
+    Check "/u explains it does not manage yt-dlp" ($dbg -match "Is Not Managed") "$dbg"
+    $dbg = & curl.exe -s "$base/u/back?debug=1"
+    Check "/u/back refuses the same way" ($dbg -match "Is Not Managed") "$dbg"
+
+    Section "M4 - managed toolchain (spec 4.5.2, 4.5.3)"
+    # A separate instance on a fresh volume, because the interesting
+    # part is what happens when there is nothing installed yet: the
+    # image deliberately ships no yt-dlp so that upgrading it never
+    # means rebuilding the image (spec 9.1).
+    $mgdPort = $Port + 2
+    $mgdData = Join-Path $dataDir "managed"
+    Remove-Item -Recurse -Force $mgdData -ErrorAction SilentlyContinue
+    $env:DATA_DIR = $mgdData
+    $env:LISTEN_ADDR = ":$mgdPort"
+    $env:YTDLP_MODE = "managed"
+    $mgdLog = Join-Path $dataDir "managed.log"
+    $mgdProc = Start-Process -FilePath $exe -RedirectStandardOutput $mgdLog `
+               -RedirectStandardError (Join-Path $dataDir "managed.err") -WorkingDirectory $dataDir -PassThru -WindowStyle Hidden
+    $mbase = "http://localhost:$mgdPort"
+    try {
+        # Bootstrap downloads a release before the listener opens.
+        $ready = $false
+        foreach ($i in 1..60) {
+            Start-Sleep -Seconds 1
+            if ((& curl.exe -s -o NUL -w "%{http_code}" "$mbase/s") -eq "200") { $ready = $true; break }
+        }
+        Check "managed instance bootstraps and listens" $ready "no response after 60s; see $mgdLog"
+
+        if ($ready) {
+            $ytdlpDir = Join-Path $mgdData "ytdlp"
+            $versions = @(Get-ChildItem (Join-Path $ytdlpDir "versions") -Directory -ErrorAction SilentlyContinue)
+            Check "a version was installed into the volume" ($versions.Count -ge 1) "versions/ is empty"
+            # Either form of the pointer is correct: a symlink where the
+            # platform allows one, a text file where it does not
+            # (implementation.md 16.5). What must never happen is both.
+            $sym = Test-Path (Join-Path $ytdlpDir "current")
+            $txt = Test-Path (Join-Path $ytdlpDir "current.txt")
+            Check "a current pointer exists" ($sym -or $txt) "neither current nor current.txt"
+            Check "only one form of the pointer exists" (-not ($sym -and $txt)) "both forms present; they can disagree"
+
+            $dbg = & curl.exe -s "$mbase/s?debug=1"
+            Check "status no longer says unmanaged" ($dbg -notmatch "unmanaged") "$dbg"
+
+            # Bootstrap installs the newest release, so /u has nothing to
+            # do -- and must say so rather than spend a download proving it.
+            & curl.exe -s -o NUL "$mbase/u"
+            $done = $false
+            foreach ($i in 1..30) {
+                Start-Sleep -Seconds 1
+                $dbg = & curl.exe -s "$mbase/u?debug=1"
+                if ($dbg -match "Already Up To Date") { $done = $true; break }
+            }
+            Check "/u on the newest release is a no-change" $done "$dbg"
+
+            # Asked immediately after the /u above, while that result is
+            # still inside its linger window. A finished run only
+            # short-circuits the same verb, so /u/back must answer as
+            # itself rather than replay the upgrade outcome
+            # (implementation.md 17.3c). The linger logic proper is
+            # covered by the unit tests; what is cheap to prove here is
+            # that the two verbs are told apart at all.
+            #
+            # One version installed means there is nowhere to go back to,
+            # and that is refused before a run is even started.
+            $dbg = & curl.exe -s "$mbase/u/back?debug=1"
+            Check "/u/back answers as a rollback, not as the /u result" ($dbg -notmatch "Up To Date") "$dbg"
+            Check "a rollback with no previous version is refused" ($dbg -match "Nothing To Roll Back To") "$dbg"
+        }
+    } finally {
+        if ($mgdProc -and -not $mgdProc.HasExited) { Stop-Process -Id $mgdProc.Id -Force }
+        $env:DATA_DIR = Join-Path $dataDir "data"
+        $env:LISTEN_ADDR = ":$Port"
+        Remove-Item Env:YTDLP_MODE -ErrorAction SilentlyContinue
+    }
 
     Section "M2 - mp4 variant and debug view"
     Check "help as mp4"  ((Get-FinalCode "h.mp4") -eq "200") "got $(Get-FinalCode 'h.mp4')"

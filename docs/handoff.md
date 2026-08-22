@@ -1,6 +1,6 @@
 # 專案現況與交接
 
-**更新於**：2026-08-22（M4 程式碼完成）
+**更新於**：2026-08-22（M4 驗證完成、M3 Discord 實測通過）
 **用途**：讓新的工作階段快速上手。閱讀順序建議為本文件 → `implementation.md` → `spec.md`。
 
 ---
@@ -22,33 +22,30 @@
 |---|---|---|
 | M1 播放路徑 | **完成，VRChat 驗收通過** | 播放與 seek 均已實測（implementation.md §11.5） |
 | M2 訊息影片 | **完成，VRChat 驗收通過** | 顯示文字為英文 |
-| M3 上線閘門 | **完成，待 VRChat 實測** | Discord 實作未經真實憑證驗證（implementation.md §12.4） |
-| M4 熱更新與健康度 | **程式碼完成，完全未經驗證** | 見 §2.1——沒有單元測試、驗收腳本未涵蓋、從未跑過一次真實升級 |
+| M3 上線閘門 | **完成，Discord 訊號實測通過** | 真實憑證下驗過，含初始 presence 快照（implementation.md §17.7）。VRChat 內的訊息影片仍待確認 |
+| M4 熱更新與健康度 | **完成，驗收條件達成** | 真實升級與回滾均已實跑，不重啟生效（implementation.md §17） |
 | M5 韌性與快取 | **完成**（滑動視窗刻意廢除） | singleflight、`MAX_CONCURRENT_JOBS`、LRU、client fallback、`/l` `/e` `/p` `/d` `/i` 全數完成；廢除理由見 implementation.md §14.2 |
 | M6 MP4 與預熱 | 未開始 | 訊息影片已支援 MP4，但影片本體的 MP4 packager 未做 |
 
 另已修正 implementation.md §11.3 的訊息影片網址問題（穩定 slot 路徑，見 §13）。
 
-程式碼規模：48 個 Go 檔、約 7,700 行。測試：`internal/adapter/httpapi`、
-`internal/domain/availability`、`internal/infra/store`、`internal/usecase/playvideo`，
-`-race` 下全過。`scripts/verify.ps1` 共 72 項，全過（**尚未涵蓋 M4**）。
+程式碼規模：約 55 個 Go 檔。測試涵蓋 `internal/adapter/httpapi`、
+`internal/domain/availability`、`internal/domain/health`、`internal/infra/config`、
+`internal/infra/store`、`internal/infra/ytdlp`、`internal/usecase/playvideo`、
+`internal/usecase/upgrade`、`internal/usecase/healthcheck`，`-race` 下全過。
+`scripts/verify.ps1` 共 84 項，全過。
 
-### 2.1 M4 的驗證缺口（動手前先讀）
+### 2.1 M4 驗證期間修掉的三個 bug
 
-M4 的程式碼通過 `go build`、`go vet`、Linux 交叉編譯與現有全部測試，
-但**沒有任何一行 M4 的行為被驗證過**：
+寫測試時才浮現，全部是真的（詳見 implementation.md §17.3）：
 
-1. **新程式碼零單元測試** —— `internal/domain/health`、`internal/infra/ytdlp`
-   （manager／marker／install／smoketest）、`internal/usecase/upgrade`、
-   `internal/usecase/healthcheck` 全部沒有測試檔
-2. **`ytdlp.Manager` 目前不可測** —— 它會真的打 GitHub、真的執行下載回來的
-   二進位檔。要測必須先加三個接縫：`Version` 回呼（取代 `binaryVersion`）、
-   `APIBase`、`DownloadBase`
-3. **從未執行過真實升級** —— spec §12 的 M4 驗收條件
-   「容器不重啟的情況下完成 yt-dlp 版本升級與回滾」**未達成**
-4. **`scripts/verify.ps1` 未加入 M4 檢查**
-
-換句話說：M4 目前的狀態是「寫完了」，不是「能用」。
+1. **年齡限制被誤判為 bot 偵測** —— yt-dlp 說 `Sign in to confirm your age`，
+   而 bot 偵測比對 `sign in to confirm` 且排在前面。使用者被告知「會自己
+   恢復」但其實永遠不會，而且錯誤變成可重試，白跑整條 client fallback 鏈
+2. **網路逾時被誤判為影片不存在** —— 舊碼有一條裸的 `Contains(s, "age")`，
+   而 `unable to download web**page**` 裡有 `age`
+3. **`/u/back` 在升級後 90 秒內被靜默吞掉** —— `Trigger` 的結果殘留短路
+   不分種類。那 90 秒正是會想回滾的時間窗，逃生門在最需要它時鎖上
 
 ---
 
@@ -170,12 +167,17 @@ CDN 大量提供影片，啟用快取正是踩在該條款上。
 
 ### 7.2 M3 的 VRChat 實測
 
-閘門的所有行為都只在瀏覽器／curl 驗證過（`scripts/verify.ps1` 72 項全過），
-尚未在 VRChat 內確認：
+**Discord 訊號已在真實憑證下驗過**（implementation.md §17.7）：Gateway 連線、
+初始 presence 快照、閘門僅靠 discord 開啟、影片經開啟的閘門交付，全部正常。
+
+閘門的其餘行為仍只在瀏覽器／curl 驗證過，尚未在 VRChat 內確認：
 
 1. 灰色的「Service Offline」訊息影片在 AVPro 中是否正常播放
-2. `/on`、`/off`、`/e`、`/p`、`/i`、`/d` 的訊息影片
-3. Discord Presence 訊號（憑證未取得，程式碼從未執行過）
+2. `/on`、`/off`、`/e`、`/p`、`/i`、`/d`、`/u` 的訊息影片
+3. 離線去抖動的實際行為（需關掉 VRChat 並等過 `GATE_GRACE_PERIOD`）
+
+**注意 deployment.md §6.1a 的 5e 已過時**：那條寫在沒有訊號來源的年代。
+現在 `/off` 只是把控制權交還給 Discord，作者在玩的時候影片仍會播。
 
 ### 7.3 實驗室網路的解析成功率
 
@@ -188,19 +190,14 @@ HiNet IP 完成。
 
 依序：
 
-1. **補齊 M4 的測試與驗證**（見 §2.1）—— 這是目前最大的風險：熱更新是唯一
-   會**替換掉正在服務的執行檔**的功能，而它一次都沒跑過。先加測試接縫與
-   單元測試，再以 `YTDLP_MODE=managed` 實跑一次 `/u` 與 `/u/back`
-2. **取得 Discord Bot 憑證並實測 M3** —— `internal/infra/signal/discord.go`
-   已照介面寫好但**從未跑過**。需要 Developer Portal 啟用 Presence Intent，
-   且 Bot 與被監測使用者同在一個 guild
-3. **VRChat 內實測閘門與新端點** —— `/on`、`/off`、`/e`、`/p`、`/i`、`/d`、
-   `/u` 的訊息影片都只在瀏覽器驗證過
-4. **Dockerfile** —— 需含 `python3`（yt-dlp zipapp 的執行環境）與新版 deno
+1. **VRChat 內實測閘門與新端點** —— `/on`、`/off`、`/e`、`/p`、`/i`、`/d`、
+   `/u` 的訊息影片都只在瀏覽器驗證過。需要作者戴上頭盔，無法自動化
+2. **Dockerfile** —— 需含 `python3`（yt-dlp zipapp 的執行環境）與新版 deno
    （解 `n` 參數挑戰用；分塊下載已不依賴它，但缺少會使部分格式無法取得），
    並設 `YTDLP_MODE=managed`。**不要用 `yt-dlp_linux`**：它連結 glibc，
-   在 Alpine（musl）上起不來
-5. **M6 MP4 路徑與預熱** —— `/w`、`/r`，以及影片本體的 MP4 packager
+   在 Alpine（musl）上起不來。注意 `.env` 不進映像——憑證走真實環境變數
+3. **M6 MP4 路徑與預熱** —— `/w`、`/r`，以及影片本體的 MP4 packager
+4. **實驗室網路的解析成功率**（§7.3）—— spec §3.1 列為部署前的必要驗收條件
 
 ---
 
