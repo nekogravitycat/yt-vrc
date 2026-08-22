@@ -197,6 +197,7 @@ func run() error {
 		Events:          events,
 		OverrideTTL:     cfg.GateOverrideTTL,
 		AdminIPs:        cfg.AdminIPs,
+		AdminToken:      cfg.AdminToken,
 		CacheLimitBytes: cfg.CacheMaxBytes,
 		Budget:          budget,
 		Upgrade:         upgrader,

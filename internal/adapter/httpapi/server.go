@@ -54,6 +54,9 @@ type Server struct {
 	// AdminIPs restricts side-effecting commands (/on /off /p /d /u
 	// /mode) to these client addresses. Empty means unrestricted.
 	AdminIPs []string
+	// AdminToken is an alternate credential for those same commands,
+	// checked as ?key=... when the address isn't in AdminIPs; empty disables it.
+	AdminToken string
 	// CacheLimitBytes is reported by /s; enforcement lives in the store.
 	CacheLimitBytes int64
 

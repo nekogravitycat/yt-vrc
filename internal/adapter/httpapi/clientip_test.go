@@ -40,3 +40,35 @@ func TestIPAllowedChecksMembership(t *testing.T) {
 		t.Error("unlisted IP should be refused once a list is configured")
 	}
 }
+
+func TestAdminAllowedByIP(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/on", nil)
+	r.RemoteAddr = "203.0.113.9:12345"
+	if !adminAllowed(r, []string{"203.0.113.9"}, "secret") {
+		t.Error("a listed IP should be allowed without needing the token")
+	}
+}
+
+func TestAdminAllowedByToken(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/on?key=secret", nil)
+	r.RemoteAddr = "198.51.100.1:12345" // not in the IP list
+	if !adminAllowed(r, []string{"203.0.113.9"}, "secret") {
+		t.Error("a matching ?key= should be allowed even off the IP list")
+	}
+}
+
+func TestAdminAllowedRejectsWrongToken(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/on?key=wrong", nil)
+	r.RemoteAddr = "198.51.100.1:12345"
+	if adminAllowed(r, []string{"203.0.113.9"}, "secret") {
+		t.Error("a mismatched token must not be allowed")
+	}
+}
+
+func TestAdminAllowedTokenDisabledWhenUnset(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/on?key=anything", nil)
+	r.RemoteAddr = "198.51.100.1:12345"
+	if adminAllowed(r, []string{"203.0.113.9"}, "") {
+		t.Error("an empty ADMIN_TOKEN must disable the ?key= path entirely")
+	}
+}

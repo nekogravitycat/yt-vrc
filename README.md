@@ -77,6 +77,15 @@ playback under. Empty (the default) means unrestricted.
 availability gate would already let watch a video, since they do the
 same underlying resolve work as playback (see Availability gate below).
 
+**`ADMIN_TOKEN`** — an alternate credential for the same commands,
+checked as `?key=...` on the URL when the caller's address isn't in
+`ADMIN_IPS` (a query string, not a header, since the only interface is
+a pasted URL). Useful when the operator has no address stable enough
+to allowlist — e.g. a phone on 4G, or an ISP that only hands out a
+dynamic IPv6 while the IPv4 is static: put the static IPv4 in
+`ADMIN_IPS` and reach for `?key=` only from elsewhere. Empty (the
+default) disables it entirely.
+
 **`/mode`** — selects the policy that governs who can *play video*,
 switchable at runtime and persisted across restarts:
 
@@ -131,6 +140,7 @@ Common settings:
 | `FFMPEG_PATH` / `YTDLP_PATH` | `ffmpeg` / `yt-dlp` | External tool locations | `.env` |
 | `GATE_ENABLED` | `true` | `false` removes the availability check entirely | `config.yaml` |
 | `ADMIN_IPS` | empty | Restricts `/on /off /p /d /u /mode /l /e /i` — see Access control | `.env` |
+| `ADMIN_TOKEN` | empty | `?key=...` alternate to `ADMIN_IPS` — see Access control | `.env` |
 | `WHITELIST_IPS` | empty | Who `/mode/whitelist` admits | `.env` |
 
 For the complete list, see `CLAUDE.md`.

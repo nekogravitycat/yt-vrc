@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"crypto/subtle"
 	"net"
 	"net/http"
 )
@@ -36,4 +37,19 @@ func ipAllowed(ip string, list []string) bool {
 		}
 	}
 	return false
+}
+
+// adminAllowed allows r if its address is in ips, or it carries a
+// matching ?key=token, a stand-in for an address ips can't pin down.
+// CRITICAL: empty token must reject -- a caller sending no ?key= would
+// otherwise match by comparing two empty strings.
+func adminAllowed(r *http.Request, ips []string, token string) bool {
+	if ipAllowed(clientIP(r), ips) {
+		return true
+	}
+	if token == "" {
+		return false
+	}
+	got := r.URL.Query().Get("key")
+	return subtle.ConstantTimeCompare([]byte(got), []byte(token)) == 1
 }

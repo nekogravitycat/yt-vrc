@@ -150,6 +150,15 @@ additions worth knowing while developing:
   to watch in whitelist mode must not thereby gain purge/upgrade/mode-
   switch/info power. `/w` and `/r` are deliberately not on this list —
   see the gate fact above.
+- `ADMIN_TOKEN` is an OR'd-in alternate to `ADMIN_IPS` for the same
+  commands, checked as `?key=...` (`adminAllowed` in
+  `internal/adapter/httpapi/clientip.go`, `crypto/subtle` constant-time
+  compare). Exists because the operator interface is a pasted URL, not
+  a browser — a header-based credential isn't reachable from it, and an
+  address-based allowlist can't pin down a connection that legitimately
+  arrives from a different family/prefix than the operator's static IP
+  (e.g. IPv4 static but IPv6 dynamic). Empty disables it; still opt-in,
+  same as `ADMIN_IPS`.
 - `WHITELIST_IPS` is who `/mode/whitelist` admits; kept as a separate list
   from `ADMIN_IPS` on purpose.
 
@@ -185,6 +194,7 @@ changes nothing).
 | `RESOLVER_PROXY` | empty | `socks5://` or `http://`, routes resolve traffic only; may embed credentials, so it's not a `config.yaml` value |
 | `DISCORD_BOT_TOKEN` / `DISCORD_USER_ID` | — | both required to register the Discord signal at all |
 | `ADMIN_IPS` | empty (unrestricted) | comma-separated; gates `/on /off /p /d /u /mode /l /e /i` |
+| `ADMIN_TOKEN` | empty (disabled) | bearer secret for the same commands via `?key=...`, OR'd with `ADMIN_IPS` |
 | `WHITELIST_IPS` | empty | comma-separated; who `/mode/whitelist` admits |
 | `FAKE_SIGNAL_ONLINE` | unset | dev-only stand-in signal; set `true`/`false` to enable |
 

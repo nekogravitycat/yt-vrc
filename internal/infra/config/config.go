@@ -64,6 +64,10 @@ type Config struct {
 	// access setting -- override/purge power isn't part of "open" mode.
 	// Empty = unrestricted (opt-in, not a breaking default).
 	AdminIPs []string
+	// AdminToken is an alternate admin credential, OR'd with AdminIPs,
+	// for a client address AdminIPs can't pin down. Checked as ?key=...
+	// since the URL-paste-only interface rules out a header. Empty disables it.
+	AdminToken string
 	// WhitelistIPs is who ModeWhitelist admits -- kept separate from
 	// AdminIPs so watch access never implies /on, /p, or /mode power.
 	WhitelistIPs []string
@@ -133,6 +137,7 @@ func Load() (*Config, error) {
 		DiscordBotToken: os.Getenv("DISCORD_BOT_TOKEN"),
 		DiscordUserID:   os.Getenv("DISCORD_USER_ID"),
 		AdminIPs:        envList("ADMIN_IPS", nil),
+		AdminToken:      os.Getenv("ADMIN_TOKEN"),
 		WhitelistIPs:    envList("WHITELIST_IPS", nil),
 
 		// config.yaml, then env override: behavior tuning that's the

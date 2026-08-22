@@ -33,7 +33,7 @@ var adminCommands = map[string]bool{
 func (s *Server) serveCommand(w http.ResponseWriter, r *http.Request, route Route) {
 	spec := route.Spec
 
-	if adminCommands[route.Command] && !ipAllowed(clientIP(r), s.AdminIPs) {
+	if adminCommands[route.Command] && !adminAllowed(r, s.AdminIPs, s.AdminToken) {
 		s.Log.Info("admin command refused", "command", route.Command, "ip", clientIP(r))
 		s.deliver(w, r, route.Command, presenter.Forbidden(), spec, http.StatusForbidden)
 		return
