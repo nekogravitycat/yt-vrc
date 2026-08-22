@@ -85,7 +85,7 @@ $env:DATA_DIR = ".\data"
 go run .\cmd\yt-vrc          # 預設 :8080
 ```
 
-### 5.2 自動化驗收（45 項）
+### 5.2 自動化驗收（50 項）
 
 ```powershell
 .\scripts\verify.ps1                      # 預設影片
@@ -93,7 +93,8 @@ go run .\cmd\yt-vrc          # 預設 :8080
 ```
 
 **注意**：失敗的影片請求同樣以 200 結束（錯誤是可播放的訊息影片），
-所以不能只看狀態碼。腳本比對最終 URL 是否落在 `/m/` 之下來區分。
+所以不能只看狀態碼。腳本比對 playlist 中的 segment 路徑是否落在 `/m/`
+之下來區分「真的播出來」與「播出一則錯誤訊息」。
 
 ### 5.3 環境陷阱
 
@@ -202,3 +203,17 @@ internal/
   由畫質推導，僅以 `video_id` 為鍵會讓 720p 請求拿到 1080p 軌道
 - **共用工作使用 `context.WithoutCancel`** —— 先送請求者放棄時不得中斷其他
   仍在等待的觀看者
+
+### 9.2 AVPro 的硬性要求（實測，詳見 implementation.md §10、§11）
+
+- **AVPro 在 PC 上就是 Windows Media Foundation**（UA 為 `NSPlayer/WMFSDK`）
+- **VRChat 會先用自己的解析器跑過網址**，再交給 AVPro。輸出必須同時讓
+  yt-dlp 與 WMF 都能理解
+- **不可用轉址交付 playlist** —— AVPro 不跟隨轉址，會把 302 的 HTML 主體
+  當成無效格式
+- **必須產生 master playlist**（含 `EXT-X-STREAM-INF` 與 `CODECS`），否則
+  yt-dlp 解析出的 vcodec/acodec 為 None
+- **HLS 版本用 3** —— 不要加 `-hls_flags independent_segments`（會升到 v6）
+- **WMF 對每個 segment 都送 `Range: bytes=0-`** —— Range 支援是必要條件
+- **「Media cannot be played, maybe due to invalid format」是通用載入失敗
+  訊息**，最常見的真因是 404，不是編碼問題。先確認產物是否存在
