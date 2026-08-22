@@ -26,12 +26,11 @@ const (
 	StageDone        = "done"
 )
 
-// Install downloads version, checks it, smoke-tests it and only then
-// makes it current (spec §4.5.3).
-//
-// The order is the whole point: a version that cannot resolve video is
-// never allowed to become the one serving users, so a bad release costs
-// a failed /u rather than an outage discovered from inside VRChat.
+// Install downloads version, verifies it, smoke-tests it, and only then
+// switches current (spec §4.5.3).
+// CRITICAL: order is the invariant — a version that fails to resolve
+// video must never go live, so a bad release costs a failed /u instead
+// of an outage discovered from inside VRChat.
 func (m *Manager) Install(ctx context.Context, version string, verify port.ToolchainVerifier, progress func(stage string)) (*port.UpgradeResult, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -107,13 +106,7 @@ func (m *Manager) Install(ctx context.Context, version string, verify port.Toolc
 	if err := os.Rename(staging, dir); err != nil {
 		return fail(res, StageSwitching, err, start), err
 	}
-	if res.From != "" && res.From != version {
-		// Best effort: losing the rollback pointer must not fail an
-		// upgrade that has already proved itself.
-		if err := m.setMarker(previousMarker, res.From); err != nil && m.Log != nil {
-			m.Log.Warn("could not record previous version", "version", res.From, "err", err)
-		}
-	}
+	m.rememberPrevious(res.From, version)
 	if err := m.setMarker(currentMarker, version); err != nil {
 		return fail(res, StageSwitching, err, start), err
 	}
@@ -123,9 +116,8 @@ func (m *Manager) Install(ctx context.Context, version string, verify port.Toolc
 	return res, nil
 }
 
-// Rollback returns to the previous version (spec §4.5.3 step 8, exposed
-// as /u/back for the case where a version passes its smoke test and
-// still misbehaves in real use).
+// Rollback returns to the previous version — for when a version passes
+// its smoke test but still misbehaves in real use (spec §4.5.3 step 8).
 func (m *Manager) Rollback(ctx context.Context, verify port.ToolchainVerifier) (*port.UpgradeResult, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -148,10 +140,9 @@ func (m *Manager) Rollback(ctx context.Context, verify port.ToolchainVerifier) (
 	if verify != nil {
 		res.Stage = StageSmokeTest
 		res.SmokeTests = verify.Verify(ctx, m.binaryFor(prev))
-		// A failing smoke test does not block a rollback. Rollback is
-		// what you reach for when the current version is broken, and
-		// refusing it because the older one also struggles would leave
-		// no way out: YouTube-side breakage fails every version at once.
+		// NOTE: a failing smoke test does not block rollback — refusing
+		// would remove the only recovery path when YouTube-side breakage
+		// fails every installed version at once.
 		for _, t := range res.SmokeTests {
 			if !t.OK && m.Log != nil {
 				m.Log.Warn("rollback target failed a smoke test", "version", prev, "test", t.Name, "err", t.Err)
@@ -160,16 +151,24 @@ func (m *Manager) Rollback(ctx context.Context, verify port.ToolchainVerifier) (
 	}
 
 	res.Stage = StageSwitching
-	if res.From != "" && res.From != prev {
-		if err := m.setMarker(previousMarker, res.From); err != nil && m.Log != nil {
-			m.Log.Warn("could not record previous version", "version", res.From, "err", err)
-		}
-	}
+	m.rememberPrevious(res.From, prev)
 	if err := m.setMarker(currentMarker, prev); err != nil {
 		return fail(res, StageSwitching, err, start), err
 	}
 	res.Succeeded, res.Stage, res.Took = true, StageDone, time.Since(start)
 	return res, nil
+}
+
+// rememberPrevious best-effort points previousMarker at from (skipped if
+// it equals the version being switched to); failure must not fail an
+// upgrade/rollback that has already proved itself.
+func (m *Manager) rememberPrevious(from, to string) {
+	if from == "" || from == to {
+		return
+	}
+	if err := m.setMarker(previousMarker, from); err != nil && m.Log != nil {
+		m.Log.Warn("could not record previous version", "version", from, "err", err)
+	}
 }
 
 func fail(res *port.UpgradeResult, stage string, err error, start time.Time) *port.UpgradeResult {
@@ -209,9 +208,9 @@ func (m *Manager) download(ctx context.Context, version, dest string) (string, e
 	if n < 64<<10 {
 		return "", fmt.Errorf("downloaded %s is only %d bytes", m.asset(), n)
 	}
-	// Chmod separately: umask can strip the execute bits O_CREATE asked
-	// for, and a downloaded interpreter script that is not executable
-	// fails much later with a confusing "permission denied".
+	// NOTE: chmod separately — umask can strip the execute bits O_CREATE
+	// asked for; an unexecutable interpreter script then fails much later
+	// with a confusing "permission denied".
 	if err := os.Chmod(dest, 0o755); err != nil {
 		return "", err
 	}

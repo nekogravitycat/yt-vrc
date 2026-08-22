@@ -13,23 +13,20 @@ import (
 	"github.com/nekogravitycat/yt-vrc/internal/domain/availability"
 )
 
-// Discord watches one user's rich presence for a VRChat activity.
+// Discord watches one user's rich presence for a VRChat activity; the
+// only real availability.Signal implementation.
 //
-// A bot account is used, never a user token: driving the gateway with a
-// personal token is a self-bot, which breaks Discord's terms and risks
-// the account (spec §4.4.2). The bot needs the privileged Presence
-// Intent enabled in the developer portal, and must share a guild with
-// the watched user -- presence is only ever delivered per guild.
+// CRITICAL: uses a bot token, never a user token — driving the gateway
+// with a personal token is a self-bot, against Discord's ToS and risks
+// the account.
 //
-// The reading is maintained in the background and Status answers from
-// the last known value, as the Signal contract requires. Presence
-// arrives two ways: a snapshot inside GUILD_CREATE when the gateway
-// connects, and PRESENCE_UPDATE for every later change. Handling only
-// the latter would leave the gate closed until the user next changed
-// activity.
+// NOTE: needs the privileged Presence Intent enabled in the developer
+// portal and must share a guild with the watched user (presence is
+// per-guild); reads both the GUILD_CREATE snapshot and PRESENCE_UPDATE
+// so the gate doesn't stay closed until the user's next activity change.
 //
-// UNVERIFIED: written against the documented gateway behaviour but not
-// yet exercised against a real bot -- no credentials have been issued.
+// UNVERIFIED: written against documented gateway behaviour, not yet
+// exercised against a real bot.
 type Discord struct {
 	Token        string
 	UserID       string
@@ -62,9 +59,6 @@ func (d *Discord) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("discord session: %w", err)
 	}
-	// Guilds is required for the GUILD_CREATE that carries the initial
-	// presence snapshot; GuildPresences is the privileged intent that
-	// makes presence visible at all.
 	s.Identify.Intents = discordgo.IntentsGuilds | discordgo.IntentsGuildPresences
 
 	s.AddHandler(func(_ *discordgo.Session, p *discordgo.PresenceUpdate) {
@@ -115,9 +109,8 @@ func (d *Discord) apply(activities []*discordgo.Activity, presence discordgo.Sta
 			break
 		}
 	}
-	// An offline or invisible user reports no activities at all, which
-	// is indistinguishable from "playing nothing" here. Both mean the
-	// gate should close, so the distinction only affects what /s says.
+	// Offline/invisible reports no activities, same as "playing nothing"
+	// here; both close the gate, this only changes what /s reports.
 	if !online && presence == discordgo.StatusOffline {
 		detail = "user appears offline on Discord"
 	}
@@ -140,10 +133,9 @@ func (d *Discord) Status(context.Context) (availability.Status, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	if !d.connected {
-		// Report the failure rather than a stale offline: the gate
-		// treats an errored source as no evidence either way, and its
-		// grace period is what keeps a dropped gateway from cutting
-		// off playback.
+		// NOTE: report the error rather than a stale offline — the gate
+		// treats an errored source as no evidence either way, relying on
+		// its grace period to survive a dropped gateway.
 		return availability.Status{
 			Confidence: availability.ConfidenceMedium,
 			ObservedAt: d.observedAt,

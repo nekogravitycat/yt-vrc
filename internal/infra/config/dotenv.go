@@ -6,21 +6,16 @@ import (
 	"strings"
 )
 
-// DotEnvFile is the optional file read before the environment is
-// consulted. It exists for one setting in particular: DISCORD_BOT_TOKEN
-// is a credential that must not be typed into a shell on every start,
-// pasted into a chat, or committed -- and it is the only value this
-// service needs that a person cannot simply retype from memory.
+// DotEnvFile holds credentials (e.g. DISCORD_BOT_TOKEN) that shouldn't
+// be typed into a shell or committed on every run.
 const DotEnvFile = ".env"
 
-// LoadDotEnv reads KEY=VALUE lines from path into the process
-// environment, leaving any variable that is already set alone.
+// LoadDotEnv reads KEY=VALUE lines from path into the environment,
+// skipping keys already set.
 //
-// The precedence is deliberate: a real environment variable is an
-// explicit act by whoever started the process (a container's env, a
-// one-off override in a test run), and a file on disk must never
-// silently outrank it. A missing file is not an error -- the file is
-// how the dev machine supplies credentials, not how deployment does.
+// NOTE: an explicit env var always wins over the file -- deliberate, so
+// a container's env or a test override is never silently shadowed by
+// .env. A missing file is not an error.
 func LoadDotEnv(path string) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -37,8 +32,7 @@ func LoadDotEnv(path string) error {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		// "export FOO=bar" is what you get from copying a line out of a
-		// shell script, and rejecting it would be a pointless surprise.
+		// Tolerate "export FOO=bar" pasted from a shell script.
 		line = strings.TrimPrefix(line, "export ")
 		k, v, ok := strings.Cut(line, "=")
 		if !ok {
@@ -58,10 +52,8 @@ func LoadDotEnv(path string) error {
 	return sc.Err()
 }
 
-// unquote strips one layer of matching quotes. Quoting is worth
-// supporting because a Discord token is opaque enough that a person
-// will reasonably wrap it, and a stray quote character would fail
-// authentication with no clue as to why.
+// unquote strips one layer of matching quotes -- an opaque token like a
+// Discord bot token is often pasted pre-quoted.
 func unquote(v string) string {
 	if len(v) >= 2 {
 		if (v[0] == '"' && v[len(v)-1] == '"') || (v[0] == '\'' && v[len(v)-1] == '\'') {

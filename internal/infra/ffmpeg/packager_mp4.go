@@ -18,12 +18,9 @@ const MP4Name = "video.mp4"
 // MP4Packager remuxes local track files into one progressive MP4, for
 // worlds built on Unity's VideoPlayer rather than AVPro (spec §4.2.1).
 //
-// This path has no equivalent of HLS's "first segment is enough": an
-// MP4 is only useful once it is whole, because Content-Length and seek
-// both need the finished file. That costs nothing extra here -- the
-// architecture already packages to completion before publishing
-// (implementation.md §3) -- which is why the two packagers can share an
-// interface that promises a complete artifact.
+// NOTE: only useful once whole — Content-Length and seek both need the
+// finished file, which matches how packaging already runs to completion
+// before publishing.
 type MP4Packager struct {
 	FFmpegPath string
 }
@@ -44,16 +41,11 @@ func (p *MP4Packager) Package(ctx context.Context, res *video.Resolution, srcVid
 	}
 	args = append(args,
 		"-c", "copy",
-		// No aac_adtstoasc here: that filter strips ADTS headers for
-		// MPEG-TS, and both source and destination are MP4 already.
-		// Applying it anyway is what turns a working audio track into
-		// silence.
-		//
-		// +faststart rewrites the file once muxing is done so the moov
-		// atom sits at the front. Without it a player must read to the
-		// end of the file before it can start, which over HTTP means
-		// downloading the whole thing (spec §4.2.1).
-		"-movflags", "+faststart",
+		// CRITICAL: do NOT add aac_adtstoasc — it strips ADTS headers for
+		// MPEG-TS; on this MP4-to-MP4 copy that silently kills the audio
+		// track. HLS needs the opposite filter (see packager_hls.go).
+		"-movflags", "+faststart", // moov atom up front; else a player must download the whole file before it can start
+
 		out,
 	)
 

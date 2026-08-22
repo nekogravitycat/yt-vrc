@@ -1,4 +1,11 @@
 // Package throttle bounds how often this service asks YouTube anything.
+//
+// Architecture Note:
+//   - Sliding window, per video ID and global. singleflight only covers
+//     simultaneous requests; this covers "same link, retried later"
+//     (~a dozen resolves/day of one video trips YouTube's bot check).
+//   - CRITICAL: attempts charge on success or failure -- success-only
+//     counting would leave retry-after-failure loops unbounded.
 package throttle
 
 import (
@@ -7,22 +14,8 @@ import (
 	"time"
 )
 
-// Limiter is a sliding-window counter over resolve attempts, kept both
-// per video and in aggregate.
-//
-// It exists for a measured failure mode rather than a hypothetical one.
-// YouTube begins answering "Sign in to confirm you're not a bot" after
-// roughly a dozen resolutions of one video in a day, and it is the
-// repetition that triggers it: the same IP resolving other videos is
-// unaffected (implementation.md §8.2). singleflight already collapses
-// the burst that arrives when several people paste one link within
-// seconds. What it cannot see is the same link pasted again an hour
-// later, once the artifact has been evicted -- or a person re-entering
-// a URL that just failed.
-//
-// Attempts are charged whether they succeed or fail. A video that fails
-// is the one most likely to be retried by hand, and counting only
-// successes would leave precisely that case unbounded.
+// Limiter is a sliding-window counter over resolve attempts, per key and
+// in aggregate (see package doc).
 type Limiter struct {
 	// PerKey and Global are the attempts allowed within Window; zero
 	// disables that dimension.
@@ -54,11 +47,8 @@ func (l *Limiter) now() time.Time {
 	return time.Now()
 }
 
-// Allow charges one attempt against key if both budgets permit it.
-//
-// On refusal it reports which budget ran out and how long until the
-// oldest attempt in that window falls out of it, which is the soonest
-// the answer could change.
+// Allow charges one attempt against key if both budgets permit it, else
+// reports which budget refused and when the oldest attempt ages out.
 func (l *Limiter) Allow(key string) (bool, Scope, time.Duration) {
 	if l.Window <= 0 || (l.PerKey <= 0 && l.Global <= 0) {
 		return true, ScopeNone, 0
@@ -81,14 +71,8 @@ func (l *Limiter) Allow(key string) (bool, Scope, time.Duration) {
 	return true, ScopeNone, 0
 }
 
-// Charge records an attempt that is going to happen regardless.
-//
-// The upgrade smoke test is the case: it resolves a fixed list to decide
-// whether a candidate yt-dlp works, and refusing it would block the
-// upgrade rather than protect anything. Its requests still reach
-// YouTube, so they must still be counted -- four upgrade cycles is a
-// dozen resolutions of the same three videos, which is the shape that
-// causes the problem in the first place.
+// Charge records an attempt that happens regardless of budget (e.g. the
+// upgrade smoke test) -- it still hits YouTube, so it still counts.
 func (l *Limiter) Charge(key string) {
 	if l.Window <= 0 {
 		return
@@ -108,16 +92,14 @@ func (l *Limiter) charge(key string, now time.Time) {
 	l.all = append(l.all, now)
 }
 
-// prune drops attempts that have aged out of the window. Callers hold
-// the lock.
+// prune drops attempts that have aged out of the window. NOTE: caller
+// must hold l.mu.
 func (l *Limiter) prune(now time.Time) {
 	cut := now.Add(-l.Window)
 	l.all = after(l.all, cut)
 	for k, ts := range l.byKey {
 		if kept := after(ts, cut); len(kept) == 0 {
-			// Dropping empty keys keeps the map from growing once per
-			// video ever requested; nothing reads a key with no
-			// attempts in the window.
+			// avoid growing the map once per video ever requested
 			delete(l.byKey, k)
 		} else {
 			l.byKey[k] = kept

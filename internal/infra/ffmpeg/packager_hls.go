@@ -18,12 +18,10 @@ const segmentGlob = "seg_*.ts"
 
 // HLSPackager remuxes local track files into an HLS artifact.
 //
-// Packaging always runs to completion before the artifact is published.
-// The alternative — serving a playlist computed from the video's
-// duration while segments are still being written — cannot work here:
-// YouTube's avc1 streams use scene-cut keyframes, so with -c copy the
-// real segments ranged from 3.0s to 9.8s against a nominal 6s, which
-// would put every seek in the wrong place (implementation.md §2.2).
+// CRITICAL: packaging always runs to completion before publishing — a
+// playlist can't be precomputed from duration because YouTube's scene-cut
+// keyframes make real segment lengths irregular (measured 3.0-9.8s against
+// a nominal 6s); EXTINF must always come from ffmpeg's real output.
 type HLSPackager struct {
 	FFmpegPath     string
 	FFprobePath    string
@@ -45,16 +43,14 @@ func (p *HLSPackager) Package(ctx context.Context, res *video.Resolution, srcVid
 	}
 	args = append(args,
 		"-c", "copy",
-		// AAC from an MP4 container carries no ADTS headers; MPEG-TS
-		// needs them, and without this filter the audio track is
-		// silently unplayable.
+		// CRITICAL: required here (opposite of MP4 — see packager_mp4.go)
+		// so MPEG-TS audio gets the ADTS headers raw AAC-in-MP4 lacks.
 		"-bsf:a", "aac_adtstoasc",
 		"-f", "hls",
 		"-hls_time", fmt.Sprint(p.SegmentSeconds),
 		"-hls_playlist_type", "vod",
-		// EXT-X-INDEPENDENT-SEGMENTS is deliberately not set: it forces
-		// EXT-X-VERSION:6, and AVPro is happiest with version 3. It was
-		// only ever needed for the mid-stream resume this design dropped.
+		// NOTE: independent-segments deliberately omitted — it forces
+		// EXT-X-VERSION:6; AVPro wants v3. Only needed for resume, dropped.
 		"-hls_list_size", "0",
 		"-hls_segment_filename", filepath.Join(destDir, "seg_%05d.ts"),
 		filepath.Join(destDir, MediaName),

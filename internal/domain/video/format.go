@@ -61,11 +61,9 @@ type OutputSpec struct {
 }
 
 // FormatSelector renders the yt-dlp format expression for this spec.
-//
-// avc1+mp4a is forced because it is the one combination AVPro and Unity
-// VideoPlayer both hardware-decode everywhere, and because holding the
-// codec fixed is what lets ffmpeg run -c copy instead of transcoding
-// (spec §4.2.2).
+// NOTE: avc1+mp4a is forced -- the one codec both AVPro and Unity
+// VideoPlayer hardware-decode, letting ffmpeg run -c copy instead of
+// transcoding (spec §4.2.2).
 func (s OutputSpec) FormatSelector() string {
 	h := int(s.Quality)
 	return fmt.Sprintf(

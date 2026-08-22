@@ -39,6 +39,7 @@ var commandAliases = map[string]string{
 	"r": "refresh", "refresh": "refresh",
 	"i": "info", "info": "info",
 	"d": "drop", "drop": "drop",
+	"m": "mode", "mode": "mode",
 }
 
 // Defaults supplies the settings a path may omit.
@@ -63,11 +64,9 @@ func ParsePath(p string, d Defaults) (Route, error) {
 	}
 
 	// 4. A full YouTube URL, pasted straight after the host. Checked
-	// before segment splitting because such a URL contains slashes.
-	//
-	// net/http cleans "//" down to "/" before a handler ever sees the
-	// path, so a pasted "https://youtu.be/x" arrives as "https:/youtu.be/x".
-	// Restore the missing slash before parsing.
+	// before segment splitting because such a URL contains slashes;
+	// restoreSchemeSlash undoes net/http's path collapse first (CRITICAL,
+	// see below).
 	trimmed = restoreSchemeSlash(trimmed)
 	if lower := strings.ToLower(trimmed); strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
 		id, err := extractIDFromURL(trimmed)
@@ -141,8 +140,9 @@ func specFromSegments(rest []string, ext string, d Defaults) (video.OutputSpec, 
 	return spec, nil
 }
 
-// restoreSchemeSlash undoes the path cleaning that turns "https://host"
-// into "https:/host".
+// restoreSchemeSlash undoes net/http's path cleaning, which collapses
+// "https://host" to "https:/host" before any handler sees the path.
+// CRITICAL: without this, every pasted full URL fails to parse.
 func restoreSchemeSlash(p string) string {
 	for _, scheme := range []string{"https:", "http:"} {
 		if len(p) > len(scheme) && strings.EqualFold(p[:len(scheme)], scheme) {

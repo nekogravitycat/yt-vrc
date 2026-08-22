@@ -21,10 +21,8 @@ const (
 
 // writeMaster generates a master playlist referencing the media playlist.
 //
-// A bare media playlist is legal HLS and browsers accept it, but Windows
-// Media Foundation -- which is what AVPro uses for HLS on PC -- expects a
-// master playlist declaring EXT-X-STREAM-INF, and rejects the stream as
-// an invalid format without one.
+// NOTE: required even though a bare media playlist is legal HLS — AVPro's
+// Windows Media Foundation backend rejects a stream without EXT-X-STREAM-INF.
 func writeMaster(ctx context.Context, ffprobePath, dir string, durationSec float64) error {
 	codecs, w, h, err := probeCodecs(ctx, ffprobePath, dir)
 	if err != nil {

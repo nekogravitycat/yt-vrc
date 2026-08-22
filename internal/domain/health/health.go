@@ -32,11 +32,9 @@ func Worse(a, b Level) Level {
 
 // Sample is the outcome of one resolve attempt.
 //
-// Only resolves are sampled. Packaging failures are recorded as events
-// instead: they say something about this machine, whereas the resolve
-// success rate is the early warning for the failure mode that actually
-// threatens this project -- YouTube shutting the door overnight
-// (spec §3.2).
+// NOTE: only resolves are sampled, not packaging failures (those go to
+// events) -- resolve success rate is the early warning for this
+// project's real threat, YouTube shutting the door (spec §3.2).
 type Sample struct {
 	At    time.Time     `json:"at"`
 	OK    bool          `json:"ok"`
@@ -135,10 +133,8 @@ func (r *Recorder) Stats() Stats {
 			if s.At.After(st.LastFailureAt) {
 				st.LastFailureAt = s.At
 			}
-			// Failed resolves are excluded from the latency median: a
-			// resolve that died at the timeout would otherwise drag the
-			// median toward the timeout and report slowness where the
-			// real problem is refusal.
+			// NOTE: excluded from the median -- a timeout would drag it
+			// toward "slow" when the real problem is refusal.
 			continue
 		}
 		took = append(took, s.Took)

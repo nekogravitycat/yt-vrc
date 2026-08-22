@@ -88,9 +88,8 @@ func (s *FSStore) Get(key video.CacheKey) (*video.MediaAsset, bool) {
 		return nil, false
 	}
 	a.LastAccessAt = time.Now()
-	// Hand back a copy: the indexed value keeps being mutated by
-	// access-time updates, and callers hold theirs across the whole
-	// response.
+	// NOTE: return a copy -- the indexed pointer keeps being mutated by
+	// access-time updates from other readers.
 	cp := *a
 	return &cp, true
 }
@@ -100,9 +99,9 @@ func (s *FSStore) Put(a *video.MediaAsset) error {
 	if err != nil {
 		return err
 	}
-	// Write meta.json last and atomically: its presence is what marks
-	// an artifact directory as complete, so a crash mid-write must not
-	// leave a half-built artifact looking usable.
+	// CRITICAL: write meta.json last, atomically -- its presence marks
+	// the artifact complete. A crash mid-write must never leave a
+	// half-built artifact indexed as usable.
 	tmp := filepath.Join(a.Dir, metaName+".tmp")
 	if err := os.WriteFile(tmp, b, 0o644); err != nil {
 		return err
@@ -120,11 +119,10 @@ func (s *FSStore) Put(a *video.MediaAsset) error {
 // evict drops least-recently-used artifacts until usage is back under
 // the target watermark (spec §4.7.2).
 //
-// Only complete artifacts are ever indexed -- meta.json is written last
-// -- so in-progress work cannot be evicted out from under a job. What
-// can still happen is evicting something a player is mid-way through;
-// LRU makes that unlikely, since anything being watched was accessed
-// seconds ago.
+// NOTE: only complete artifacts are indexed (meta.json written last), so
+// eviction can't pull in-progress work. It can still drop something
+// mid-playback; LRU makes that unlikely since watching keeps
+// LastAccessAt recent.
 func (s *FSStore) evict() {
 	if s.MaxBytes <= 0 {
 		return
@@ -204,8 +202,8 @@ func (s *FSStore) List(limit int) []*video.MediaAsset {
 
 // Open serves one file from inside an artifact directory.
 func (s *FSStore) Open(key video.CacheKey, name string) (io.ReadSeekCloser, time.Time, error) {
-	// Reject traversal before touching the filesystem: name comes
-	// straight from the request path.
+	// CRITICAL: reject traversal before touching the filesystem -- name
+	// comes straight from the request path.
 	if name == "" || strings.Contains(name, "..") || strings.ContainsAny(name, `/\`) {
 		return nil, time.Time{}, fmt.Errorf("invalid asset file %q", name)
 	}

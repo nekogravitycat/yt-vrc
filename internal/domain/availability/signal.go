@@ -1,12 +1,8 @@
 // Package availability decides whether the service should be serving
-// video at all (spec §4.4).
-//
-// The service is meant to run only while its operator is in VRChat, and
-// how that is detected must stay replaceable: Discord presence is merely
-// the first source, chosen because it needs nothing installed on the
-// gaming machine. Everything here is expressed against the Signal
-// interface so a new source is an implementation, not a change to the
-// gate, the use cases or anything above them.
+// video at all (spec §4.4). Detection stays pluggable behind Signal;
+// Discord presence is merely the first source, chosen because it needs
+// nothing installed on the gaming machine. See Gate (gate.go) for the
+// combination logic.
 package availability
 
 import (
@@ -15,10 +11,8 @@ import (
 )
 
 // Confidence expresses how much a source's answer should be trusted when
-// sources disagree. Nothing uses it to arbitrate yet -- there is one
-// source -- but a later local-process detector is strictly more reliable
-// than a presence relay, and the interface should not have to change to
-// say so (spec §6.3.1).
+// sources disagree. Unused today (one source), reserved for arbitrating
+// multiple sources later (spec §6.3.1).
 type Confidence int
 
 const (
@@ -48,9 +42,8 @@ type Status struct {
 
 // Signal is a source of "is the operator in VRChat right now".
 //
-// Status must not block: a source backed by a gateway or a long poll
-// maintains its state in the background and answers from the last known
-// reading.
+// NOTE: Status must not block -- sources backed by a gateway or long poll
+// maintain state in the background and answer from the last known reading.
 type Signal interface {
 	Name() string
 	Status(ctx context.Context) (Status, error)
@@ -75,9 +68,8 @@ func (o Override) Expired(now time.Time) bool {
 
 // OverrideStore persists the manual override across restarts.
 //
-// This matters more than it looks: with no signal source configured the
-// gate is closed, so a restart that forgot an active /on would take the
-// service down with no way to notice from inside VRChat.
+// CRITICAL: the gate is fail-closed (see Gate); an unpersisted override
+// lost on restart takes video down with no way to notice from inside VRChat.
 type OverrideStore interface {
 	Load() (Override, error)
 	Save(Override) error

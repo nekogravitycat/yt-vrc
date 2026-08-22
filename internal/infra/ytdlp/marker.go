@@ -6,18 +6,15 @@ import (
 	"strings"
 )
 
-// The "current" and "previous" markers exist in two forms.
-//
-// spec §4.5.2 specifies a symlink, which is right on Linux: it is atomic
-// via rename and legible to anyone poking around the volume. Creating
-// one on Windows needs administrator rights or developer mode, so the
-// dev machine gets a text pointer file instead, swapped by the same
-// rename (implementation.md §1.2). Both satisfy the requirement that
-// matters -- the marker is re-read on every call, never cached.
-//
-// The form is chosen by trying the symlink and falling back, rather than
-// by inspecting GOOS: what fails on Windows is the privilege, not the
-// platform, and a machine with developer mode on gets the better one.
+// Architecture Note: current/previous version markers
+//   - NOTE: symlink is preferred (atomic, legible on disk); chosen by
+//     trying it and falling back, not by checking GOOS, since what fails
+//     on Windows is the privilege, not the platform. Falls back to a
+//     current.txt pointer file, swapped the same way.
+//   - CRITICAL: both forms switch via write-tmp-then-rename (see
+//     setMarker) -- never write the marker path directly, or a crash
+//     mid-switch can leave a half-written pointer.
+//   - Markers are re-read on every call, never cached (see Resolver.Locate).
 
 // markerVersion returns the version directory name a marker points at.
 func (m *Manager) markerVersion(name string) (string, bool) {

@@ -63,6 +63,57 @@ func (s *OverrideStore) Save(o availability.Override) error {
 	return os.Rename(tmp, s.path)
 }
 
+// ModeStore keeps the /mode selection in a file, the same way
+// OverrideStore keeps the manual override: without it, a restart drops
+// back to ModeDefault, which for whitelist mode would silently put the
+// presence gate back in front of viewers relying on their IP alone.
+type ModeStore struct {
+	path string
+	mu   sync.Mutex
+}
+
+func NewModeStore(stateDir string) (*ModeStore, error) {
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		return nil, err
+	}
+	return &ModeStore{path: filepath.Join(stateDir, "mode.json")}, nil
+}
+
+func (s *ModeStore) Load() (availability.AccessMode, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, err := os.ReadFile(s.path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return availability.ModeDefault, nil
+		}
+		return availability.ModeDefault, err
+	}
+	var m struct {
+		Mode availability.AccessMode `json:"mode"`
+	}
+	if err := json.Unmarshal(b, &m); err != nil {
+		return availability.ModeDefault, err
+	}
+	return m.Mode, nil
+}
+
+func (s *ModeStore) Save(mode availability.AccessMode) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, err := json.Marshal(struct {
+		Mode availability.AccessMode `json:"mode"`
+	}{mode})
+	if err != nil {
+		return err
+	}
+	tmp := s.path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.path)
+}
+
 // EventLog appends to events.jsonl and serves the tail from memory.
 //
 // The in-memory ring is the only thing reads ever touch, so /e costs

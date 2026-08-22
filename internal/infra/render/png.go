@@ -69,8 +69,8 @@ func New() *Renderer { return &Renderer{faces: newFaceCache()} }
 
 // RenderPNG draws v and writes a PNG to w.
 func (r *Renderer) RenderPNG(v message.View, w io.Writer) error {
-	// Faces are cached and not internally synchronised, so serialise
-	// drawing. Rendering a frame takes single-digit milliseconds.
+	// NOTE: font.Face draws are not concurrency-safe; serialise (cheap --
+	// single-digit ms per frame). Canonical for faceCache too (font.go).
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -90,14 +90,13 @@ func (r *Renderer) RenderPNG(v message.View, w io.Writer) error {
 	img := image.NewRGBA(image.Rect(0, 0, Width, Height))
 	fill(img, img.Bounds(), colBG)
 
-	// Header band, coloured by category.
 	head := kindColor(v.Kind)
 	fill(img, image.Rect(0, 0, Width, headerH), head)
 	drawText(img, titleFace, colHeadFG, padX, 88, truncate(titleFace, v.Title, Width-2*padX))
 
 	y := headerH + 64
-	// The subtitle is usually the video title, so it gets full contrast
-	// and a gap to keep it from reading as another row label.
+	// Full contrast + extra gap: distinguishes the subtitle (usually the
+	// video title) from an ordinary row label.
 	if v.Subtitle != "" {
 		drawText(img, bodyFace, colText, padX, y, truncate(bodyFace, v.Subtitle, Width-2*padX))
 		y += lineH + 18
@@ -153,8 +152,7 @@ func drawText(dst *image.RGBA, face font.Face, c color.RGBA, x, baseline int, s 
 	d.DrawString(s)
 }
 
-// truncate shortens s with an ellipsis until it fits maxW pixels. Video
-// titles are arbitrary length and must not overflow the frame.
+// truncate shortens s with an ellipsis until it fits maxW pixels.
 func truncate(face font.Face, s string, maxW int) string {
 	s = strings.ReplaceAll(s, "\n", " ")
 	if textWidth(face, s) <= maxW {

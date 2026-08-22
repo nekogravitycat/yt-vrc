@@ -17,33 +17,23 @@ import (
 
 type Resolver struct {
 	BinPath string
-	// Locate, when set, supersedes BinPath and is consulted on every
-	// resolve. A hot upgrade takes effect by moving a marker on disk
-	// (spec §4.5.2), so caching the path here would keep the old
-	// version live until the next restart -- the exact thing the
-	// versioned directory exists to avoid.
+	// CRITICAL: Locate, when set, supersedes BinPath and is called fresh
+	// on every resolve — caching it would keep a stale binary live
+	// across a hot upgrade until restart (see marker.go).
 	Locate  func() string
-	Proxy   string // optional egress proxy for metadata only (spec §3.1)
+	Proxy   string // NOTE: proxy covers metadata/resolve only, not track download (spec §3.1)
 	Timeout time.Duration
-	// Clients is the ordered list of YouTube player clients to try.
-	// "" or "default" means yt-dlp's own choice, which Phase 0 measured
-	// at 15/15; the rest exist because SABR-only is switched on per
-	// session rather than per client, so the working path can vanish
-	// overnight for everyone at once (spec §3.2).
-	//
-	// The chain is short and only retried on failures a different
-	// client could plausibly fix. Repeated resolution of one video is
-	// itself what triggers YouTube's per-video rate limit
-	// (implementation.md §8.2), so retrying an unavailable or
-	// age-restricted video would trade a clear error for a block.
+	// Clients is the ordered player-client fallback chain ("" /
+	// "default" = yt-dlp's own choice). Exists because YouTube's
+	// SABR-only rollout is per-session not per-client, so the working
+	// client can vanish overnight (spec §3.2); see worthRetrying for
+	// which failures trigger a retry.
 	Clients []string
-	// JSRuntimes names the JavaScript runtimes yt-dlp may use for
-	// YouTube's `n` parameter challenge, as --js-runtimes takes them.
-	//
-	// It has to be said out loud because yt-dlp enables deno and nothing
-	// else by default: a perfectly good node on PATH is reported as
-	// "unavailable" until it is named. Empty leaves yt-dlp's default
-	// alone, which is right for a host that has deno or has neither.
+	// JSRuntimes lists runtimes for yt-dlp's --js-runtimes (YouTube's
+	// `n`-challenge).
+	// NOTE: yt-dlp enables only deno by default — a working node on PATH
+	// still reports "unavailable" until named here; empty leaves
+	// yt-dlp's own default alone.
 	JSRuntimes string
 	Log        *slog.Logger
 }
@@ -68,8 +58,10 @@ func (r *Resolver) clients() []string {
 	return r.Clients
 }
 
-// worthRetrying reports whether another player client could plausibly
-// succeed where this attempt failed.
+// worthRetrying gates the client fallback chain.
+// CRITICAL: only errors another client could plausibly fix are retried
+// — retrying a non-retryable failure (age-restricted, not found) would
+// burn the outgoing resolve budget on a video that won't succeed either way.
 func worthRetrying(err error) bool {
 	return errors.Is(err, video.ErrResolveFailed) || errors.Is(err, video.ErrBotDetected)
 }
@@ -221,11 +213,10 @@ func (r *Resolver) resolveWith(ctx context.Context, id video.ID, spec video.Outp
 func classifyError(stderr string, err error) error {
 	s := strings.ToLower(stderr)
 	switch {
-	// Age restriction is tested before bot detection, because yt-dlp
-	// words it "Sign in to confirm your age" and the broader phrase
-	// below would otherwise swallow it. The two have opposite advice --
-	// one clears on its own, the other never will -- and only bot
-	// detection is worth another player client.
+	// NOTE: age-restriction checked before bot-detection — yt-dlp's
+	// "Sign in to confirm your age" would otherwise match the broader
+	// bot-detection phrase below. Only bot detection is worth a client
+	// retry (worthRetrying); age restriction never clears that way.
 	case strings.Contains(s, "confirm your age"),
 		strings.Contains(s, "age-restricted"),
 		strings.Contains(s, "age restricted"),

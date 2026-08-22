@@ -57,6 +57,10 @@ func TestParsePathCommand(t *testing.T) {
 		{"/h", "help"},
 		{"/on", "enable"},
 		{"/off", "disable"},
+		{"/mode", "mode"},
+		{"/mode/whitelist", "mode"},
+		{"/m", "mode"},
+		{"/m/open", "mode"},
 		{"/S", "status"}, // case-insensitive
 	}
 	for _, tt := range tests {

@@ -216,6 +216,73 @@ func TestStartLoadsPersistedOverride(t *testing.T) {
 	}
 }
 
+func TestModeOpenBypassesPresence(t *testing.T) {
+	g, _ := newGate(t) // no signals: presence gate would be closed
+	g.SetMode(ModeOpen)
+
+	open, reason := g.Allow(context.Background(), "203.0.113.9")
+	if !open || reason.Source != "mode:open" {
+		t.Fatalf("open mode should allow regardless of presence, got open=%v source=%q", open, reason.Source)
+	}
+}
+
+func TestModeWhitelistIgnoresPresenceAndChecksIP(t *testing.T) {
+	s := &stubSignal{name: "s", on: true} // presence is online
+	g, _ := newGate(t, s)
+	g.WhitelistIPs = []string{"203.0.113.9"}
+	g.SetMode(ModeWhitelist)
+
+	if open, reason := g.Allow(context.Background(), "203.0.113.9"); !open || reason.Source != "mode:whitelist" {
+		t.Fatalf("whitelisted IP should be allowed, got open=%v source=%q", open, reason.Source)
+	}
+	if open, _ := g.Allow(context.Background(), "198.51.100.1"); open {
+		t.Fatal("a non-whitelisted IP must be refused even though presence is online")
+	}
+}
+
+func TestModeDefaultUnchangedFromIsOpen(t *testing.T) {
+	s := &stubSignal{name: "s", on: true}
+	g, _ := newGate(t, s)
+
+	open, reason := g.Allow(context.Background(), "198.51.100.1")
+	if !open || reason.Source != "s" {
+		t.Fatalf("default mode should behave like IsOpen, got open=%v source=%q", open, reason.Source)
+	}
+}
+
+func TestModePersistsAcrossRestart(t *testing.T) {
+	g, _ := newGate(t)
+	store := &memModeStore{}
+	g.ModeStore = store
+	g.PollInterval = time.Hour
+
+	g.SetMode(ModeOpen)
+	if store.m != ModeOpen {
+		t.Fatal("mode was not persisted; a restart would silently drop back to ModeDefault")
+	}
+
+	// A fresh Gate loading from the same store, as happens on restart.
+	g2, _ := newGate(t)
+	g2.ModeStore = store
+	g2.PollInterval = time.Hour
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := g2.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer g2.Close()
+	if g2.CurrentMode() != ModeOpen {
+		t.Fatalf("mode not restored on Start, got %q", g2.CurrentMode())
+	}
+}
+
+type memModeStore struct {
+	m AccessMode
+}
+
+func (m *memModeStore) Load() (AccessMode, error)  { return m.m, nil }
+func (m *memModeStore) Save(mode AccessMode) error { m.m = mode; return nil }
+
 func TestTransitionsAreReported(t *testing.T) {
 	s := &stubSignal{name: "s", on: true}
 	g, c := newGate(t, s)

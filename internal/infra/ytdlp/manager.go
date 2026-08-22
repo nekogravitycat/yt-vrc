@@ -20,21 +20,21 @@ import (
 )
 
 // Manager installs yt-dlp releases into a versioned directory and points
-// a "current" marker at one of them:
+// "current"/"previous" markers at one of them:
 //
 //	{Root}/versions/{version}/{asset}
 //	{Root}/current   -> versions/{version}
 //	{Root}/previous  -> versions/{older}
 //
-// Nothing is cached: BinaryPath re-reads the marker every call, which is
-// what makes an upgrade take effect mid-run (spec §4.5.2).
+// See marker.go's Architecture Note for the atomic switch and
+// re-read-per-call guarantee.
 type Manager struct {
 	// Root is the versioned directory, normally {DATA_DIR}/ytdlp.
 	Root string
-	// Asset is the release asset to install. Defaults to the plain
-	// zipapp, which needs a python3 in the image but runs on musl; the
-	// self-contained yt-dlp_linux build is glibc-only and will not run
-	// on Alpine.
+	// Asset is the release asset to install.
+	// NOTE: default (plain zipapp) needs python3 but runs on musl;
+	// yt-dlp_linux is self-contained but glibc-only and won't run on
+	// Alpine.
 	Asset string
 	// Fallback is used before anything has been installed, so a fresh
 	// volume still resolves videos via whatever is on PATH.
@@ -44,11 +44,9 @@ type Manager struct {
 	// Repo is the GitHub repository releases are read from.
 	Repo string
 
-	// The three fields below are seams, and exist so this type can be
-	// tested at all. Without them a test has to reach the real GitHub
-	// and execute the binary it downloads, which is precisely the code
-	// path that must not be exercised by accident: it replaces the
-	// executable a running service resolves with.
+	// The three fields below are test seams: without them a test would
+	// hit real GitHub and execute the downloaded binary, replacing the
+	// executable a live service resolves with.
 	//
 	// APIBase and DownloadBase point at GitHub by default; Version
 	// defaults to running the candidate's --version.
@@ -120,10 +118,9 @@ func (m *Manager) client() *http.Client {
 
 func (m *Manager) Managed() bool { return true }
 
-// BinaryPath resolves the current marker on every call. A stale or
-// broken marker falls back to PATH rather than returning a path that
-// cannot execute: a service that resolves nothing is worse than one
-// running a version it did not choose.
+// BinaryPath re-reads the current marker every call (see marker.go). A
+// stale/broken marker falls back to PATH: a service resolving nothing is
+// worse than one running an unchosen version.
 func (m *Manager) BinaryPath() string {
 	if p, ok := m.resolveMarker(currentMarker); ok {
 		return p
@@ -156,15 +153,11 @@ func binaryVersion(ctx context.Context, bin string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// Ensure installs a version on a volume that has none, which is the
-// state every fresh deployment starts in: the image deliberately does
-// not ship yt-dlp, so that upgrading it never means rebuilding the
-// image (spec §9.1).
-//
-// It returns without error when something is already installed, and
-// reports rather than fails when the bootstrap download does not work.
-// A service that will not start because GitHub was briefly unreachable
-// is worse than one that starts, falls back to PATH, and says so on /s.
+// Ensure bootstraps a version on a fresh volume (the image ships none,
+// so upgrading it never means rebuilding the image; spec §9.1).
+// NOTE: never fails startup on a bad bootstrap — if GitHub is briefly
+// unreachable it returns nil and resolution falls back to Fallback/PATH,
+// reported on /s.
 func (m *Manager) Ensure(ctx context.Context) error {
 	if err := os.MkdirAll(filepath.Join(m.Root, versionsDir), 0o755); err != nil {
 		return err
@@ -176,10 +169,9 @@ func (m *Manager) Ensure(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("bootstrapping yt-dlp: %w", err)
 	}
-	// No smoke test here. Bootstrap runs before the service is
-	// listening, and resolving three videos to decide whether to
-	// install the only version available would delay startup to prove
-	// something it cannot act on.
+	// No smoke test here: bootstrap runs before the service is
+	// listening, and there's no alternative version to fall back to
+	// anyway if it failed.
 	if _, err := m.Install(ctx, latest, nil, nil); err != nil {
 		return fmt.Errorf("bootstrapping yt-dlp %s: %w", latest, err)
 	}

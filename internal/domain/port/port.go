@@ -18,17 +18,15 @@ type Resolver interface {
 
 // MediaFetcher copies one track to local storage.
 //
-// This exists because googlevideo throttles a plain sequential GET to
-// roughly 300 KB/s while serving ranged chunks at ~20 MB/s — a 62x gap
-// measured in implementation.md §2.1. Handing a googlevideo URL straight
-// to ffmpeg is therefore never acceptable.
+// CRITICAL: never hand a googlevideo URL straight to ffmpeg -- a
+// sequential GET throttles to ~300 KB/s vs ~20 MB/s for ranged chunks
+// (implementation.md §2.1).
 type MediaFetcher interface {
 	Fetch(ctx context.Context, t video.Track, dest string, onProgress func(done, total int64)) error
 }
 
 // Packager remuxes downloaded tracks into a deliverable artifact.
-// It returns only once the artifact is complete, so every segment a
-// player can ask for already exists (implementation.md §3).
+// NOTE: returns only once complete, never progressively (implementation.md §3).
 type Packager interface {
 	Container() video.Container
 	Package(ctx context.Context, res *video.Resolution, srcVideo, srcAudio, destDir string) (*video.MediaAsset, error)

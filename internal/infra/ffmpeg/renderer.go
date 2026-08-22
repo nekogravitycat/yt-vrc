@@ -21,24 +21,20 @@ type PNGRenderer interface {
 	RenderPNG(v message.View, w io.Writer) error
 }
 
-// MessageRenderer turns a message.View into playable media.
-//
-// Rendered messages are keyed by content hash, so repeated identical
-// messages are encoded once (spec §4.3.3).
+// MessageRenderer turns a message.View into playable media, keyed by
+// content hash so repeated identical messages encode once.
 type MessageRenderer struct {
 	FFmpegPath  string
 	FFprobePath string
 	PNG         PNGRenderer
 	Dir         string // {DATA_DIR}/messages
 	Seconds     int
-	// MaxEntries bounds the message cache. Status views embed live
-	// numbers, so each distinct reading hashes differently and would
-	// otherwise accumulate without limit.
+	// MaxEntries bounds the cache: status views embed live numbers, so
+	// each distinct reading hashes differently and would grow unbounded.
 	MaxEntries int
-	// Pinned lists renders that must not be pruned no matter how old:
-	// a stable message URL handed to a player outlives the render that
-	// was current when it was issued, and pruning it turns the next
-	// playback into a 404 (implementation.md §11.3).
+	// CRITICAL: pinned renders must never be pruned — a stable message
+	// URL can outlive the render that was current when issued; pruning
+	// it turns the next playback into a 404.
 	Pinned func() []string
 
 	mu       sync.Mutex
@@ -143,18 +139,15 @@ func (m *MessageRenderer) encode(ctx context.Context, frame, dir string, spec vi
 	args := []string{
 		"-hide_banner", "-loglevel", "error", "-nostdin", "-y",
 		"-loop", "1", "-i", frame,
-		// Some players misbehave on a video with no audio track at
-		// all, so a silent one is generated even though the message
-		// makes no sound (spec §4.3.3).
+		// A silent track avoids players that misbehave on video with none.
 		"-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
 		"-t", fmt.Sprint(m.Seconds),
 		"-r", "15",
 		"-c:v", "libx264", "-preset", "veryfast", "-tune", "stillimage",
 		"-pix_fmt", "yuv420p",
-		// Force a keyframe every 3s. libx264 defaults to a 250-frame
-		// GOP, which at 15fps exceeds the whole clip, leaving one
-		// keyframe and therefore a single unsplittable segment. Players
-		// handle a normally segmented playlist far more predictably.
+		// CRITICAL: forces a keyframe every 3s — libx264's default 250-frame
+		// GOP at 15fps exceeds the whole clip, producing one unsplittable
+		// HLS segment otherwise.
 		"-g", "45", "-keyint_min", "45",
 		"-force_key_frames", "expr:gte(t,n_forced*3)",
 		"-c:a", "aac", "-b:a", "64k",

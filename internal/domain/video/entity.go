@@ -24,9 +24,9 @@ func ParseID(s string) (ID, error) {
 
 func (id ID) String() string { return string(id) }
 
-// Track is one downloadable elementary stream. YouTube no longer serves
-// progressive formats, so a Resolution normally carries two of these
-// (spec §2.4); when it does not, Video and Audio are identical.
+// Track is one downloadable elementary stream. A Resolution normally
+// carries two (YouTube has no progressive formats, spec §2.4); when it
+// doesn't, Video and Audio are identical.
 type Track struct {
 	URL       string
 	Codec     string

@@ -10,12 +10,18 @@ import (
 )
 
 // GateClosed is what a video request gets while the service is not
-// serving (spec §4.4.1).
-//
-// It is a message rather than an HTTP error for the usual reason: an
-// error the player refuses to render tells the user nothing, and the one
-// thing they need here is the way back in, which is /on.
+// serving (spec §4.4.1); a message, not an HTTP error, so the player
+// renders it and the viewer sees the way back in (/on).
 func GateClosed(r availability.Reason) message.View {
+	if r.Source == "mode:whitelist" {
+		// Not a presence issue: "/on" advice here would mislead.
+		return message.View{
+			Kind:     message.KindGate,
+			Title:    "Access Restricted",
+			Subtitle: "This service is limited to allow-listed addresses right now",
+			Footer:   "/s for status",
+		}
+	}
 	v := message.View{
 		Kind:     message.KindGate,
 		Title:    "Service Offline",
@@ -36,6 +42,41 @@ func GateClosed(r availability.Reason) message.View {
 	return v
 }
 
+// Forbidden is what an admin command (/on /off /p /d /u /mode) gets
+// from a client address not on AdminIPs.
+func Forbidden() message.View {
+	return message.View{
+		Kind:     message.KindError,
+		Title:    "Access Restricted",
+		Subtitle: "This command is limited to allowed addresses",
+		Footer:   "/h for what does not need one",
+	}
+}
+
+// ModeStatus reports the current /mode selection.
+func ModeStatus(m availability.AccessMode) message.View {
+	v := message.View{Kind: message.KindStatus, Title: "Access Mode"}
+	v.AddRow("Current", string(m))
+	v.Footer = "/mode/default · /mode/open · /mode/whitelist to change it"
+	return v
+}
+
+// ModeChanged confirms a /mode switch.
+func ModeChanged(m availability.AccessMode) message.View {
+	v := message.View{Kind: message.KindSuccess, Title: "Access Mode Changed"}
+	v.AddRow("Now", string(m))
+	switch m {
+	case availability.ModeOpen:
+		v.Lines = []string{"Every viewer can play video; the presence gate is bypassed."}
+	case availability.ModeWhitelist:
+		v.Lines = []string{"Only whitelisted addresses can play video, regardless of presence."}
+	default:
+		v.Lines = []string{"Back to the presence gate and manual override."}
+	}
+	v.Footer = "/mode for current status"
+	return v
+}
+
 // GateOverridden confirms /on.
 func GateOverridden(until time.Time) message.View {
 	v := message.View{
@@ -49,11 +90,8 @@ func GateOverridden(until time.Time) message.View {
 	return v
 }
 
-// GateReleased confirms /off.
-//
-// /off releases the override rather than forcing the service down, per
-// spec §4.1.3: the pair is "take manual control" and "give it back", not
-// "on" and "off".
+// GateReleased confirms /off, which releases the manual override rather
+// than forcing the service down (spec §4.1.3).
 func GateReleased(r availability.Reason) message.View {
 	v := message.View{
 		Kind:     message.KindSuccess,

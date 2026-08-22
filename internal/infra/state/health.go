@@ -42,8 +42,7 @@ func (s *HealthStore) Load() []health.Sample {
 	return samples
 }
 
-// Save rewrites the whole window. It is called after every resolve, but
-// the window is capped at 50 entries, so this is a few kilobytes.
+// Save rewrites the whole window (capped at 50 entries, so a few KB).
 func (s *HealthStore) Save(samples []health.Sample) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

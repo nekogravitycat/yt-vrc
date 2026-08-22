@@ -9,9 +9,9 @@ import (
 	"golang.org/x/image/font/opentype"
 )
 
-// The font is embedded so the runtime has no font dependency (spec
-// §4.3.2). Noto Sans TC covers Latin and CJK: display text is English,
-// but video titles arrive in whatever script the uploader used.
+// Embedded so the runtime has no font dependency (spec §4.3.2); Noto
+// Sans TC covers CJK because video titles arrive in whatever script the
+// uploader used, not just Latin.
 //
 //go:embed NotoSansTC-Regular.otf
 var fontData []byte
@@ -27,8 +27,9 @@ func loadFont() (*opentype.Font, error) {
 	return parsed, parseErr
 }
 
-// faceCache avoids rebuilding a face per draw; faces are immutable once
-// built and safe to reuse from one goroutine at a time.
+// faceCache avoids rebuilding a face per draw (parse + hint on every
+// frame). NOTE: map access is mutex-guarded, but a returned font.Face is
+// not safe for concurrent Draw calls -- see Renderer.mu in png.go.
 type faceCache struct {
 	mu    sync.Mutex
 	faces map[float64]font.Face

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/nekogravitycat/yt-vrc/internal/adapter/presenter"
+	"github.com/nekogravitycat/yt-vrc/internal/domain/availability"
 	"github.com/nekogravitycat/yt-vrc/internal/domain/event"
 	"github.com/nekogravitycat/yt-vrc/internal/domain/health"
 	"github.com/nekogravitycat/yt-vrc/internal/domain/video"
@@ -15,14 +16,27 @@ import (
 	"github.com/nekogravitycat/yt-vrc/internal/usecase/upgrade"
 )
 
-// serveCommand handles the management endpoints.
-//
-// None of them consult the availability gate. That is the point of the
-// exemption in spec §4.4.1: when the gate has closed wrongly, /s is how
-// you find out and /on is how you fix it, and neither can be behind the
-// thing they exist to diagnose.
+// adminCommands mutate state, spend resources, or change who is served.
+// NOTE: checked against AdminIPs independent of the current /mode — a
+// friend allowed to watch in whitelist mode must not thereby gain
+// purge/mode power.
+var adminCommands = map[string]bool{
+	"enable": true, "disable": true, "purge": true,
+	"drop": true, "upgrade": true, "mode": true,
+}
+
+// serveCommand handles the management endpoints. None consult the
+// availability gate (CRITICAL, see Server.serveVideo) — /s and /on must
+// stay reachable to diagnose and fix a wrongly closed gate.
 func (s *Server) serveCommand(w http.ResponseWriter, r *http.Request, route Route) {
 	spec := route.Spec
+
+	if adminCommands[route.Command] && !ipAllowed(clientIP(r), s.AdminIPs) {
+		s.Log.Info("admin command refused", "command", route.Command, "ip", clientIP(r))
+		s.deliver(w, r, route.Command, presenter.Forbidden(), spec, http.StatusForbidden)
+		return
+	}
+
 	switch route.Command {
 	case "help":
 		s.deliver(w, r, "help", presenter.Help(s.Version), spec, http.StatusOK)
@@ -58,6 +72,9 @@ func (s *Server) serveCommand(w http.ResponseWriter, r *http.Request, route Rout
 	case "upgrade":
 		s.upgrade(w, r, route, spec)
 
+	case "mode":
+		s.setMode(w, r, route, spec)
+
 	case "warm":
 		s.warm(w, r, route, spec, false)
 
@@ -92,10 +109,9 @@ func (s *Server) warm(w http.ResponseWriter, r *http.Request, route Route, spec 
 	key := spec.CacheKey(id)
 
 	if refresh {
-		// Every variant, not just the requested one. /r is the "this
-		// artifact is wrong" button, and a viewer who reaches for it has
-		// no reason to know that 720p is a separate cache entry from the
-		// 1080p they were watching.
+		// Drop every cached variant, not just the requested one — a
+		// viewer reaching for /r has no reason to know quality is a
+		// separate cache key.
 		var dropped int
 		for _, a := range s.Play.Store.List(0) {
 			if a.VideoID == id {
@@ -113,10 +129,8 @@ func (s *Server) warm(w http.ResponseWriter, r *http.Request, route Route, spec 
 		return
 	}
 
-	// Already running: report on it rather than asking for it again.
-	// singleflight would collapse the duplicate anyway, but answering
-	// from the live job says something useful instead of waiting out
-	// the grace period to say nothing.
+	// Already running: report the live job instead of waiting out the
+	// grace period to say nothing.
 	if title, p, ok := s.Play.Progress(key); ok {
 		s.deliver(w, r, slot, presenter.Preparing(title, spec, p), spec, http.StatusAccepted)
 		return
@@ -171,6 +185,7 @@ func (s *Server) statusView(r *http.Request) presenter.StatusData {
 	if s.Gate != nil {
 		_, d.Gate = s.Gate.IsOpen(r.Context())
 		d.Sources = s.Gate.Sources()
+		d.Mode = s.Gate.CurrentMode()
 	} else {
 		d.Gate.Open = true
 		d.Gate.Source = "gate disabled"
@@ -180,9 +195,7 @@ func (s *Server) statusView(r *http.Request) presenter.StatusData {
 		d.Managed = s.Toolchain.Managed()
 		v, err := s.Toolchain.CurrentVersion(r.Context())
 		if err != nil {
-			// Worth saying out loud. Every video request goes through
-			// this binary, so "cannot even ask its version" is the whole
-			// story, not a footnote.
+			// Every video request depends on this binary; surface the failure.
 			d.YtdlpErr = err.Error()
 		} else {
 			d.YtdlpVersion = v
@@ -218,11 +231,9 @@ func (s *Server) thresholds() health.Thresholds {
 	return s.Thresholds
 }
 
-// upgrade handles /u and /u/back (spec §4.5).
-//
-// It answers immediately and lets the work run behind it; re-entering
-// the URL reports progress and then the outcome. See upgrade.State for
-// why this is not a blocking request.
+// upgrade handles /u and /u/back (spec §4.5). It answers immediately and
+// lets the work run behind it; re-entering the URL reports progress and
+// then the outcome (see upgrade.State).
 func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, route Route, spec video.OutputSpec) {
 	if s.Upgrade == nil {
 		s.deliver(w, r, "upgrade", presenter.NotImplemented("u"), spec, http.StatusNotImplemented)
@@ -276,6 +287,28 @@ func (s *Server) disableGate(w http.ResponseWriter, r *http.Request, spec video.
 	reason := s.Gate.Reason()
 	s.record(event.Event{Kind: event.KindGate, Summary: "override cleared via /off"})
 	s.deliver(w, r, "disable", presenter.GateReleased(reason), spec, http.StatusOK)
+}
+
+// setMode serves /mode (report the current access mode) and
+// /mode/{default|open|whitelist} (switch it). It is one handler because
+// it differs in exactly one step, the same shape as /w and /r.
+func (s *Server) setMode(w http.ResponseWriter, r *http.Request, route Route, spec video.OutputSpec) {
+	if s.Gate == nil {
+		s.deliver(w, r, "mode", presenter.NotImplemented("mode"), spec, http.StatusNotImplemented)
+		return
+	}
+	if len(route.Args) == 0 || route.Args[0] == "" {
+		s.deliver(w, r, "mode", presenter.ModeStatus(s.Gate.CurrentMode()), spec, http.StatusOK)
+		return
+	}
+	m, ok := availability.ParseAccessMode(route.Args[0])
+	if !ok {
+		s.deliver(w, r, "mode", presenter.Unrecognised(), spec, http.StatusBadRequest)
+		return
+	}
+	s.Gate.SetMode(m)
+	s.record(event.Event{Kind: event.KindGate, Summary: "access mode set to " + string(m) + " via /mode"})
+	s.deliver(w, r, "mode", presenter.ModeChanged(m), spec, http.StatusOK)
 }
 
 // purgeTokenTTL is short on purpose: the token exists to prove the

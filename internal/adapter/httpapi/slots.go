@@ -13,22 +13,14 @@ import (
 	"github.com/nekogravitycat/yt-vrc/internal/domain/video"
 )
 
-// A slot is a stable URL under which the media for one logical message
-// lives, decoupled from the content hash of whatever is currently
-// rendered there.
+// slotTable maps a stable URL (e.g. /m/status_hls/...) to whichever
+// render is currently correct for it.
 //
-// Messages are content-addressed on disk so identical renders are
-// encoded once (spec §4.3.3). Addressing them that way over HTTP does
-// not work: /s embeds live counters, so every changed reading produces a
-// new hash and therefore a new URL, while VRChat caches the URL it
-// resolved for a given input. The player then either replays a stale
-// frame or, once the old render is pruned, fetches a 404 and reports a
-// generic "invalid format" (implementation.md §11.3).
-//
-// A slot fixes the address — /m/status_hls/media.m3u8 always means "the
-// current status message" — and the table below maps it onto whichever
-// render is current. Slot URLs are served no-store; the hash is now only
-// a de-duplication key on disk.
+// CRITICAL: messages are content-addressed on disk (spec §4.3.3), but a
+// status message's hash changes every poll (live counters) while VRChat
+// caches whatever URL it resolved for a request. Serving by hash
+// directly would leave it replaying a stale frame, or 404ing once that
+// hash is pruned. Slot URLs are fixed and always served no-store.
 type slotTable struct {
 	path string // persisted here so the mapping survives a restart
 	max  int
@@ -48,27 +40,23 @@ func newSlotTable(statePath string, max int) *slotTable {
 	return t
 }
 
-// slotFor names the slot for one logical message.
-//
-// The name identifies what the message is about, never what it says, so
-// that repeated requests for the same thing keep landing on the same
-// URL. The container suffix matches the shape of a message cache key
-// ({hash}_{container}), which is what lets resolve fall through to a
-// direct hash lookup for anything not in the table.
+// slotFor names a slot by what the message is about, not what it
+// currently says, so repeated requests land on the same URL. The
+// {name}_{container} shape matches a cache key's, letting resolve fall
+// through to a direct hash lookup for names outside the table.
 func slotFor(name string, c video.Container) string {
 	return name + "_" + string(c)
 }
 
-// pathSlot derives a slot name for a request path that maps to no
-// stable identity of its own, such as an unrecognised command. Hashing
-// the path keeps it stable per input without letting arbitrary user text
-// into a URL we serve.
+// pathSlot names a slot for a path with no identity of its own (e.g. an
+// unrecognised command); hashing keeps it stable per input without
+// putting arbitrary user text in a served URL.
 func pathSlot(p string) string {
 	sum := sha256.Sum256([]byte(p))
 	return "x-" + hex.EncodeToString(sum[:])[:8]
 }
 
-// set points a slot at a render, returning true if that changed anything.
+// set points a slot at a render and persists the table.
 func (t *slotTable) set(slot string, key video.CacheKey) {
 	t.mu.Lock()
 	if e, ok := t.entries[slot]; ok && e.Key == key {
@@ -83,9 +71,9 @@ func (t *slotTable) set(slot string, key video.CacheKey) {
 	t.save(snapshot)
 }
 
-// resolve maps a URL segment onto a render. stable reports whether it
-// came from the table, which is what decides the caching headers: a slot
-// changes contents, a bare hash never does.
+// resolve maps a URL segment onto a render; stable reports whether it
+// came from the table, which drives cache headers (a slot's contents
+// change, a bare hash's never do).
 func (t *slotTable) resolve(seg string) (key video.CacheKey, stable bool) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -95,9 +83,9 @@ func (t *slotTable) resolve(seg string) (key video.CacheKey, stable bool) {
 	return video.CacheKey(seg), false
 }
 
-// pinned lists every render a slot currently points at. These must
-// survive pruning: a slot URL VRChat has cached outlives the render that
-// was current when it was handed out.
+// pinned lists renders a slot currently points at.
+// NOTE: excluded from cache eviction — a slot URL VRChat cached outlives
+// the render that was current when it was handed out.
 func (t *slotTable) pinned() []string {
 	t.mu.RLock()
 	defer t.mu.RUnlock()

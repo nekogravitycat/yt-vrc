@@ -5,13 +5,10 @@ import (
 	"time"
 )
 
-// ToolchainManager owns the yt-dlp binary: which version is live, and
-// how to move to another one without restarting (spec §4.5).
-//
-// The whole interface exists because yt-dlp is the one dependency that
-// must be replaceable on the timescale of a YouTube change -- days --
-// while the container it runs in is rebuilt on the timescale of this
-// project's own releases.
+// ToolchainManager owns the yt-dlp binary: which version is live and how
+// to move to another one without restarting (spec §4.5) -- yt-dlp must
+// be replaceable on YouTube's change timescale (days), not the
+// container's.
 type ToolchainManager interface {
 	// BinaryPath re-reads the current pointer on every call, so a
 	// completed upgrade takes effect for the next resolve with no
@@ -29,20 +26,16 @@ type ToolchainManager interface {
 	PreviousVersion() string
 	// CheckLatest asks upstream what the newest release is.
 	CheckLatest(ctx context.Context) (string, error)
-	// Install downloads version, verifies it, hands the candidate
-	// binary to verify, and only then makes it current. Nothing is
-	// switched unless verify returns nil (spec §4.5.3 step 6).
+	// Install downloads, verifies, and only then makes version current --
+	// NOTE: nothing switches unless verify returns nil (spec §4.5.3 step 6).
 	Install(ctx context.Context, version string, verify ToolchainVerifier, progress func(stage string)) (*UpgradeResult, error)
 	// Rollback makes the previous version current again.
 	Rollback(ctx context.Context, verify ToolchainVerifier) (*UpgradeResult, error)
 }
 
-// ToolchainVerifier is the smoke test a candidate binary must pass.
-//
-// It is a port rather than a method on the manager because deciding
-// what "working" means -- resolving a fixed list of real videos -- is
-// policy, and policy does not belong in the component that downloads
-// files.
+// ToolchainVerifier is the smoke test a candidate binary must pass. A
+// port, not a manager method: deciding what "working" means is policy,
+// not the downloader's job.
 type ToolchainVerifier interface {
 	Verify(ctx context.Context, binPath string) []SmokeTestResult
 }

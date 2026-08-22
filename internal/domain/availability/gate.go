@@ -29,33 +29,32 @@ type Reason struct {
 	LastOnline time.Time
 }
 
-// Gate aggregates signals into the single yes/no the HTTP layer asks for.
-//
-// Composition is OR across sources (spec §4.4.3): any source reporting
-// online opens the gate. Going the other way is debounced by Grace,
-// because Discord drops its gateway connection routinely and a game
-// restart looks identical to quitting -- without the delay a five-second
-// blip would cut off everyone watching.
-//
-// With no sources configured the gate stays closed and only /on can open
-// it. That is deliberate: an unconfigured detector is not evidence that
-// anyone is playing, and the manual override is always reachable because
-// command endpoints bypass the gate entirely.
+// Gate aggregates signals into the single yes/no the HTTP layer asks for
+// (spec §4.4.3): OR across Signals; offline->closed debounced by Grace
+// (Discord's gateway drops routinely). CRITICAL: fail-closed -- zero
+// configured sources means closed, only /on opens it; command endpoints
+// always bypass the gate.
 type Gate struct {
 	Signals []Signal
 	// Grace is how long the gate stays open after the last source went
 	// offline.
 	Grace time.Duration
-	// PollInterval is how often the background loop re-evaluates.
-	// Evaluating only on request would misjudge the grace window: it
-	// measures from the last observed online moment, which nobody
-	// observes while no requests arrive.
+	// PollInterval is how often the background loop re-evaluates; needed
+	// because the grace window measures from the last observed online
+	// moment, which nobody observes while no requests arrive.
 	PollInterval time.Duration
 	Now          func() time.Time
 	Overrides    OverrideStore
 	// OnTransition is called whenever the decision flips, for the event
 	// log /e reads (spec §4.4.3).
 	OnTransition func(Reason)
+
+	// ModeStore persists the /mode selection; nil keeps mode fixed at
+	// ModeDefault (gate-less/mode-unaware deployments, and tests).
+	ModeStore ModeStore
+	// WhitelistIPs is consulted only in ModeWhitelist: plain client
+	// addresses, not CIDRs -- the allowed set is small and fixed.
+	WhitelistIPs []string
 
 	mu         sync.Mutex
 	started    bool
@@ -66,6 +65,7 @@ type Gate struct {
 	detail     string
 	override   Override
 	sources    []SourceStatus
+	mode       AccessMode
 	stop       context.CancelFunc
 }
 
@@ -83,6 +83,11 @@ func (g *Gate) Start(ctx context.Context) error {
 	if g.Overrides != nil {
 		if o, err := g.Overrides.Load(); err == nil {
 			g.override = o
+		}
+	}
+	if g.ModeStore != nil {
+		if m, err := g.ModeStore.Load(); err == nil && m != "" {
+			g.mode = m
 		}
 	}
 	g.since = g.now()
@@ -136,9 +141,8 @@ func (g *Gate) Close() error {
 	return firstErr
 }
 
-// IsOpen reports the current decision. It re-reads the sources rather
-// than waiting for the next tick, so a source that just came online
-// takes effect on the very next request.
+// IsOpen re-reads the sources rather than waiting for the next tick, so a
+// source that just came online takes effect on the next request.
 func (g *Gate) IsOpen(ctx context.Context) (bool, Reason) {
 	g.evaluate(ctx)
 	g.mu.Lock()
@@ -171,6 +175,46 @@ func (g *Gate) reasonLocked() (bool, Reason) {
 		Detail:     g.detail,
 		Since:      g.since,
 		LastOnline: g.lastOnline,
+	}
+}
+
+// CurrentMode reports the access mode /mode last selected, ModeDefault
+// if none ever was.
+func (g *Gate) CurrentMode() AccessMode {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.mode == "" {
+		return ModeDefault
+	}
+	return g.mode
+}
+
+// SetMode switches the access mode (spec-adjacent /mode command).
+func (g *Gate) SetMode(m AccessMode) {
+	g.mu.Lock()
+	g.mode = m
+	g.mu.Unlock()
+	if g.ModeStore != nil {
+		g.ModeStore.Save(m)
+	}
+}
+
+// Allow is IsOpen filtered through the current mode; IsOpen itself stays
+// mode-unaffected so /s keeps reporting the raw presence signal.
+func (g *Gate) Allow(ctx context.Context, clientIP string) (bool, Reason) {
+	switch g.CurrentMode() {
+	case ModeOpen:
+		return true, Reason{Open: true, Source: "mode:open", Detail: "open mode: presence gate bypassed"}
+	case ModeWhitelist:
+		// NOTE: WhitelistIPs is set once at construction, so it needs no lock.
+		for _, ip := range g.WhitelistIPs {
+			if ip == clientIP {
+				return true, Reason{Open: true, Source: "mode:whitelist", Detail: "client address is allow-listed"}
+			}
+		}
+		return false, Reason{Open: false, Source: "mode:whitelist", Detail: "client address is not on the whitelist"}
+	default:
+		return g.IsOpen(ctx)
 	}
 }
 

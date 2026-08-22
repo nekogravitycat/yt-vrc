@@ -90,10 +90,9 @@ func run() error {
 	recorder := &health.Recorder{Persist: healthStore.Save}
 	recorder.Restore(healthStore.Load())
 
-	// One budget shared by every path that reaches YouTube: viewers,
-	// the scheduled probe, and the upgrade smoke test. Splitting it per
-	// caller would let the total drift past what YouTube is actually
-	// counting, which is requests from this address.
+	// Shared across every path that reaches YouTube (viewers, probe, smoke
+	// test): splitting it per caller would let usage drift past what
+	// YouTube actually rate-limits, which is this IP.
 	budget := &throttle.Limiter{
 		PerKey: cfg.ResolveLimitPerVideo,
 		Global: cfg.ResolveLimitGlobal,
@@ -143,11 +142,8 @@ func run() error {
 			Clients:    cfg.YtdlpClients,
 			JSRuntimes: cfg.YtdlpJSRuntimes,
 			Log:        log,
-			// Charged but never refused. A smoke test decides whether a
-			// candidate yt-dlp works at all, so blocking it would stop
-			// the upgrade rather than protect anything -- but its
-			// requests do reach YouTube, and four upgrade cycles is a
-			// dozen lookups of the same three videos.
+			// Charged but never refused: blocking would stop the upgrade
+			// rather than protect anything, yet these requests do hit YouTube.
 			Charge: budget.Charge,
 		},
 		Drain:         play.Drain,
@@ -200,6 +196,7 @@ func run() error {
 		MaxSlots:        cfg.MessageSlotsLimit,
 		Events:          events,
 		OverrideTTL:     cfg.GateOverrideTTL,
+		AdminIPs:        cfg.AdminIPs,
 		CacheLimitBytes: cfg.CacheMaxBytes,
 		Budget:          budget,
 		Upgrade:         upgrader,
@@ -208,8 +205,7 @@ func run() error {
 		Thresholds:      thresholds(cfg),
 		DataDir:         cfg.DataDir,
 	}
-	// Nil rather than a typed nil: the HTTP layer checks the interface
-	// against nil to decide whether the gate applies at all.
+	// NOTE: nil, not a typed nil — httpapi checks the interface against nil.
 	if gate != nil {
 		srv.Gate = gate
 	}
@@ -218,17 +214,16 @@ func run() error {
 	httpSrv := &http.Server{
 		Addr:    cfg.ListenAddr,
 		Handler: srv.Handler(),
-		// Generous write timeout: a cache miss on a long video blocks
-		// the request for the whole prepare (implementation.md §3.3).
+		// NOTE: keep >= PrepareTimeout — a cache miss on a long video blocks
+		// the request for the whole prepare.
 		ReadHeaderTimeout: 10 * time.Second,
 		WriteTimeout:      cfg.PrepareTimeout + time.Minute,
 	}
 
 	if gate != nil {
 		if err := gate.Start(ctx); err != nil {
-			// A source that will not start is worth failing loudly for:
-			// with the gate fail-closed, silently continuing would look
-			// like the service is up while every video is refused.
+			// Fail loudly: silently continuing would mask a stuck-closed
+			// gate as normal startup.
 			return err
 		}
 		defer gate.Close()
@@ -258,12 +253,10 @@ func run() error {
 	return nil
 }
 
-// buildToolchain decides how yt-dlp is obtained (spec §4.5.2).
-//
-// managed mode owns a versioned directory on the volume and can replace
-// the binary while running; path mode uses whatever is on PATH, which is
-// how the dev machine runs and why /u refuses there rather than
-// replacing a binary this service did not install.
+// buildToolchain decides how yt-dlp is obtained (spec §4.5.2): managed mode
+// owns a versioned dir and can hot-swap the binary; path mode uses whatever
+// is on PATH (the dev setup), so /u refuses there rather than replacing a
+// binary this service didn't install.
 func buildToolchain(ctx context.Context, cfg *config.Config, log *slog.Logger) port.ToolchainManager {
 	if !strings.EqualFold(cfg.YtdlpMode, "managed") {
 		return &ytdlp.PathManager{Bin: cfg.YtdlpPath}
@@ -274,19 +267,18 @@ func buildToolchain(ctx context.Context, cfg *config.Config, log *slog.Logger) p
 		Fallback: cfg.YtdlpPath,
 		Log:      log,
 	}
-	// Deliberately non-fatal. The image ships no yt-dlp (spec §9.1), so
-	// a fresh volume needs this download -- but refusing to start
-	// because GitHub was briefly unreachable would take down a service
-	// whose management endpoints could have explained the problem.
+	// Deliberately non-fatal: a fresh volume needs this download (image
+	// ships no yt-dlp, spec §9.1), but failing startup over a transient
+	// GitHub outage would take down a service whose own endpoints could
+	// have explained the problem.
 	if err := m.Ensure(ctx); err != nil {
 		log.Error("yt-dlp bootstrap failed; falling back to PATH", "err", err, "fallback", cfg.YtdlpPath)
 	}
 	return m
 }
 
-// thresholds turns the configurable part of spec §4.6 into domain
-// thresholds. Only the staleness point is configurable; the rest are
-// fixed because they describe the service rather than the deployment.
+// thresholds builds spec §4.6 domain thresholds; only staleness is
+// configurable, since the rest describe the service, not the deployment.
 func thresholds(cfg *config.Config) health.Thresholds {
 	t := health.DefaultThresholds
 	if cfg.YtdlpStaleDays > 0 {
@@ -298,9 +290,8 @@ func thresholds(cfg *config.Config) health.Thresholds {
 	return t
 }
 
-// parseVideoIDs validates the probe and smoke-test list, dropping and
-// reporting anything malformed rather than failing startup over a typo
-// in a diagnostic setting.
+// parseVideoIDs drops and logs malformed entries rather than failing
+// startup over a typo in a diagnostic setting.
 func parseVideoIDs(raw []string, log *slog.Logger) []video.ID {
 	out := make([]video.ID, 0, len(raw))
 	for _, s := range raw {
@@ -314,14 +305,12 @@ func parseVideoIDs(raw []string, log *slog.Logger) []video.ID {
 	return out
 }
 
-// buildGate assembles the availability gate from whatever sources are
-// configured (spec §4.4.2). It returns nil when the gate is switched
-// off, which leaves every video endpoint unguarded.
+// buildGate assembles the availability gate from configured sources
+// (spec §4.4.2); nil means the gate is switched off entirely.
 //
-// No source is enabled by default. That combination -- gate on, nothing
-// detecting -- is deliberately fail-closed: an unconfigured detector is
-// not evidence that anyone is playing. /on is always reachable because
-// command endpoints bypass the gate.
+// NOTE: fail-closed — zero configured sources still closes the gate (an
+// unconfigured detector isn't evidence anyone's playing); only /on,
+// which bypasses the gate, can open it.
 func buildGate(cfg *config.Config, log *slog.Logger, events *state.EventLog) (*availability.Gate, error) {
 	if !cfg.GateEnabled {
 		log.Warn("availability gate disabled; every video endpoint is open")
@@ -329,6 +318,10 @@ func buildGate(cfg *config.Config, log *slog.Logger, events *state.EventLog) (*a
 	}
 
 	overrides, err := state.NewOverrideStore(cfg.StateDir())
+	if err != nil {
+		return nil, err
+	}
+	modes, err := state.NewModeStore(cfg.StateDir())
 	if err != nil {
 		return nil, err
 	}
@@ -354,6 +347,8 @@ func buildGate(cfg *config.Config, log *slog.Logger, events *state.EventLog) (*a
 		Grace:        cfg.GateGracePeriod,
 		PollInterval: cfg.GatePollInterval,
 		Overrides:    overrides,
+		ModeStore:    modes,
+		WhitelistIPs: cfg.WhitelistIPs,
 		OnTransition: func(r availability.Reason) {
 			log.Info("gate transition", "open", r.Open, "source", r.Source, "detail", r.Detail)
 			verb := "closed"

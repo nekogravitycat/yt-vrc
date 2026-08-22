@@ -1,10 +1,8 @@
 // Package fetch downloads media tracks using parallel ranged requests.
 //
-// googlevideo throttles a single long-lived sequential GET to roughly
-// 300 KB/s, but serves ranged chunk requests at ~20 MB/s — a 62x gap
-// measured on a real 1080p track (implementation.md §2.1). At the
-// throttled rate a 1080p remux would run slower than playback, so
-// chunking is not an optimisation here but a correctness requirement.
+// CRITICAL: googlevideo throttles a single sequential GET to ~300 KB/s but
+// serves ranged chunks at ~20 MB/s (60x+) — a straight fetch runs slower
+// than playback. Chunking is a correctness requirement, not a perf tweak.
 package fetch
 
 import (
@@ -51,9 +49,8 @@ func (f *Fetcher) Fetch(ctx context.Context, t video.Track, dest string, onProgr
 		total = clenFromURL(t.URL)
 	}
 
-	// Resolve any redirect once, then reuse the final URL for every
-	// chunk. Re-following a 302 per chunk cost ~5x throughput in
-	// testing (implementation.md §2.4).
+	// NOTE: resolve the redirect once and reuse it — re-following a 302
+	// per chunk cost ~5x throughput in testing.
 	final, probed, err := f.probe(ctx, t.URL)
 	if err != nil {
 		return err
@@ -158,9 +155,8 @@ func (f *Fetcher) chunkOnce(ctx context.Context, url string, out *os.File, start
 	}
 	defer resp.Body.Close()
 
-	// A 200 here means the server ignored the Range header and is
-	// streaming the whole file — exactly the throttled path we must
-	// avoid, so treat it as an error rather than silently accepting it.
+	// CRITICAL: a 200 means the server ignored Range and would stream at
+	// the throttled rate — reject it, don't silently accept.
 	if resp.StatusCode != http.StatusPartialContent {
 		return 0, fmt.Errorf("expected 206, got %s", resp.Status)
 	}

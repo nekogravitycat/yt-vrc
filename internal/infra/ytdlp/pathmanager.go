@@ -7,13 +7,10 @@ import (
 	"github.com/nekogravitycat/yt-vrc/internal/domain/port"
 )
 
-// PathManager is the toolchain for a deployment that uses whatever
-// yt-dlp is on PATH (YTDLP_MODE=path), which is how the dev machine runs.
-//
-// It reports versions and staleness like the real thing -- those are
-// what /s needs -- but refuses to install, because a binary this service
-// did not put there is not one it should replace. /u then explains that
-// rather than failing somewhere deep in a download.
+// PathManager is the toolchain for YTDLP_MODE=path (whatever yt-dlp is
+// on PATH; the dev-machine default). It reports version/staleness like
+// the managed toolchain but refuses to install: a binary this service
+// didn't place is not one it should replace.
 type PathManager struct {
 	Bin string
 }

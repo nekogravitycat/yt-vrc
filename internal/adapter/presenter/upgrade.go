@@ -9,16 +9,11 @@ import (
 	"github.com/nekogravitycat/yt-vrc/internal/usecase/upgrade"
 )
 
-// UpgradeProgress reports a run that is still going (spec §4.5).
-//
-// /u answers immediately and the work continues behind it, so this view
-// carries the instruction that makes the pattern work: come back and
-// enter the same URL again.
+// UpgradeProgress reports a run that is still going (spec §4.5); carries
+// the "re-enter /u" instruction since the work continues async behind it.
 func UpgradeProgress(s upgrade.State, started bool) message.View {
 	v := message.View{Kind: message.KindProgress}
-	// Name the verb that is actually running. The two move the same
-	// pointer in opposite directions, and someone who typed /u/back
-	// needs to see that it took, not a screen that says "Upgrade".
+	// Names the actual verb: /u/back must show "Rollback", not a generic "Upgrade".
 	what := "Upgrade"
 	if s.Kind == upgrade.KindRollback {
 		what = "Rollback"
@@ -86,9 +81,8 @@ func UpgradeOutcome(s upgrade.State) message.View {
 		if r.To != "" && r.To != r.From {
 			v.AddRow("Tried", r.To)
 		}
-		// Naming the failing smoke test is the difference between "the
-		// upgrade broke" and "this release cannot resolve video", which
-		// are different problems with different responses.
+		// Names the failing test: "the upgrade broke" vs. "this release
+		// can't resolve video" are different problems needing different responses.
 		for _, t := range r.SmokeTests {
 			if !t.OK {
 				v.AddRow("Failed test", t.Name)
@@ -141,9 +135,8 @@ func Maintenance(stage string, since time.Time) message.View {
 	if !since.IsZero() {
 		v.AddRow("Elapsed", time.Since(since).Round(time.Second).String())
 	}
-	// No countdown: the duration depends on GitHub and on how long three
-	// live resolves take, and a made-up number that expires is worse
-	// than none.
+	// No countdown: duration depends on GitHub and live resolve timing —
+	// a made-up number that expires is worse than none.
 	v.AddLine("Usually under a minute. Re-enter the video URL after that.")
 	v.Footer = "/u for upgrade progress"
 	return v

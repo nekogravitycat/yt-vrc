@@ -51,6 +51,9 @@ type Server struct {
 	Events event.Log
 	// OverrideTTL is how long /on holds for.
 	OverrideTTL time.Duration
+	// AdminIPs restricts side-effecting commands (/on /off /p /d /u
+	// /mode) to these client addresses. Empty means unrestricted.
+	AdminIPs []string
 	// CacheLimitBytes is reported by /s; enforcement lives in the store.
 	CacheLimitBytes int64
 
@@ -83,10 +86,16 @@ type Server struct {
 // only on what it actually calls.
 type Gate interface {
 	IsOpen(ctx context.Context) (bool, availability.Reason)
+	// Allow is IsOpen filtered through the /mode selection: open mode
+	// always allows, whitelist mode checks clientIP instead of the
+	// presence signal, default mode is IsOpen unchanged.
+	Allow(ctx context.Context, clientIP string) (bool, availability.Reason)
 	Reason() availability.Reason
 	Sources() []availability.SourceStatus
 	SetOverride(open bool, until time.Time)
 	ClearOverride()
+	CurrentMode() availability.AccessMode
+	SetMode(m availability.AccessMode)
 }
 
 // slotTable returns the message slot table, building it on first use.
@@ -114,13 +123,10 @@ func (s *Server) PinnedMessages() []string { return s.slotTable().pinned() }
 const messagePrefix = "m"
 
 const (
-	// cacheImmutable suits artifacts published only once complete and
-	// addressed by a key encoding id, quality and container: their bytes
-	// never change. Saying so keeps repeat viewers off the origin
-	// entirely -- the common case when several people watch together.
+	// cacheImmutable: video artifacts are content-addressed and never
+	// mutate once complete, so repeat viewers can be served from cache.
 	cacheImmutable = "public, max-age=31536000, immutable"
-	// cacheNever suits every message URL, whose contents move with the
-	// service state.
+	// cacheNever: message URLs resolve to different content over time (see slots.go).
 	cacheNever = "no-store"
 )
 
@@ -140,13 +146,11 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 	segs := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 
 	// Rendered message media: /m/{slot}/{file}, falling back to a bare
-	// {hash}_{container} for anything not currently held by a slot.
+	// {hash}_{container} for anything not currently held by a slot (see slots.go).
 	if len(segs) == 3 && segs[0] == messagePrefix && isAssetFile(segs[2]) {
 		key, stable := s.slotTable().resolve(segs[1])
 		cache := cacheImmutable
 		if stable {
-			// What a slot points at changes with the service state, so
-			// nothing along the path may hold a copy.
 			cache = cacheNever
 		}
 		s.serveFrom(w, r, s.Messages.Open, key, segs[2], cache)
@@ -180,10 +184,9 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) serveVideo(w http.ResponseWriter, r *http.Request, route Route) {
-	// Maintenance is checked before the gate: during a version swap the
-	// service is unavailable for a reason the user can wait out, and
-	// saying "offline" instead would send them to /on to fix something
-	// that is not broken (spec §10).
+	// Checked before the gate: a version swap is a wait-it-out state, and
+	// reporting "offline" instead would send the user to /on to fix
+	// something that isn't broken.
 	if s.Upgrade != nil {
 		if active, stage := s.Upgrade.Maintenance(); active {
 			st := s.Upgrade.State()
@@ -192,11 +195,11 @@ func (s *Server) serveVideo(w http.ResponseWriter, r *http.Request, route Route)
 		}
 	}
 
-	// The gate covers video only. Management endpoints stay reachable
-	// so the service can be diagnosed and reopened from inside VRChat
-	// (spec §4.4.1).
+	// CRITICAL: the gate covers video only. Command endpoints (including
+	// /on) must stay reachable so the service can be diagnosed and
+	// reopened from inside VRChat when the gate closes wrongly.
 	if s.Gate != nil {
-		if open, reason := s.Gate.IsOpen(r.Context()); !open {
+		if open, reason := s.Gate.Allow(r.Context(), clientIP(r)); !open {
 			s.Log.Info("gate closed", "id", route.VideoID, "source", reason.Source)
 			s.deliver(w, r, "gate", presenter.GateClosed(reason), route.Spec, http.StatusServiceUnavailable)
 			return
@@ -213,12 +216,8 @@ func (s *Server) serveVideo(w http.ResponseWriter, r *http.Request, route Route)
 	}
 	w.Header().Set("Cache-Control", "public, max-age=60")
 
-	// Serve the playlist inline rather than redirecting to it. AVPro
-	// chooses its backend partly from the request URL, and a 302 whose
-	// body is text/html reads to it as an unplayable format -- browsers
-	// only succeed here because they follow redirects and sniff types.
-	// Segment URIs are rewritten to absolute paths so they still resolve
-	// against the artifact directory (spec §13.1 item 2).
+	// CRITICAL: served inline, never via 302 — AVPro doesn't follow
+	// redirects or sniff Content-Type, so a redirect reads as unplayable.
 	if asset.Spec.Container == video.ContainerHLS {
 		s.servePlaylist(w, r, s.Play.Open, asset.Key, "/"+string(asset.Key)+"/")
 		return
@@ -226,16 +225,12 @@ func (s *Server) serveVideo(w http.ResponseWriter, r *http.Request, route Route)
 	s.serveFrom(w, r, s.Play.Open, asset.Key, "video.mp4", cacheImmutable)
 }
 
-// deliver renders a view and points the player at it.
+// deliver renders a view under a stable slot URL (name identifies the
+// message, e.g. a command or video ID; see slotFor) and serves it.
 //
-// The player is the only display this user has, so the response body is
-// always media (spec §10). The classification still reaches the logs,
-// and ?debug=1 returns it as text for terminal debugging.
-//
-// name identifies what the message is about -- a command, a video --
-// never what it currently says. It becomes the slot the media is served
-// under, so the same input always yields the same media URL even as the
-// content behind it changes (see slots.go).
+// CRITICAL: the real response is always 200/206 via http.ServeContent —
+// code only affects the ?debug=1 text branch. A player won't render a
+// 4xx body, so classification goes to the log and ?debug=1 instead.
 func (s *Server) deliver(w http.ResponseWriter, r *http.Request, name string, v message.View, spec video.OutputSpec, code int) {
 	if r.URL.Query().Has("debug") {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -256,16 +251,8 @@ func (s *Server) deliver(w http.ResponseWriter, r *http.Request, name string, v 
 
 	slot := slotFor(name, spec.Container)
 	s.slotTable().set(slot, asset.Key)
-
-	// Which render a slot resolves to moves with the service state, so
-	// neither this response nor anything under the slot may be cached.
 	w.Header().Set("Cache-Control", cacheNever)
 
-	// Deliberately 200, whatever the classification. The body is the
-	// only thing the user can perceive, and a player refuses to render
-	// the body of a 4xx -- an error message video that will not play
-	// tells them nothing. The classification reaches the structured log
-	// and ?debug=1 instead (spec §10, docs/implementation.md §7.3).
 	if spec.Container == video.ContainerHLS {
 		s.servePlaylist(w, r, s.Messages.Open, asset.Key,
 			"/"+messagePrefix+"/"+slot+"/")
@@ -370,14 +357,10 @@ func (d Defaults) spec() video.OutputSpec {
 
 func errorIs(err, target error) bool { return errors.Is(err, target) }
 
-// servePlaylist serves an HLS playlist with its segment URIs rewritten
-// to absolute paths.
-//
-// ffmpeg writes segment names relative to the playlist ("seg_00000.ts"),
-// which only resolves correctly when the playlist is fetched from inside
-// the artifact directory. Serving it at the video URL instead means the
-// player would resolve them against the wrong base, so the URIs are made
-// absolute on the way out.
+// servePlaylist serves an HLS playlist with segment URIs rewritten to
+// absolute paths: ffmpeg writes them relative to the playlist file,
+// which is wrong once served from a different URL than the artifact
+// directory (the video URL, or a message slot).
 func (s *Server) servePlaylist(w http.ResponseWriter, r *http.Request, open opener, key video.CacheKey, prefix string) {
 	f, modTime, err := open(key, ffmpeg.MasterName)
 	if err != nil {

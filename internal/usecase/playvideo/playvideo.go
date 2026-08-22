@@ -18,6 +18,11 @@ import (
 	"github.com/nekogravitycat/yt-vrc/internal/domain/video"
 )
 
+// Architecture Note: singleflight here is anti-throttle, not a perf
+// cache — YouTube bot-checks a video resolved too often. resolveGroup
+// keys "{id}_{quality}" (the format selector depends on quality);
+// prepareGroup keys the full cache key. Shared work runs under
+// context.WithoutCancel, so one caller leaving can't cancel others'.
 type UseCase struct {
 	Resolver    port.Resolver
 	Fetcher     port.MediaFetcher
@@ -30,21 +35,14 @@ type UseCase struct {
 	PrepareTimeout time.Duration
 	// TempDir holds downloaded tracks; they are deleted once remuxed.
 	TempDir string
-	// MaxJobs caps how many distinct artifacts are prepared at once
-	// (spec §8). Beyond bounding disk and CPU, this is the second half
-	// of the anti-blocking story: singleflight collapses duplicate
-	// requests for one video, and this stops a burst of *different*
-	// videos turning into a burst of yt-dlp calls from one IP.
+	// MaxJobs caps concurrent distinct-video preparations (disk/CPU;
+	// singleflight above only dedups repeats of the *same* video).
 	MaxJobs int
 	// Health receives the outcome of every resolve, feeding the rolling
-	// success rate /s reports (spec §4.6). Optional.
+	// success rate /s reports. Optional.
 	Health port.ResolveRecorder
 
-	// Two layers of de-duplication (spec §4.7.3). This is not merely an
-	// optimisation: YouTube rate-limits repeated resolution of one
-	// video, and a VRChat instance produces exactly that burst when
-	// several people paste the same link within seconds
-	// (docs/implementation.md §8.2).
+	// prepareGroup/resolveGroup: see Architecture Note above.
 	prepareGroup singleflight.Group
 	resolveGroup singleflight.Group
 
@@ -55,10 +53,8 @@ type UseCase struct {
 	jobs   map[video.CacheKey]*jobState
 }
 
-// jobState is what /w and the progress view read while a preparation is
-// running. It exists only for the lifetime of the job: once the artifact
-// is in the store, the store is the better answer to every question this
-// could be asked.
+// jobState backs /w and progress reads while a job runs; deleted once
+// the artifact lands in the store, which then answers those questions.
 type jobState struct {
 	Title      string
 	Stage      string
@@ -91,14 +87,9 @@ func (u *UseCase) jobUpdate(key video.CacheKey, f func(*jobState)) {
 	}
 }
 
-// Progress reports how far a running preparation has got, and whether
-// there is one at all.
-//
-// The estimate is derived from the download alone. It is the only stage
-// whose remaining work is knowable -- resolving is a single opaque call,
-// and the remux that follows it took 0.24s for a five-minute video
-// (implementation.md §2.3), so folding either into a percentage would
-// make the number less honest rather than more complete.
+// Progress reports how far a running preparation has got.
+// Estimate covers only the download stage: resolve is one opaque call
+// and remux is near-instant, so blending them in would be less honest.
 func (u *UseCase) Progress(key video.CacheKey) (string, video.Progress, bool) {
 	u.jobsMu.RLock()
 	defer u.jobsMu.RUnlock()
@@ -120,24 +111,14 @@ func (u *UseCase) Progress(key video.CacheKey) (string, video.Progress, bool) {
 	return j.Title, p, true
 }
 
-// Warm prepares an artifact without a player waiting on it (spec §4.1.3
-// /w), and is also what /r uses once it has dropped the old one.
-//
-// It waits `grace` for the job to fail before returning, because the
-// failures worth telling someone about immediately -- a video that does
-// not exist, a spent resolve budget, every job slot busy -- all land
-// inside the first couple of seconds, which is roughly one resolve
-// (Phase 0 median 1.6s). Anything still running after that is genuinely
-// downloading, and the caller is told so.
-//
-// report is called with the eventual outcome whether or not anyone is
-// still listening: a warm that fails after the response has gone out is
-// exactly the failure that would otherwise vanish.
+// Warm prepares an artifact without a player waiting (used by /w and /r).
+// It blocks up to grace so fast failures (bad video, spent budget, full
+// job slots) return synchronously; report still fires after grace so a
+// later failure isn't lost once the caller has stopped listening.
 func (u *UseCase) Warm(ctx context.Context, id video.ID, spec video.OutputSpec, grace time.Duration, report func(error)) error {
 	done := make(chan error, 1)
 	go func() {
-		// Detached: /w answers immediately by design, so the job must
-		// not die with the request that asked for it.
+		// Detached: must survive the request that started it.
 		_, err := u.Prepare(context.WithoutCancel(ctx), id, spec)
 		if report != nil {
 			report(err)
@@ -153,10 +134,8 @@ func (u *UseCase) Warm(ctx context.Context, id video.ID, spec video.OutputSpec, 
 	}
 }
 
-// acquire takes a job slot, reporting false when the service is already
-// at its limit. It never waits: a player left staring at a spinner
-// learns nothing, whereas an immediate "N jobs running" message tells
-// the user to come back (spec §10).
+// acquire takes a job slot without waiting; false means already at
+// MaxJobs — an immediate refusal beats a stalled spinner.
 func (u *UseCase) acquire() bool {
 	sem := u.semaphore()
 	if sem == nil {
@@ -176,9 +155,8 @@ func (u *UseCase) release() {
 	}
 }
 
-// semaphore builds the slot channel on first use. Every reader goes
-// through here: /s can ask for the job count while a request is still
-// building it, and reading the field directly would race.
+// semaphore lazily builds the slot channel; always read through here —
+// reading the field directly would race with ActiveJobs().
 func (u *UseCase) semaphore() chan struct{} {
 	u.semOnce.Do(func() {
 		if u.MaxJobs > 0 {
@@ -191,13 +169,9 @@ func (u *UseCase) semaphore() chan struct{} {
 // ActiveJobs reports how many preparations are running, for /s.
 func (u *UseCase) ActiveJobs() int { return len(u.semaphore()) }
 
-// Drain waits until no preparation is running, so a yt-dlp swap does
-// not land underneath a job that is midway through using it
-// (spec §4.5.3 step 2).
-//
-// Polling rather than signalling is deliberate: the wait happens once
-// per upgrade, and a condition variable here would add synchronisation
-// to the request path to serve a path that runs a few times a year.
+// Drain waits until no preparation is running, so a yt-dlp swap can't
+// land under an in-flight job. Polls rather than signals — this runs a
+// few times a year, not worth adding sync overhead to the request path.
 func (u *UseCase) Drain(ctx context.Context) error {
 	const poll = 250 * time.Millisecond
 	for {
@@ -221,10 +195,6 @@ func (u *UseCase) Prepare(ctx context.Context, id video.ID, spec video.OutputSpe
 		return a, nil
 	}
 
-	// The shared work deliberately does not inherit this caller's
-	// cancellation: a player that gives up must not abort a job other
-	// players are still waiting on. Request values are kept so tracing
-	// and logging still work.
 	ch := u.prepareGroup.DoChan(string(key), func() (any, error) {
 		workCtx := context.WithoutCancel(ctx)
 		if u.PrepareTimeout > 0 {
@@ -235,18 +205,28 @@ func (u *UseCase) Prepare(ctx context.Context, id video.ID, spec video.OutputSpe
 		return u.prepare(workCtx, id, spec, key)
 	})
 
+	asset, shared, err := waitShared[*video.MediaAsset](ctx, ch)
+	if err != nil {
+		return nil, err
+	}
+	if shared {
+		u.Log.Debug("joined in-flight preparation", "key", key)
+	}
+	return asset, nil
+}
+
+// waitShared blocks for a singleflight result while still honoring ctx
+// cancellation locally; the work itself (started under
+// context.WithoutCancel by the caller) keeps running for other waiters.
+func waitShared[T any](ctx context.Context, ch <-chan singleflight.Result) (val T, shared bool, err error) {
 	select {
 	case <-ctx.Done():
-		// This caller left; the job continues for whoever remains.
-		return nil, ctx.Err()
-	case res := <-ch:
-		if res.Err != nil {
-			return nil, res.Err
+		return val, false, ctx.Err()
+	case r := <-ch:
+		if r.Err != nil {
+			return val, false, r.Err
 		}
-		if res.Shared {
-			u.Log.Debug("joined in-flight preparation", "key", key)
-		}
-		return res.Val.(*video.MediaAsset), nil
+		return r.Val.(T), r.Shared, nil
 	}
 }
 
@@ -278,17 +258,15 @@ func (u *UseCase) prepare(ctx context.Context, id video.ID, spec video.OutputSpe
 	}
 	u.jobUpdate(key, func(j *jobState) {
 		j.Title, j.Stage, j.DownloadAt = res.Title, "downloading", time.Now()
-		// Both tracks are downloaded, so the total is both track sizes;
-		// showing only the video track's would stall the bar near the
-		// end while the audio came down.
+		// Total covers both tracks so the bar doesn't stall near the end
+		// while audio is still downloading.
 		j.Total = res.Video.SizeBytes
 		if !res.Combined() {
 			j.Total += res.Audio.SizeBytes
 		}
 	})
 
-	// Refusing rather than transcoding is deliberate: -c copy is what
-	// makes packaging cheap enough for this design to work (spec §4.2.2).
+	// Refuse rather than transcode: -c copy is what keeps packaging cheap.
 	if res.NeedsRecode {
 		return nil, fmt.Errorf("%w: video=%s audio=%s", video.ErrNeedsRecode, res.Video.Codec, res.Audio.Codec)
 	}
@@ -306,8 +284,7 @@ func (u *UseCase) prepare(ctx context.Context, id video.ID, spec video.OutputSpe
 	srcAudio := filepath.Join(work, "audio.m4a")
 
 	dlStart := time.Now()
-	// The two tracks report their own byte counts, so the second one
-	// starts from where the first finished rather than from zero.
+	// base offsets audio progress by the video size already counted.
 	var base int64
 	onProgress := func(done, _ int64) {
 		u.jobUpdate(key, func(j *jobState) { j.Done = base + done })
@@ -347,25 +324,15 @@ func (u *UseCase) prepare(ctx context.Context, id video.ID, spec video.OutputSpe
 	return asset, nil
 }
 
-// resolve wraps the yt-dlp call in its own de-duplication layer.
-//
-// Spec §4.7.3 keys this on video ID alone, reasoning that every quality
-// of one video shares its metadata. That holds for metadata but not for
-// what Resolve actually returns: the format selector is quality-derived,
-// so the resulting track URLs differ per quality. Keying on ID alone
-// would hand a 720p request the 1080p tracks. The key therefore includes
-// quality, which still collapses the case that matters — many viewers
-// requesting the same video at the default quality.
+// resolve wraps the yt-dlp call in resolveGroup's per-quality dedup
+// (see Architecture Note).
 func (u *UseCase) resolve(ctx context.Context, id video.ID, spec video.OutputSpec) (*video.Resolution, error) {
 	key := fmt.Sprintf("%s_%d", id, spec.Quality)
 	ch := u.resolveGroup.DoChan(key, func() (any, error) {
 		start := time.Now()
 		res, err := u.Resolver.Resolve(context.WithoutCancel(ctx), id, spec)
-		// A resolve we declined to make is not evidence about whether
-		// resolving works: it never reached YouTube. Recording it would
-		// let the service's own restraint drive the success rate on /s
-		// down to critical, which is the opposite of what that number
-		// is for (spec §4.6).
+		// NOTE: a budget-refused resolve never reached YouTube; recording
+		// it would corrupt /s's success rate with our own restraint.
 		if u.Health != nil && !errors.Is(err, video.ErrThrottled) {
 			u.Health.RecordResolve(err == nil, time.Since(start), false)
 		}
@@ -379,15 +346,8 @@ func (u *UseCase) resolve(ctx context.Context, id video.ID, spec video.OutputSpe
 		return res, nil
 	})
 
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case r := <-ch:
-		if r.Err != nil {
-			return nil, r.Err
-		}
-		return r.Val.(*video.Resolution), nil
-	}
+	res, _, err := waitShared[*video.Resolution](ctx, ch)
+	return res, err
 }
 
 // Open serves one file from a prepared artifact.

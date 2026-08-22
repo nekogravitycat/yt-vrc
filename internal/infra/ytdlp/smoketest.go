@@ -9,13 +9,12 @@ import (
 	"github.com/nekogravitycat/yt-vrc/internal/domain/video"
 )
 
-// SmokeTester decides whether a candidate yt-dlp binary works, by making
-// it resolve a fixed list of real videos (spec §4.5.3 step 6).
-//
-// "--version succeeded" is not evidence of anything: every way yt-dlp
-// breaks in this project -- SABR-only, a changed player client, a broken
-// signature routine -- leaves the binary running perfectly and returning
-// no playable format. Only a real resolve distinguishes them.
+// SmokeTester verifies a candidate yt-dlp binary by resolving real
+// videos, not by running --version.
+// CRITICAL: "--version succeeded" proves nothing — SABR-only, a changed
+// player client, or a broken signature routine all leave the binary
+// running fine while returning no playable format; only a real resolve
+// catches them, gating whether Install lets the version go live.
 type SmokeTester struct {
 	Videos     []video.ID
 	Quality    video.QualityCap
@@ -24,11 +23,11 @@ type SmokeTester struct {
 	Clients    []string
 	JSRuntimes string
 	Log        *slog.Logger
-	// Charge, when set, records each probe against the service's
-	// outgoing resolve budget. Deliberately not the budget's Allow: a
-	// smoke test that could be refused would turn a busy evening into a
-	// blocked upgrade, but these requests still reach YouTube and the
-	// count would be wrong without them.
+	// Charge, when set, records each probe against the outgoing resolve
+	// budget.
+	// NOTE: deliberately not the budget's Allow gate — a refusable smoke
+	// test could block an upgrade, but the probe still hits YouTube and
+	// must be charged regardless.
 	Charge func(videoID string)
 }
 

@@ -21,15 +21,9 @@ const (
 	KindRollback Kind = "rollback"
 )
 
-// State is what /u reports.
-//
-// An upgrade runs in the background and /u reports where it has got to,
-// rather than holding the request open until it finishes. A blocking
-// request would have to survive AVPro's load timeout, which is still
-// unmeasured (spec §13.1 item 4), and Cloudflare's 100-second origin
-// timeout; and a player that gives up mid-upgrade would leave the user
-// unable to tell whether the version changed. Re-entering the same URL
-// to see progress is the interaction spec §4.2.3 already establishes.
+// State is what /u reports; an upgrade runs in the background rather than
+// blocking the request (would outrun AVPro's load timeout and Cloudflare's
+// 100s origin timeout) — re-poll /u to see progress (spec §4.2.3).
 type State struct {
 	Running    bool
 	Kind       Kind
@@ -40,10 +34,8 @@ type State struct {
 	Result     *port.UpgradeResult
 }
 
-// resultLinger is how long a finished run keeps answering /u before the
-// endpoint means "start another one" again. Long enough to walk back to
-// the video panel and read the outcome; short enough that /u stays a
-// verb rather than becoming a report.
+// resultLinger is how long a finished run still answers /u before the
+// endpoint means "start another one" again.
 const resultLinger = 90 * time.Second
 
 type UseCase struct {
@@ -56,10 +48,8 @@ type UseCase struct {
 	// Timeout bounds a whole run, which outlives the request that
 	// triggered it.
 	Timeout time.Duration
-	// CheckInterval is how often upstream is polled for a new release;
-	// Auto decides whether finding one also installs it. Auto is off by
-	// default: an unattended version change is exactly what you do not
-	// want to discover from inside VRChat (spec §4.5.4).
+	// CheckInterval is how often upstream is polled; Auto decides whether
+	// a found version also installs — off by default, spec §4.5.4.
 	CheckInterval time.Duration
 	Auto          bool
 
@@ -112,15 +102,10 @@ func (u *UseCase) Trigger(ctx context.Context, kind Kind) (State, bool) {
 	now := time.Now()
 
 	u.mu.Lock()
-	// A run in flight blocks anything else: the two kinds move the same
-	// pointer, and letting a rollback race a half-finished switch is how
-	// a volume ends up pointing at a staging directory.
-	//
-	// A *finished* run only short-circuits the same kind. Re-entering /u
-	// means "show me what happened"; /u/back after an upgrade means the
-	// opposite, and the linger window is exactly when someone decides
-	// the new version is bad. Swallowing it there would lock the escape
-	// hatch for the ninety seconds it exists for (implementation.md §16.3).
+	// CRITICAL: a run in flight blocks any other run — racing rollback
+	// against a half-finished switch can leave the volume pointing at a
+	// staging dir. A *finished* run only blocks a repeat of the same kind,
+	// so /u/back stays available during the linger window as the undo path.
 	if u.state.Running || (u.state.Fresh(now) && u.state.Kind == kind) {
 		s := u.state
 		u.mu.Unlock()
@@ -130,9 +115,8 @@ func (u *UseCase) Trigger(ctx context.Context, kind Kind) (State, bool) {
 	s := u.state
 	u.mu.Unlock()
 
-	// Detached from the request: the player that asked has already been
-	// answered, and cancelling the swap halfway because someone closed a
-	// video panel would be worse than finishing it.
+	// Detached: cancelling a swap mid-flight is worse than finishing it
+	// after the requester is gone.
 	work := context.WithoutCancel(ctx)
 	go u.run(work, kind)
 	return s, true

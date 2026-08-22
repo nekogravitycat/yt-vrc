@@ -9,13 +9,10 @@ import (
 	"github.com/nekogravitycat/yt-vrc/internal/domain/availability"
 )
 
-// Fake reports a fixed answer, set from configuration and flippable at
-// runtime.
-//
-// It exists because the gate is fail-closed and Discord credentials are
-// not yet issued: without it, developing or testing anything downstream
-// of the gate would mean reaching for /on after every restart. Its
-// confidence is low so that a real source always wins once one exists.
+// Fake is a dev-only stand-in signal (FAKE_SIGNAL_ONLINE), set at startup
+// and flippable via Set. Exists so developing anything downstream of the
+// fail-closed gate doesn't require /on after every restart; ConfidenceLow
+// ensures a real source always wins once one is configured.
 type Fake struct {
 	online atomic.Bool
 }

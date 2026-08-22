@@ -28,10 +28,9 @@ var DefaultThresholds = Thresholds{
 	WarnDiskFree:        10 << 30,
 }
 
-// Input is the raw material for a report. Every field is optional in
-// the sense that a zero value means "unknown" and scores LevelOK: a
-// metric this build cannot measure must not raise an alarm it cannot
-// substantiate.
+// Input is the raw material for a report. NOTE: a zero value means
+// "unknown" and scores LevelOK -- a metric this build can't measure
+// must not raise an alarm it can't substantiate.
 type Input struct {
 	ToolVersion string
 	// ToolAge is the age derived from yt-dlp's YYYY.MM.DD version;
@@ -105,10 +104,8 @@ func Evaluate(in Input, t Thresholds) Report {
 }
 
 // ParseVersionAge derives how old a yt-dlp release is from its version
-// string, which is always the release date in YYYY.MM.DD form.
-//
-// A suffix such as "2026.08.19.232349" (a nightly) is tolerated by
-// reading only the first three fields.
+// string (release date, YYYY.MM.DD; a nightly suffix like ".232349" is
+// tolerated by reading only the first three fields).
 func ParseVersionAge(version string, now time.Time) (time.Duration, bool) {
 	released, ok := ParseVersionDate(version)
 	if !ok {

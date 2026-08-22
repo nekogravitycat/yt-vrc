@@ -30,8 +30,8 @@ type Config struct {
 	YtdlpPath   string
 	YtdlpMode   string // "managed" | "path"
 
-	// Chunked fetching, the workaround for googlevideo's throttling of
-	// plain sequential GETs (implementation.md §2.1).
+	// NOTE: googlevideo throttles sequential GETs to ~300KB/s; parallel
+	// chunked fetch (infra/fetch) is required, not a perf tweak.
 	FetchWorkers    int
 	FetchChunkBytes int64
 
@@ -53,13 +53,20 @@ type Config struct {
 	EventLogEntries   int
 	MessageSlotsLimit int
 
-	// Availability gate (spec §4.4). GateEnabled false removes the
-	// check entirely; with it on and no source configured the gate is
-	// closed and only /on opens it.
+	// NOTE: fail-closed. GateEnabled=false removes the check; with it on
+	// and no source configured, only /on opens the gate.
 	GateEnabled      bool
 	GateGracePeriod  time.Duration
 	GateOverrideTTL  time.Duration
 	GatePollInterval time.Duration
+
+	// AdminIPs gates /on /off /p /d /u /mode independent of /mode's
+	// access setting -- override/purge power isn't part of "open" mode.
+	// Empty = unrestricted (opt-in, not a breaking default).
+	AdminIPs []string
+	// WhitelistIPs is who ModeWhitelist admits -- kept separate from
+	// AdminIPs so watch access never implies /on, /p, or /mode power.
+	WhitelistIPs []string
 
 	DiscordBotToken     string
 	DiscordUserID       string
@@ -77,20 +84,15 @@ type Config struct {
 	// container sets it to node; a host with deno needs nothing.
 	YtdlpJSRuntimes string
 
-	// Outgoing resolve budget (implementation.md §18). This is the only
-	// limit that protects against the failure mode actually measured on
-	// this project -- YouTube rate-limiting repeated resolution of one
-	// video -- rather than against load.
+	// CRITICAL: outgoing resolve budget -- the only guard against YouTube
+	// rate-limiting repeated resolution of one video (not a load limit).
 	ResolveLimitPerVideo int
 	ResolveLimitGlobal   int
 	ResolveLimitWindow   time.Duration
 
-	// Hot upgrade and health (spec §4.5, §4.6).
-	//
-	// YtdlpAsset is the release file to install; the plain zipapp needs
-	// a python3 alongside it but runs anywhere, whereas the
-	// self-contained yt-dlp_linux build is linked against glibc and
-	// will not start on Alpine.
+	// CRITICAL: YtdlpAsset picks the release file. yt-dlp_linux links
+	// against glibc and won't run on musl/Alpine; the zipapp needs a
+	// python3 alongside it but runs anywhere.
 	YtdlpAsset          string
 	YtdlpAutoUpgrade    bool
 	YtdlpCheckInterval  time.Duration
@@ -104,9 +106,8 @@ type Config struct {
 }
 
 func Load() (*Config, error) {
-	// Credentials come from a gitignored .env on the dev machine and
-	// from the real environment everywhere else; the file never wins
-	// over an explicitly-set variable (see LoadDotEnv).
+	// .env supplements the environment; an explicit env var always wins
+	// (see LoadDotEnv).
 	if err := LoadDotEnv(DotEnvFile); err != nil {
 		return nil, fmt.Errorf("reading %s: %w", DotEnvFile, err)
 	}
@@ -140,6 +141,9 @@ func Load() (*Config, error) {
 		GateOverrideTTL:  envDur("GATE_OVERRIDE_TTL", 4*time.Hour),
 		GatePollInterval: envDur("GATE_POLL_INTERVAL", 30*time.Second),
 
+		AdminIPs:     envList("ADMIN_IPS", nil),
+		WhitelistIPs: envList("WHITELIST_IPS", nil),
+
 		DiscordBotToken:     os.Getenv("DISCORD_BOT_TOKEN"),
 		DiscordUserID:       os.Getenv("DISCORD_USER_ID"),
 		DiscordActivityName: env("DISCORD_ACTIVITY_NAME", "VRChat"),
@@ -147,10 +151,8 @@ func Load() (*Config, error) {
 		YtdlpClients:    envList("YTDLP_CLIENTS", nil),
 		YtdlpJSRuntimes: os.Getenv("YTDLP_JS_RUNTIMES"),
 
-		// Well under the measured trigger of roughly a dozen resolves of
-		// one video in a day (implementation.md §8.2), and far above
-		// what normal use reaches: singleflight already collapses the
-		// several people who paste one link at once into a single call.
+		// 5/day is well under the measured ~12/day trigger, comfortably
+		// above singleflight-collapsed normal use.
 		ResolveLimitPerVideo: envInt("RESOLVE_LIMIT_PER_VIDEO", 5),
 		ResolveLimitGlobal:   envInt("RESOLVE_LIMIT_GLOBAL", 40),
 		ResolveLimitWindow:   envDur("RESOLVE_LIMIT_WINDOW", time.Hour),
@@ -159,9 +161,8 @@ func Load() (*Config, error) {
 		YtdlpAutoUpgrade:   envBool("YTDLP_AUTO_UPGRADE", false),
 		YtdlpCheckInterval: envDur("YTDLP_CHECK_INTERVAL", 24*time.Hour),
 		YtdlpStaleDays:     envInt("YTDLP_STALE_DAYS", 30),
-		// 60s matches spec §4.5.3 step 2. Overrunning it is survivable:
-		// a job already holding the old binary keeps using it, and only
-		// the next resolve sees the swap.
+		// Overrunning is survivable: in-flight jobs keep the old binary;
+		// only the next resolve sees the swap.
 		UpgradeDrainTimeout: envDur("UPGRADE_DRAIN_TIMEOUT", 60*time.Second),
 		UpgradeTimeout:      envDur("UPGRADE_TIMEOUT", 10*time.Minute),
 		HealthProbeInterval: envDur("HEALTH_PROBE_INTERVAL", 6*time.Hour),

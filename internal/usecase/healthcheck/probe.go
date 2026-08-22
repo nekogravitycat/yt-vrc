@@ -14,14 +14,8 @@ import (
 	"github.com/nekogravitycat/yt-vrc/internal/domain/video"
 )
 
-// Probe resolves a known-good video on a schedule so /s shows a real
-// answer rather than a stale one.
-//
-// The service is used in bursts -- only while its author is in VRChat --
-// so without this, the success rate on display could be days old, and
-// the failure mode it exists to catch (YouTube closing the door
-// overnight, spec §3.2) would be invisible until someone tried to watch
-// something.
+// Probe resolves a known-good video on a schedule so /s health data
+// doesn't go stale between bursts of actual use (spec §4.6).
 type Probe struct {
 	Resolver port.Resolver
 	Recorder *health.Recorder
@@ -51,13 +45,11 @@ func (p *Probe) Run(ctx context.Context) {
 	}
 }
 
-// Once probes exactly one video, advancing through the list.
+// Once probes exactly one video per tick, round-robin through the list.
 //
-// One per tick, round-robin, rather than the whole list: YouTube
-// rate-limits repeated resolution of a single video
-// (implementation.md §8.2), and a fixed probe list is precisely the
-// repetition that triggers it. Rotating spreads a six-hourly probe to
-// roughly one resolve per video per day.
+// CRITICAL: resolving the same video repeatedly triggers YouTube's bot
+// check; probing the whole list each tick would reintroduce that. Rotation
+// keeps each video to ~1 resolve/day even at a 6h interval.
 func (p *Probe) Once(ctx context.Context) {
 	if len(p.Videos) == 0 {
 		return
@@ -70,10 +62,8 @@ func (p *Probe) Once(ctx context.Context) {
 	_, err := p.Resolver.Resolve(ctx, id, spec)
 	took := time.Since(start)
 
-	// A probe the limiter declined never reached YouTube, so it is no
-	// evidence either way and must not move the success rate. Skipping
-	// this tick is the right outcome: if the budget is that busy, the
-	// service is being used and /s has fresher data than a probe.
+	// NOTE: a throttled probe never reached YouTube; recording it would
+	// corrupt the success rate with the service's own restraint.
 	if errors.Is(err, video.ErrThrottled) {
 		if p.Log != nil {
 			p.Log.Debug("health probe skipped by the resolve budget", "id", id, "err", err)

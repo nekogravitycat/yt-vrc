@@ -1,7 +1,8 @@
 // Package presenter turns domain results into message views.
 //
-// Display text is English throughout; video titles pass through in
-// their original script.
+// Display text is English throughout; titles pass through in their
+// original script. Message frames hold ~6-7 rows, so Status/Help/
+// CacheList curate which fields show rather than dumping everything.
 package presenter
 
 import (
@@ -55,10 +56,8 @@ func PrepareError(id video.ID, err error) message.View {
 		}
 		v.Footer = "/s to see how many jobs are running"
 	case errors.Is(err, video.ErrThrottled):
-		// Deliberately says who did the refusing. Reading this as
-		// "YouTube blocked us" would send the user hunting a problem
-		// that has not happened -- the point of holding back here is
-		// that it has not happened.
+		// NOTE: states who refused (this service, not YouTube) —
+		// misattributing it sends the user chasing a problem that hasn't happened.
 		v.Title = "Slowing Down"
 		v.Kind = message.KindWarning
 		v.Lines = throttleLines(err)
@@ -73,9 +72,8 @@ func PrepareError(id video.ID, err error) message.View {
 	return v
 }
 
-// ErrorSummary is the one-line classification recorded in the event log,
-// so /e can show what went wrong without re-deriving it from the raw
-// error text.
+// ErrorSummary is the one-line classification recorded in the event log
+// (so /e need not re-derive it from raw error text).
 func ErrorSummary(err error) string {
 	switch {
 	case errors.Is(err, video.ErrBotDetected):
@@ -128,8 +126,7 @@ func Help(version string) message.View {
 		Kind:     message.KindStatus,
 		Title:    "yt-vrc — Help",
 		Subtitle: "Paste a YouTube link, or use a command",
-		// Six lines is what the frame holds, so commands are paired
-		// rather than listed one per line.
+		// Paired two-per-line to fit the row budget.
 		Lines: []string{
 			"/{id}  play · /{id}/720 quality · /{id}.mp4 MP4",
 			"/s status       /l list cache    /e recent events",
@@ -142,9 +139,8 @@ func Help(version string) message.View {
 	}
 }
 
-// StatusData is everything /s reports. It is a struct rather than a
-// parameter list because the frame fits about seven rows and choosing
-// which seven is a presentation decision, not a caller's.
+// StatusData is everything /s could report; Status curates which fields
+// actually show (row budget, see package doc).
 type StatusData struct {
 	Version    string
 	Default    video.OutputSpec
@@ -156,6 +152,7 @@ type StatusData struct {
 	MaxJobs    int
 	Gate       availability.Reason
 	Sources    []availability.SourceStatus
+	Mode       availability.AccessMode
 
 	// Toolchain and health (spec §4.6).
 	YtdlpVersion string
@@ -173,12 +170,9 @@ type StatusData struct {
 	Budget throttle.Usage
 }
 
-// Status summarises the service (spec §4.6).
-//
-// The frame holds about six rows, so this is a ranking exercise rather
-// than a dump: what is shown is what changes, what breaks, and what a
-// user can act on from inside VRChat. Static configuration is not on
-// that list and lives in the subtitle.
+// Status summarises the service (spec §4.6): ranks by what changes, what
+// breaks, and what's actionable from inside VRChat; static config goes
+// in the subtitle instead.
 func Status(d StatusData) message.View {
 	v := message.View{
 		Kind:     message.KindStatus,
@@ -193,10 +187,13 @@ func Status(d StatusData) message.View {
 	if d.Gate.Source != "" {
 		gate += " · " + d.Gate.Source
 	}
-	// The gate leads because it is the one setting that makes every
-	// video endpoint stop working, and the only one a user can change
-	// from inside VRChat.
+	// Leads: the one setting that stops every video endpoint, and the
+	// only one changeable from inside VRChat.
 	v.AddRow("Availability", gate)
+	// Shown only for a non-default mode, which silently overrides the row above.
+	if d.Mode != "" && d.Mode != availability.ModeDefault {
+		v.AddRow("Access mode", string(d.Mode))
+	}
 	for _, src := range d.Sources {
 		state := "offline"
 		switch {
@@ -223,16 +220,12 @@ func Status(d StatusData) message.View {
 	}
 	v.AddRow("Cache", cache)
 	v.AddRow("Jobs", fmt.Sprintf("%d of %d running", d.ActiveJobs, d.MaxJobs))
-	// Disk earns a row only when it is running out. Free space is not
-	// interesting until it is the reason artifacts start truncating,
-	// and the frame has no room for rows that are always fine.
+	// Shown only when low — no room in the frame for rows that are always fine.
 	if d.Report.Disk != health.LevelOK {
 		v.AddRow("Disk free", humanBytes(d.DiskFree)+" (low)")
 	}
-	// Same rule for the resolve budget: silent while there is plenty of
-	// room, a row once it is close enough that a refusal would surprise
-	// someone. Being told "Slowing Down" with no way to see it coming is
-	// the failure this row prevents.
+	// Same rule for the resolve budget: shown only once a refusal is
+	// close enough to surprise — prevents an unexplained "Slowing Down".
 	if line, show := budgetSummary(d.Budget); show {
 		v.AddRow("Lookups", line)
 	}
@@ -254,12 +247,9 @@ func Status(d StatusData) message.View {
 	return v
 }
 
-// budgetSummary reports the outgoing resolve allowance, and whether it
-// is worth a row at all.
-//
-// The threshold is three quarters of either dimension. Below that the
-// number answers a question nobody is asking; above it, the next new
-// video may well be refused, and that is worth seeing before it happens.
+// budgetSummary reports the outgoing resolve allowance and whether it's
+// worth a row: threshold is 3/4 of either dimension, below which the
+// number answers a question nobody is asking.
 func budgetSummary(u throttle.Usage) (string, bool) {
 	if u.Window <= 0 {
 		return "", false
@@ -271,17 +261,14 @@ func budgetSummary(u throttle.Usage) (string, bool) {
 
 	per := humanWindow(u.Window)
 	if near(u.Busiest, u.PerKey) && !near(u.Used, u.Limit) {
-		// Naming the video matters: this budget is escaped by playing
-		// something else, and the user cannot know which one is holding
-		// it without being told.
+		// Names the video: the per-video budget is escaped by playing something else.
 		return fmt.Sprintf("%s at %d of %d %s", u.BusiestKey, u.Busiest, u.PerKey, per), true
 	}
 	return fmt.Sprintf("%d of %d %s", u.Used, u.Limit, per), true
 }
 
-// humanWindow and humanWait render durations the way a person says
-// them. Go's own format produces "10m0s", which is fine in a log and
-// poor on a panel someone is reading from across a room.
+// humanWindow and humanWait render durations the way a person says them
+// (Go's own format, e.g. "10m0s", reads poorly on a status panel).
 func humanWindow(d time.Duration) string {
 	switch {
 	case d == time.Hour:
@@ -298,8 +285,7 @@ func humanWindow(d time.Duration) string {
 func humanWait(d time.Duration) string {
 	switch {
 	case d < time.Minute:
-		// Rounding to the minute here would say "in 0s", which reads as
-		// "now" and invites the retry this is trying to prevent.
+		// Not rounded: "in 0s" reads as "now" and invites a retry.
 		return "in under a minute"
 	case d < time.Hour:
 		return fmt.Sprintf("in %d min", d.Round(time.Minute)/time.Minute)
@@ -341,8 +327,7 @@ func ytdlpSummary(d StatusData) string {
 func resolveSummary(d StatusData) string {
 	rate := d.Resolve.SuccessRate()
 	if rate < 0 {
-		// Distinct from 0%: nothing has been asked of yt-dlp yet, which
-		// is not the same as everything having failed.
+		// Distinct from 0%: no samples yet, not "everything failed".
 		return "no samples yet"
 	}
 	s := fmt.Sprintf("%.0f%% of %d", rate*100, d.Resolve.Samples)
@@ -355,12 +340,9 @@ func resolveSummary(d StatusData) string {
 	return s
 }
 
-// PurgeConfirm hands out the token that authorises a purge.
-//
-// URLs are the only input channel, so a destructive command cannot ask
-// for confirmation interactively. A short-lived token typed back as
-// /p/{token} is the equivalent, and is deliberately awkward enough that
-// it cannot happen by accident (spec §4.1.3).
+// PurgeConfirm issues the confirmation token for a destructive purge
+// (spec §4.1.3): URLs can't prompt interactively, so retyping /p/{token}
+// stands in, deliberately awkward enough not to happen by accident.
 func PurgeConfirm(token string, ttl time.Duration, items int, bytes int64) message.View {
 	v := message.View{
 		Kind:     message.KindWarning,
@@ -434,7 +416,7 @@ func CacheList(items []*video.MediaAsset) message.View {
 		v.Footer = "/h for help"
 		return v
 	}
-	// The frame fits a handful of lines; show the most recent.
+	// Row budget: show the most recent.
 	const maxRows = 7
 	shown := items
 	if len(shown) > maxRows {
@@ -456,9 +438,8 @@ func CacheList(items []*video.MediaAsset) message.View {
 func Preparing(title string, spec video.OutputSpec, p video.Progress) message.View {
 	v := message.View{Kind: message.KindProgress, Title: "Preparing Video", Subtitle: title}
 	v.AddRow("Output", fmt.Sprintf("%dp %s", spec.Quality, strings.ToUpper(string(spec.Container))))
-	// Named explicitly, because once the download completes the byte
-	// counts stop moving and a frozen "234 MB / 234 MB" reads as a
-	// stall rather than as the remux it actually is.
+	// Shown explicitly: once download completes, a frozen byte count
+	// reads as a stall rather than the remux stage it actually is.
 	if p.Stage != "" {
 		v.AddRow("Stage", p.Stage)
 	}
@@ -499,11 +480,9 @@ func humanBytes(n int64) string {
 	return fmt.Sprintf("%d B", n)
 }
 
-// throttleLines explains a refusal this service made about itself.
-//
-// The two scopes need different advice, and getting that wrong wastes
-// the user's time: a per-video budget is fixed by playing something
-// else, while the service-wide one is not.
+// throttleLines explains a self-imposed refusal; per-video and
+// service-wide scopes need different advice (former is fixed by playing
+// something else, latter isn't).
 func throttleLines(err error) []string {
 	var t *video.ThrottledError
 	if !errors.As(err, &t) {
