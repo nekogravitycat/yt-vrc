@@ -70,10 +70,11 @@ func run() error {
 				SegmentSeconds: cfg.HLSSegmentSeconds,
 			},
 		},
-		Store:       assetStore,
-		Log:         log,
-		MaxDuration: cfg.MaxDuration,
-		TempDir:     tmp,
+		Store:          assetStore,
+		Log:            log,
+		MaxDuration:    cfg.MaxDuration,
+		PrepareTimeout: cfg.PrepareTimeout,
+		TempDir:        tmp,
 	}
 
 	messages := &ffmpeg.MessageRenderer{

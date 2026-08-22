@@ -153,6 +153,31 @@ try {
 
     } # end video-dependent checks
 
+    Section "Singleflight de-duplication (spec 4.7.3)"
+    if ($skipVideo) {
+        Write-Host "  skipped (video rate-limited)" -ForegroundColor Yellow
+    } else {
+        # An uncached key is required, or a cache hit would never reach
+        # the resolver and this would pass vacuously. A quality variant
+        # of the video already verified above gives one without needing
+        # a second video that might itself be unavailable.
+        $target = "$VideoId/480"
+        $before = (Select-String -Path $log -Pattern '"msg":"resolved"' -AllMatches).Count
+        $jobs = 1..6 | ForEach-Object {
+            Start-Job -ArgumentList $base, $target {
+                param($b, $v) & curl.exe -sL -o NUL -w "%{http_code}" "$b/$v"
+            }
+        }
+        $codes = $jobs | Wait-Job -Timeout 180 | Receive-Job
+        $jobs | Remove-Job -Force
+        Check "6 concurrent requests all succeed" `
+              (($codes | Where-Object { $_ -eq "200" }).Count -eq 6) "codes: $codes"
+        Start-Sleep -Milliseconds 300
+        $after = (Select-String -Path $log -Pattern '"msg":"resolved"' -AllMatches).Count
+        $ran = $after - $before
+        Check "6 concurrent requests trigger 1 resolve" ($ran -eq 1) "yt-dlp ran $ran times"
+    }
+
     Section "M2 - every endpoint returns playable media"
     $endpoints = @{ "h"="help"; "s"="status"; "l"="list"; "u"="not-implemented";
                     "nonsense"="unrecognised"; "aaaaaaaaaaa"="missing video" }

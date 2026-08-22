@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"github.com/nekogravitycat/yt-vrc/internal/domain/port"
 	"github.com/nekogravitycat/yt-vrc/internal/domain/video"
 )
@@ -21,19 +23,64 @@ type UseCase struct {
 	Store       port.AssetStore
 	Log         *slog.Logger
 	MaxDuration time.Duration
+	// PrepareTimeout bounds shared preparation work, which outlives any
+	// single caller's request context.
+	PrepareTimeout time.Duration
 	// TempDir holds downloaded tracks; they are deleted once remuxed.
 	TempDir string
+
+	// Two layers of de-duplication (spec §4.7.3). This is not merely an
+	// optimisation: YouTube rate-limits repeated resolution of one
+	// video, and a VRChat instance produces exactly that burst when
+	// several people paste the same link within seconds
+	// (docs/implementation.md §8.2).
+	prepareGroup singleflight.Group
+	resolveGroup singleflight.Group
 }
 
 // Prepare returns a ready artifact for id, packaging it if the cache
-// misses. It blocks until the artifact is complete.
-//
-// Concurrent callers currently each do their own work; singleflight
-// de-duplication arrives in M5 (spec §4.7.3).
+// misses. Concurrent callers for the same artifact share one job.
 func (u *UseCase) Prepare(ctx context.Context, id video.ID, spec video.OutputSpec) (*video.MediaAsset, error) {
 	key := spec.CacheKey(id)
 	if a, ok := u.Store.Get(key); ok {
-		u.Log.Info("cache hit", "key", key)
+		u.Log.Debug("cache hit", "key", key)
+		return a, nil
+	}
+
+	// The shared work deliberately does not inherit this caller's
+	// cancellation: a player that gives up must not abort a job other
+	// players are still waiting on. Request values are kept so tracing
+	// and logging still work.
+	ch := u.prepareGroup.DoChan(string(key), func() (any, error) {
+		workCtx := context.WithoutCancel(ctx)
+		if u.PrepareTimeout > 0 {
+			var cancel context.CancelFunc
+			workCtx, cancel = context.WithTimeout(workCtx, u.PrepareTimeout)
+			defer cancel()
+		}
+		return u.prepare(workCtx, id, spec, key)
+	})
+
+	select {
+	case <-ctx.Done():
+		// This caller left; the job continues for whoever remains.
+		return nil, ctx.Err()
+	case res := <-ch:
+		if res.Err != nil {
+			return nil, res.Err
+		}
+		if res.Shared {
+			u.Log.Debug("joined in-flight preparation", "key", key)
+		}
+		return res.Val.(*video.MediaAsset), nil
+	}
+}
+
+// prepare does the actual work for one cache key.
+func (u *UseCase) prepare(ctx context.Context, id video.ID, spec video.OutputSpec, key video.CacheKey) (*video.MediaAsset, error) {
+	// Re-check: a concurrent job for this key may have finished between
+	// the miss above and this call being scheduled.
+	if a, ok := u.Store.Get(key); ok {
 		return a, nil
 	}
 
@@ -43,14 +90,10 @@ func (u *UseCase) Prepare(ctx context.Context, id video.ID, spec video.OutputSpe
 	}
 
 	start := time.Now()
-	res, err := u.Resolver.Resolve(ctx, id, spec)
+	res, err := u.resolve(ctx, id, spec)
 	if err != nil {
 		return nil, err
 	}
-	u.Log.Info("resolved",
-		"id", id, "title", res.Title, "duration", res.Duration,
-		"height", res.Video.Height, "vcodec", res.Video.Codec, "acodec", res.Audio.Codec,
-		"took", time.Since(start))
 
 	// Refusing rather than transcoding is deliberate: -c copy is what
 	// makes packaging cheap enough for this design to work (spec §4.2.2).
@@ -102,6 +145,41 @@ func (u *UseCase) Prepare(ctx context.Context, id video.ID, spec video.OutputSpe
 		"key", key, "size", asset.SizeBytes,
 		"packaging", time.Since(pkgStart), "total", time.Since(start))
 	return asset, nil
+}
+
+// resolve wraps the yt-dlp call in its own de-duplication layer.
+//
+// Spec §4.7.3 keys this on video ID alone, reasoning that every quality
+// of one video shares its metadata. That holds for metadata but not for
+// what Resolve actually returns: the format selector is quality-derived,
+// so the resulting track URLs differ per quality. Keying on ID alone
+// would hand a 720p request the 1080p tracks. The key therefore includes
+// quality, which still collapses the case that matters — many viewers
+// requesting the same video at the default quality.
+func (u *UseCase) resolve(ctx context.Context, id video.ID, spec video.OutputSpec) (*video.Resolution, error) {
+	key := fmt.Sprintf("%s_%d", id, spec.Quality)
+	ch := u.resolveGroup.DoChan(key, func() (any, error) {
+		start := time.Now()
+		res, err := u.Resolver.Resolve(context.WithoutCancel(ctx), id, spec)
+		if err != nil {
+			return nil, err
+		}
+		u.Log.Info("resolved",
+			"id", id, "title", res.Title, "duration", res.Duration,
+			"height", res.Video.Height, "vcodec", res.Video.Codec,
+			"acodec", res.Audio.Codec, "took", time.Since(start))
+		return res, nil
+	})
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case r := <-ch:
+		if r.Err != nil {
+			return nil, r.Err
+		}
+		return r.Val.(*video.Resolution), nil
+	}
 }
 
 // Open serves one file from a prepared artifact.

@@ -301,3 +301,54 @@ playlist 中的 `EXTINF` **全部取自 ffmpeg 實際產出的值**，時間軸�
    憑證。AVPro 對自簽憑證必定失敗（spec §9.2）
 2. **訊息影片在 VR 中的可讀性**——字級與對比是依 spec §4.3.3 推算，未經實地確認
 3. **VRChat 的影片載入逾時上限**（spec §13.1 第 4 項）——決定長影片的可用長度上限
+
+---
+
+## 9. Singleflight 併發去重（提前自 M5）
+
+依 §8.2 的發現提前實作 spec §4.7.3。這不是效能最佳化，而是**防止觸發
+YouTube 每支影片速率限制的必要機制**。
+
+### 9.1 兩層去重
+
+| 層 | 鍵 | 保護對象 |
+|---|---|---|
+| 第一層 | `{cache_key}` | 整個準備工作（下載 + ffmpeg） |
+| 第二層 | `{video_id}_{quality}` | yt-dlp 呼叫 |
+
+### 9.2 與 spec §4.7.3 的差異：解析層的鍵包含畫質
+
+spec 主張解析層應以 `video_id` 為鍵，理由是「同一支影片的不同畫質共用同一份
+metadata」。這對 metadata 成立，但對本實作的 `Resolver.Resolve` **不成立**：
+格式選擇器由畫質推導（`bv*[height<=H]...`），因此回傳的**軌道 URL 隨畫質而異**。
+若僅以 `video_id` 為鍵，720p 的請求會收到 1080p 的軌道。
+
+故解析鍵為 `{video_id}_{quality}`。實務上絕大多數請求使用預設畫質，去重效果
+與 spec 的設想幾乎相同。
+
+若日後要完全達成 spec 的粒度，需改為「一次抽取完整格式清單、在 Go 內做格式
+選擇」，屆時 metadata 才真正可跨畫質共用。
+
+### 9.3 呼叫者取消不影響共用工作
+
+共用工作以 `context.WithoutCancel` 執行，並套用獨立的 `PREPARE_TIMEOUT`。
+理由：先送出請求的播放器若放棄（使用者切換影片、離開世界），不得中斷其他
+仍在等待同一支影片的觀看者。離開的呼叫者收到 `context.Canceled`，工作本身
+繼續進行至完成。
+
+### 9.4 驗證
+
+單元測試（`internal/usecase/playvideo/playvideo_test.go`，含 `-race`）：
+
+| 測試 | 保證 |
+|---|---|
+| `TestConcurrentRequestsResolveOnce` | 8 個併發請求 → 1 次 resolve、1 次 package |
+| `TestDifferentQualitiesAreSeparate` | 不同畫質不被合併，且各自拿到正確高度 |
+| `TestCancelledCallerDoesNotAbortSharedWork` | 呼叫者取消不影響其他等待者 |
+| `TestCacheHitSkipsResolve` | 快取命中完全不碰 resolver |
+| `TestSharedFailureReachesAllCallers` | 失敗傳達給所有加入者 |
+| `TestRetryAfterFailure` | 失敗後該鍵可再次使用，不會被毒化 |
+
+實機驗證（`scripts/verify.ps1`）：6 個併發請求同一支未快取影片 →
+記錄中 `resolved`、`downloaded`、`packaged` 各 1 次。**達成 spec §12 M5 的
+驗收條件**「5 個併發請求同一影片僅觸發一次 yt-dlp」。
