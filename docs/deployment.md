@@ -36,73 +36,63 @@ AVPro（VRChat 的播放器核心）**對 TLS 憑證驗證嚴格，自簽憑證�
 
 ---
 
-## 3. Cloudflare Tunnel（建議先用這個做實測）
+## 3. Cloudflare Tunnel（目前採用）
 
-`cloudflared` 已安裝於開發機（2025.11.1）。
-
-### 3.1 登入（互動式，需你自己執行）
-
-在 Claude Code 中可用 `!` 前綴執行，輸出會留在對話裡：
+**本專案重用既有的 `Dorm Windows` 通道**（`7a045f06-6432-4e7b-82d8-1772c9203b73`），
+不另建通道。該通道以 Windows 服務形式常駐於本機（GravityPC）：
 
 ```
-! cloudflared tunnel login
+"C:\Program Files (x86)\cloudflared\cloudflared.exe" tunnel run --token <token>
 ```
 
-會開啟瀏覽器要你選擇 `gravity.tw` 這個 zone。完成後會產生
-`~/.cloudflared/cert.pem`。
+### 3.1 這是「儀表板管理」的通道
 
-### 3.2 建立通道並綁定網域
+以 `--token` 執行的通道，其 **ingress 規則儲存在 Cloudflare 儀表板，而非本機
+`config.yml`**。在本機寫任何 `config.yml` 都不會生效。因此新增主機名稱必須於
+儀表板操作，無法以 CLI 完成。
+
+### 3.2 已完成的部分（CLI）
+
+`v.gravity.tw` 的 CNAME 已指向 Dorm Windows 通道：
 
 ```powershell
-cloudflared tunnel create yt-vrc
-cloudflared tunnel route dns yt-vrc v.gravity.tw
+cloudflared tunnel route dns --overwrite-dns 7a045f06-6432-4e7b-82d8-1772c9203b73 v.gravity.tw
 ```
 
-第一行會輸出一個 tunnel UUID 並產生 `~/.cloudflared/<UUID>.json`（憑證，
-**勿提交至版本控制**）。第二行自動在 Cloudflare 建立 CNAME 並設為 Proxied。
+### 3.3 待完成的部分（儀表板，需手動）
 
-### 3.3 設定檔
+Cloudflare Dashboard → **Zero Trust** → Networks → Tunnels →
+**Dorm Windows** → Public Hostname → **Add a public hostname**：
 
-建立 `~/.cloudflared/config.yml`：
+| 欄位 | 值 |
+|---|---|
+| Subdomain | `v` |
+| Domain | `gravity.tw` |
+| Type | `HTTP` |
+| URL | `localhost:8080` |
 
-```yaml
-tunnel: yt-vrc
-credentials-file: C:\Users\gravity\.cloudflared\<UUID>.json
+儲存後即時生效，無需重啟服務。
 
-ingress:
-  - hostname: v.gravity.tw
-    service: http://localhost:8080
-    originRequest:
-      # 冷啟動時請求會阻塞至封裝完成；放寬以容納長影片
-      connectTimeout: 30s
-      # 不緩衝回應，維持 HLS 的即時性（spec §9.2）
-      disableChunkedEncoding: false
-  - service: http_status:404
-```
+### 3.4 啟動服務本體
 
-### 3.4 啟動
-
-兩個終端機：
+通道由 Windows 服務常駐，因此只需啟動 yt-vrc：
 
 ```powershell
-# 終端機 1：服務本體
 cd C:\Users\gravity\Documents\Repositories\gravity\yt-vrc
 $env:DATA_DIR = ".\data"
-$env:LOG_LEVEL = "info"
+$env:LISTEN_ADDR = ":8080"
 go run .\cmd\yt-vrc
 ```
 
-```powershell
-# 終端機 2：通道
-cloudflared tunnel run yt-vrc
-```
-
-### 3.5 上線前確認
+### 3.5 確認
 
 ```powershell
-curl.exe -sI https://v.gravity.tw/h            # 應為 302
-curl.exe -sL -o NUL -w "%{http_code}`n" https://v.gravity.tw/h   # 應為 200
+curl.exe -sI https://v.gravity.tw/h
+curl.exe -sL -o NUL -w "%{http_code}`n" https://v.gravity.tw/h
 ```
+
+預期分別為 302 與 200。若回傳 Cloudflare 錯誤 1033 或 404，表示 §3.3 的主機
+名稱尚未加入。
 
 ---
 
