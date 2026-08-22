@@ -14,7 +14,7 @@ services:
       # whole service (spec §7.1).
       - yt-vrc-data:/data
     environment:
-      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-https://v.gravity.tw}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:?set PUBLIC_BASE_URL in .env}
       # Credentials come from the real environment here, never from a
       # .env baked into the image. Compose reads ./.env on the host and
       # substitutes below, so the file stays on the host.
