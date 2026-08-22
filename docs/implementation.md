@@ -400,3 +400,50 @@ playlist 直接於影片網址回傳後，ffmpeg 寫入的相對 segment 名稱
 | segment 路徑 | 已改寫為絕對路徑 |
 
 全套驗收現為 **50 項**。
+
+---
+
+## 11. AVPro 實測的關鍵發現（2026-08-22）
+
+### 11.1 AVPro 在 PC 上就是 Windows Media Foundation
+
+由 User-Agent 記錄確認的請求鏈：
+
+| User-Agent | 身分 | 行為 |
+|---|---|---|
+| `Mozilla/5.0 (Windows NT 10.0...)` | VRChat 的解析器 | 先抓 master playlist 與 media.m3u8 |
+| `NSPlayer/12.x WMFSDK/12.x` | **AVPro = Windows Media Foundation** | 抓 media.m3u8，再依序抓每一個 segment |
+
+**WMF 對每一個 segment 都送 `Range: bytes=0-`。** 因此 §4.2.4 的 Range 支援
+不是選配，是播放的必要條件。
+
+**VRChat 會先用自己的解析器（yt-dlp）處理貼上的網址**，再把結果交給 AVPro。
+因此服務端輸出必須同時讓 yt-dlp 與 WMF 都能正確理解。
+
+### 11.2 「Media cannot be played, maybe due to invalid format」是通用載入失敗訊息
+
+此訊息**不代表格式有問題**。實測過程中，同一批訊息影片時而可播、時而報此錯誤，
+而以 ffmpeg 完整解碼驗證為 225 frames、零錯誤。
+
+真正的原因是**產物在除錯過程中被刪除**（`rm -rf data/messages`），使 VRChat
+已快取的解析結果指向不存在的路徑，回應 404 後 AVPro 即顯示此訊息。
+
+**除錯時務必先確認產物是否存在，不要一看到此訊息就假設是編碼問題。**
+
+### 11.3 內容雜湊網址與用戶端快取的衝突（待修）
+
+訊息影片以內容雜湊為網址（spec §4.3.3）。但 `/s` 的內容含即時快取統計，
+**每次數值變動就產生新的雜湊與新網址**。VRChat 會快取網址解析結果，於是：
+
+- 舊產物仍存在（LRU 保留 200 筆）→ 使用者看到**過期的狀態畫面**
+- 舊產物已被淘汰 → **404**，AVPro 報載入失敗
+
+兩種結果都不正確。可能的解法是讓命令端點的媒體走**穩定路徑**（如
+`/m/status/media.m3u8`）並標記為 `no-store`，內容雜湊僅用於磁碟上的去重。
+
+**此問題尚未修正。**
+
+### 11.4 已確認可在 AVPro 中播放
+
+`/`、`/s`、`/status`、`/h`、`/help` 全部正常播放。訊息影片子系統（M2）
+**於 VRChat 中驗收通過**。

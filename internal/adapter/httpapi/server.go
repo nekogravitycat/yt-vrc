@@ -221,7 +221,16 @@ func (s *Server) logRequest(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		next.ServeHTTP(w, r)
-		s.Log.Debug("request", "method", r.Method, "path", r.URL.Path, "took", time.Since(start))
+		// User-Agent and Range distinguish which component is fetching:
+		// VRChat resolves through yt-dlp before AVPro loads anything, and
+		// the two behave very differently when a stream is rejected.
+		s.Log.Debug("request",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"ua", r.Header.Get("User-Agent"),
+			"range", r.Header.Get("Range"),
+			"proto", r.Proto,
+			"took", time.Since(start))
 	})
 }
 
