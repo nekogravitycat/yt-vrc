@@ -274,3 +274,38 @@ go run .\cmd\yt-vrc
 | 顯示「Service Offline」 | 上線閘門關閉。輸入 `/on`（§3.4）。`/s` 會說明是哪個來源判定的 |
 | 顯示「Server Busy」 | 同時準備的影片達到 `MAX_CONCURRENT_JOBS`（預設 3），稍候再試 |
 | seek 後畫面錯亂 | 記錄下來——這會推翻 implementation.md §3 的設計假設 |
+
+---
+
+## 8. 以容器部署
+
+映像已建置並實跑驗證過（bootstrap 安裝 yt-dlp、解析、播放皆正常）。
+
+```powershell
+# 憑證留在主機的 .env，compose 讀它並代入環境變數；
+# .dockerignore 是白名單，.env 不可能進到 build context。
+docker compose up -d --build
+docker compose logs -f
+```
+
+### 8.1 需要知道的幾件事
+
+- **基底是 Alpine 3.24.1，JS runtime 是 nodejs**。不要退回舊的 Alpine：
+  3.20 的 nodejs（20）與 deno（1.43）**都低於 yt-dlp 的最低版本**，裝了也
+  不會被使用（implementation.md §20.1）
+- **`YTDLP_JS_RUNTIMES=node` 不可省略**。yt-dlp 預設只啟用 deno，其他 runtime
+  即使裝好也回報 unavailable（§20.2）
+- **yt-dlp 不在映像裡**，首次啟動下載到 volume。第一次 `up` 之後要等十幾秒
+  才會開始監聽
+- **映像 261 MB**，未達 spec §5 的 200 MB。差額是 nodejs 的 66 MB，取捨見 §20.4
+- **HEALTHCHECK 打 `/h` 而非影片端點**：閘門關閉是設計行為，拿影片端點做健康
+  檢查會讓 Docker 週期性重啟一個正常的服務
+
+### 8.2 與現行 Cloudflare Tunnel 的關係
+
+通道指向 `localhost:8080`，compose 也發布在 `8080`，所以切換過去只需要先停掉
+Windows 上的 `go run`，再 `docker compose up -d`。**兩者不能同時跑**，連接埠會撞。
+
+資料不共用：目前的 `./data` 在 Windows 檔案系統，容器用的是 named volume
+`yt-vrc-data`。切過去等於全新的快取與 yt-dlp 安裝（會重新下載），而
+**`/on` 的覆寫狀態也不會跟著過去**——沒有 Discord 訊號時記得重新輸入一次。

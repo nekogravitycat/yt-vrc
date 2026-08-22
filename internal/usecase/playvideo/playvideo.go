@@ -3,6 +3,7 @@ package playvideo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -49,6 +50,107 @@ type UseCase struct {
 
 	semOnce sync.Once
 	sem     chan struct{}
+
+	jobsMu sync.RWMutex
+	jobs   map[video.CacheKey]*jobState
+}
+
+// jobState is what /w and the progress view read while a preparation is
+// running. It exists only for the lifetime of the job: once the artifact
+// is in the store, the store is the better answer to every question this
+// could be asked.
+type jobState struct {
+	Title      string
+	Stage      string
+	Done       int64
+	Total      int64
+	StartedAt  time.Time
+	DownloadAt time.Time // when the download stage began, for the estimate
+}
+
+func (u *UseCase) jobBegin(key video.CacheKey) {
+	u.jobsMu.Lock()
+	defer u.jobsMu.Unlock()
+	if u.jobs == nil {
+		u.jobs = map[video.CacheKey]*jobState{}
+	}
+	u.jobs[key] = &jobState{Stage: "resolving", StartedAt: time.Now()}
+}
+
+func (u *UseCase) jobEnd(key video.CacheKey) {
+	u.jobsMu.Lock()
+	defer u.jobsMu.Unlock()
+	delete(u.jobs, key)
+}
+
+func (u *UseCase) jobUpdate(key video.CacheKey, f func(*jobState)) {
+	u.jobsMu.Lock()
+	defer u.jobsMu.Unlock()
+	if j := u.jobs[key]; j != nil {
+		f(j)
+	}
+}
+
+// Progress reports how far a running preparation has got, and whether
+// there is one at all.
+//
+// The estimate is derived from the download alone. It is the only stage
+// whose remaining work is knowable -- resolving is a single opaque call,
+// and the remux that follows it took 0.24s for a five-minute video
+// (implementation.md §2.3), so folding either into a percentage would
+// make the number less honest rather than more complete.
+func (u *UseCase) Progress(key video.CacheKey) (string, video.Progress, bool) {
+	u.jobsMu.RLock()
+	defer u.jobsMu.RUnlock()
+	j := u.jobs[key]
+	if j == nil {
+		return "", video.Progress{}, false
+	}
+
+	p := video.Progress{Stage: j.Stage, Fraction: -1, BytesDone: j.Done, BytesTotal: j.Total}
+	if j.Total > 0 && j.Done > 0 {
+		p.Fraction = float64(j.Done) / float64(j.Total)
+		if elapsed := time.Since(j.DownloadAt); elapsed > time.Second && j.Done < j.Total {
+			rate := float64(j.Done) / elapsed.Seconds()
+			if rate > 0 {
+				p.EstimatedRemain = time.Duration(float64(j.Total-j.Done) / rate * float64(time.Second))
+			}
+		}
+	}
+	return j.Title, p, true
+}
+
+// Warm prepares an artifact without a player waiting on it (spec §4.1.3
+// /w), and is also what /r uses once it has dropped the old one.
+//
+// It waits `grace` for the job to fail before returning, because the
+// failures worth telling someone about immediately -- a video that does
+// not exist, a spent resolve budget, every job slot busy -- all land
+// inside the first couple of seconds, which is roughly one resolve
+// (Phase 0 median 1.6s). Anything still running after that is genuinely
+// downloading, and the caller is told so.
+//
+// report is called with the eventual outcome whether or not anyone is
+// still listening: a warm that fails after the response has gone out is
+// exactly the failure that would otherwise vanish.
+func (u *UseCase) Warm(ctx context.Context, id video.ID, spec video.OutputSpec, grace time.Duration, report func(error)) error {
+	done := make(chan error, 1)
+	go func() {
+		// Detached: /w answers immediately by design, so the job must
+		// not die with the request that asked for it.
+		_, err := u.Prepare(context.WithoutCancel(ctx), id, spec)
+		if report != nil {
+			report(err)
+		}
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(grace):
+		return nil
+	}
 }
 
 // acquire takes a job slot, reporting false when the service is already
@@ -166,11 +268,24 @@ func (u *UseCase) prepare(ctx context.Context, id video.ID, spec video.OutputSpe
 	}
 	defer u.release()
 
+	u.jobBegin(key)
+	defer u.jobEnd(key)
+
 	start := time.Now()
 	res, err := u.resolve(ctx, id, spec)
 	if err != nil {
 		return nil, err
 	}
+	u.jobUpdate(key, func(j *jobState) {
+		j.Title, j.Stage, j.DownloadAt = res.Title, "downloading", time.Now()
+		// Both tracks are downloaded, so the total is both track sizes;
+		// showing only the video track's would stall the bar near the
+		// end while the audio came down.
+		j.Total = res.Video.SizeBytes
+		if !res.Combined() {
+			j.Total += res.Audio.SizeBytes
+		}
+	})
 
 	// Refusing rather than transcoding is deliberate: -c copy is what
 	// makes packaging cheap enough for this design to work (spec §4.2.2).
@@ -191,15 +306,23 @@ func (u *UseCase) prepare(ctx context.Context, id video.ID, spec video.OutputSpe
 	srcAudio := filepath.Join(work, "audio.m4a")
 
 	dlStart := time.Now()
-	if err := u.Fetcher.Fetch(ctx, res.Video, srcVideo, nil); err != nil {
+	// The two tracks report their own byte counts, so the second one
+	// starts from where the first finished rather than from zero.
+	var base int64
+	onProgress := func(done, _ int64) {
+		u.jobUpdate(key, func(j *jobState) { j.Done = base + done })
+	}
+	if err := u.Fetcher.Fetch(ctx, res.Video, srcVideo, onProgress); err != nil {
 		return nil, fmt.Errorf("downloading video track: %w", err)
 	}
 	if !res.Combined() {
-		if err := u.Fetcher.Fetch(ctx, res.Audio, srcAudio, nil); err != nil {
+		base = res.Video.SizeBytes
+		if err := u.Fetcher.Fetch(ctx, res.Audio, srcAudio, onProgress); err != nil {
 			return nil, fmt.Errorf("downloading audio track: %w", err)
 		}
 	}
 	u.Log.Info("downloaded", "id", id, "took", time.Since(dlStart))
+	u.jobUpdate(key, func(j *jobState) { j.Stage = "packaging" })
 
 	dir, err := u.Store.Dir(key)
 	if err != nil {
@@ -238,7 +361,12 @@ func (u *UseCase) resolve(ctx context.Context, id video.ID, spec video.OutputSpe
 	ch := u.resolveGroup.DoChan(key, func() (any, error) {
 		start := time.Now()
 		res, err := u.Resolver.Resolve(context.WithoutCancel(ctx), id, spec)
-		if u.Health != nil {
+		// A resolve we declined to make is not evidence about whether
+		// resolving works: it never reached YouTube. Recording it would
+		// let the service's own restraint drive the success rate on /s
+		// down to critical, which is the opposite of what that number
+		// is for (spec §4.6).
+		if u.Health != nil && !errors.Is(err, video.ErrThrottled) {
 			u.Health.RecordResolve(err == nil, time.Since(start), false)
 		}
 		if err != nil {

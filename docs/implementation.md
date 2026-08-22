@@ -852,3 +852,222 @@ fallback 鏈也不會啟動。該條件已刪除。
 Bot 端設定：只需在 Developer Portal 開 **Presence Intent**；guild 權限**一個
 都不需要**（presence 來自 Gateway intent，不是 permission），邀請連結的
 `permissions=0` 即可。Bot 必須與被監測使用者同在一個 guild。
+
+---
+
+## 18. 對外解析額度（rate limit，2026-08-22）
+
+### 18.1 為什麼需要
+
+在此之前，對 YouTube 的節流只有兩個**間接**的機制：singleflight 把同一支影片
+的併發請求收成一次，`MAX_CONCURRENT_JOBS` 限制同時準備的產物數。兩者都只涵蓋
+「同一瞬間」，**沒有任何東西限制一段時間內總共打了幾次 yt-dlp**。
+
+而 §8.2 實測的觸發條件正是跨時間的：「同一支影片當日約十餘次解析」。最容易
+達成它的路徑是使用者反覆輸入同一個網址——快取被淘汰、用 `/r` 強制重解析、
+或最常見的：**那支影片解析失敗，於是他一直重試**。
+
+### 18.2 設計
+
+`internal/domain/throttle` 的滑動視窗計數器，兩個維度：
+
+| 變數 | 預設 | 說明 |
+|---|---|---|
+| `RESOLVE_LIMIT_PER_VIDEO` | `5` | 單一影片在視窗內的解析次數 |
+| `RESOLVE_LIMIT_GLOBAL` | `40` | 全服務在視窗內的解析次數 |
+| `RESOLVE_LIMIT_WINDOW` | `1h` | 視窗長度 |
+
+以 `throttle.Resolver` 這個 `port.Resolver` 裝飾器套用，於 `main` 組裝。
+放裝飾器而不是塞進 `ytdlp.Resolver`：額度是「這個部署與 YouTube 的整體關係」
+這種政策，而 `ytdlp.Resolver` 的職責只是跑一個指令並讀它的輸出。副作用是
+播放路徑與健康探測**共用同一份額度**，而兩者都不需要知道對方存在。
+
+**鍵是影片 ID，不含畫質。** 與 §9.2 的 singleflight 鍵刻意不同：畫質是我們
+自己的事，從 YouTube 的角度，問 720p 和問 1080p 是同一支影片被問了兩次。
+
+### 18.3 三個容易寫錯的決定
+
+**（a）失敗的解析一樣扣額度。** `Allow` 在知道結果之前就扣款。只算成功等於
+讓「一直重試一支解析不了的影片」這個情境完全不受限——而那正是實測觸發條件
+描述的形狀。
+
+**（b）被自己擋下的解析不計入健康度視窗。** 它根本沒碰到 YouTube，對「解析
+還能不能用」沒有證據價值。若計入，服務的自我克制會把 `/s` 的成功率一路壓成
+紅色，而那個數字存在的目的恰好相反（spec §4.6）。`playvideo` 與
+`healthcheck.Probe` 兩處都有這個守衛。
+
+**（c）煙霧測試只扣款、不會被拒絕。** 升級的煙霧測試要判斷候選 yt-dlp 能不能
+用，擋下它只會讓升級失敗、保護不到任何東西。但它的請求確實會送到 YouTube：
+四輪升級／回滾就是同樣三支影片被解析十二次，正是問題的形狀。因此
+`SmokeTester.Charge` 記帳但不設限。
+
+### 18.4 超額時的行為
+
+**立即拒絕，不排隊**——與 `MAX_CONCURRENT_JOBS` 一致（§14.1）。回一支橘色
+「Slowing Down」訊息影片，並依照是哪一個維度用完而給不同建議：
+
+- 每影片：「這支影片剛查過太多次，`in N min` 再試；已快取的照常播，**其他
+  影片不受影響**」——因為換一支影片確實就解決了
+- 全域：「服務的查詢額度用完了，快取的照常播，新影片 `in N min` 恢復」
+
+標題刻意**不**寫成「Blocked by YouTube」。把自我節流說成被封鎖，會讓使用者
+去追一個還沒發生的問題——而「還沒發生」正是這整個機制的目的。
+
+### 18.5 `/s` 只在快用完時才顯示
+
+沿用 §16.7 對磁碟可用空間的同一條規則：任一維度用掉四分之三以上才佔一列。
+在那之下這個數字回答的是沒有人在問的問題；在那之上，下一支新影片就可能被
+拒絕，而「被告知 Slowing Down 卻完全沒有預兆」正是這一列要避免的。
+
+每影片維度接近上限時會**指名是哪一支影片**佔著額度——這個維度換一支影片就
+能繞過，但使用者無從得知是哪一支。
+
+### 18.6 沒有做的：懲罰箱
+
+曾考慮在某支影片真的收到 `ErrBotDetected` 後把它關進冷卻期。**未採用**：
+一次誤判就會把一支本來能播的影片鎖住半小時。退而求其次的保護來自 §18.3(a)
+——被擋的解析同樣扣額度，所以一支持續失敗的影片會在幾次之後自然被本地拒絕，
+不必額外的懲罰狀態。
+
+---
+
+## 19. M6：MP4 路徑與預熱（2026-08-22）
+
+### 19.1 spec §4.2.3 的前提已經不成立
+
+spec 為 MP4 設計了一整套「冷啟動進度互動」，理由是「MP4 必須完整下載並封裝
+完成後才能交付，HLS 只需等第一個 segment」。
+
+**§3 的架構修訂之後，這個對比消失了。** 兩條路徑現在都是完整封裝後才交付，
+所以 MP4 的冷啟動與 HLS **一樣快**（同樣的下載 + 同樣的 `-c copy`）。因此
+影片端點對 MP4 **不做**特殊的進度處理，維持與 HLS 一致的阻塞行為——那個行為
+已經在 VRChat 內驗收過。
+
+進度互動仍然實作，但用在它真正有價值的地方：`/w`。
+
+### 19.2 MP4 packager
+
+`internal/infra/ffmpeg/packager_mp4.go`。與 HLS 版本的兩個差異都是必要的：
+
+- **不加 `-bsf:a aac_adtstoasc`**。那個 filter 是為了 MPEG-TS 補 ADTS header
+  （§6.2 第 3 點），來源與目的都是 MP4 時套用它反而會把能播的音軌變成靜音
+- **`-movflags +faststart`**，把 moov atom 搬到檔首。沒有它，播放器必須讀到
+  檔尾才能開始，在 HTTP 上等於先下載整支影片
+
+實測（`NJ1tne9u8YM`，4:56）：h264 1920×1080 + aac stereo、51.2 MB、
+duration 295.96 s、`moov` 在 offset 0x24（早於 `mdat`）、Range 回 206。
+
+### 19.3 `/w` 與 `/r`
+
+兩者共用一個 handler，因為它們只差一步：**要不要先把已快取的丟掉**。
+
+**`/w/{id}`（預熱）**
+- 已快取 → 綠色「Ready To Play」，附標題、大小、長度
+- 未快取 → 背景啟動，**先等 `warmGrace`（4 秒）看它會不會失敗**
+
+那 4 秒是刻意的：值得立刻告知的失敗——影片不存在、解析額度用完、工作槽滿——
+都落在頭兩秒內（Phase 0 的 resolve 中位數 1.6 s）。撐過去的就是真的在下載，
+於是回傳進度畫面。這比「一律回排入佇列」誠實：貼錯網址的人當場就知道。
+
+**`/r/{id}`（強制重建）**
+- 丟掉該影片的**所有**變體，不只請求的那一個。`/r` 是「這個產物壞了」的按鈕，
+  會去按它的人沒有理由知道 720p 在快取裡是另一筆
+- 丟棄數量寫入事件記錄
+- 之後與 `/w` 相同
+
+**進度來源**：`playvideo` 為進行中的工作維護一份狀態（stage、bytes、標題），
+在工作結束時刪除——產物一旦進了 store，store 就是所有問題更好的答案。
+
+估算**只根據下載階段**。那是唯一「剩餘工作量可知」的階段：resolve 是一次不透
+明的呼叫，而其後的 remux 對五分鐘影片只花 0.24 秒（§2.3）。把任一者折進百分比
+只會讓數字更不誠實，而不是更完整。
+
+進度畫面顯式列出 **Stage**：下載完成後位元組數就不再變動，一個凍結的
+「234 MB / 234 MB」看起來像卡住，而不像它實際上正在做的 remux。
+
+### 19.4 `/h` 重排
+
+`/w` 與 `/r` 進入速查表後，命令列從 5 行增為 6 行（畫面上限）。
+
+---
+
+## 20. 容器映像（2026-08-22）
+
+### 20.1 基底改用 Alpine 3.24.1，JS runtime 改用 node
+
+handoff §8 要求映像包含「新版 deno」。實作時發現這件事比想像中麻煩，而且
+spec §9.1 與 §5 都需要修正。
+
+**yt-dlp 對 JS runtime 有最低版本要求**（`yt_dlp/utils/_jsruntime.py`）：
+
+| runtime | 最低版本 | Alpine 3.20 | Alpine 3.24.1 |
+|---|---|---|---|
+| deno | 2.3.0 | 1.43.5 ✗ | 2.7.4 ✓ |
+| node | 22.0.0 | 20.15.1 ✗ | 24.18.1 ✓ |
+| bun | 1.2.11 | 未打包 | 未打包 |
+| quickjs | 2023.12.9 | 0.2024… ✗ | — |
+
+**Alpine 3.20 的每一個候選都低於門檻。** 照 handoff 的字面裝 deno，會付出
+82 MB 換一個 yt-dlp 標記為 unsupported、永遠不會呼叫的執行檔。這也解釋了
+§2.1 的舊觀察：開發機的 deno 2.2.3 之所以被拒，就是差在 2.3.0 這條線。
+
+3.24.1 上兩個都可用，選 **node**：
+
+- **體積**：node 加 66 MB，deno 加 120 MB
+- **餘裕**：node 24.18 高於門檻兩個大版本；3.22 的 deno 2.3.1 只比門檻高一個
+  patch，yt-dlp 一動門檻就斷
+
+### 20.2 `--js-runtimes node` 不是選配
+
+裝了 node 還不夠。**yt-dlp 預設只啟用 deno**，其餘一律回報 unavailable：
+
+```
+[debug] JS runtimes: none
+[debug] [youtube] [jsc] JS Challenge Providers: bun (unavailable),
+        deno (unavailable), node (unavailable), quickjs (unavailable)
+WARNING: No supported JavaScript runtime could be found. Only deno is
+         enabled by default; to use another runtime add --js-runtimes …
+```
+
+因此新增設定 `YTDLP_JS_RUNTIMES`（預設空，即沿用 yt-dlp 的預設），由
+`ytdlp.Resolver` 與 `SmokeTester` 傳給 `--js-runtimes`，映像中設為 `node`。
+加上之後：`[debug] JS runtimes: node-24.18.1`，警告消失。
+
+**少了這個環境變數，映像就是白背 66 MB。**
+
+### 20.3 `.dockerignore` 用白名單
+
+黑名單 fail-open：下一個掉進 repo 的憑證或狀態檔預設會進 build context，而
+context 裡的東西離映像只差一行 `COPY . .`。白名單 fail-closed——漏列的後果是
+編譯失敗，不是洩漏。
+
+實測 context 內容確認只有 `go.mod`、`go.sum`、`cmd/`、`internal/`、
+`assets/fonts/OFL.txt`；`.env`、`data/`、`docs/`、`.git/` 全部不在其中。
+
+`OFL.txt` 對編譯不必要（嵌入用的字型副本在 `internal/infra/render/`），但二進位
+檔帶著 Noto Sans TC，散布映像即散布字型，SIL OFL 要求授權隨附，因此它被
+`COPY` 進 `/usr/local/share/licenses/`。
+
+### 20.4 映像大小：261 MB（**未達成 spec §5 的 < 200 MB**）
+
+| 組成 | 大小 |
+|---|---|
+| alpine + ffmpeg + ca-certificates + tzdata + python3 | 181 MB |
+| nodejs | +66 MB |
+| yt-vrc 二進位（含 5.4 MB 嵌入字型） | +14.5 MB |
+
+**未達標，且是刻意的。** spec §5 的 200 MB 寫在「JS runtime 是選配」的假設下。
+真要達標只能拿掉 node（196 MB），代價是部分格式無法取得且走上 yt-dlp 已標記
+為 deprecated 的路徑。
+
+yt-dlp 本身**不在**映像裡（spec §9.1），首次啟動時安裝到 volume。
+
+### 20.5 其他決定
+
+- **HEALTHCHECK 打 `/h` 而不是影片端點**。上線閘門會在沒人玩的時候關閉影片
+  端點——那是設計，不是故障。用影片端點做健康檢查，等於讓 Docker 週期性重啟
+  一個完全正常的服務。`/h` 不受閘門限制，且走同一條 handler 鏈
+- **compose 檔案設 `cpus` 與 `mem_limit`**。remux 短而吃滿 CPU，三個併發工作
+  在沒有上限時會把整台機器佔滿——部署目標是共用的實驗室機器（spec §3.1）
+- **憑證只走真實環境變數**。compose 從主機的 `.env` 代入，檔案不進映像；
+  `.dockerignore` 的白名單也保證了這一點

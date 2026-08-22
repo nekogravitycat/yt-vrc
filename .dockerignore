@@ -1,0 +1,15 @@
+# Deny everything, then name what the build needs.
+#
+# A denylist fails open: the next credential or state file dropped into
+# this repo lands in the build context by default, and anything in the
+# context is one `COPY . .` away from the image. This fails closed --
+# forgetting an entry breaks the build instead of leaking a file.
+*
+
+!go.mod
+!go.sum
+!cmd/
+!internal/
+# Not needed to compile -- the embedded copy lives under internal/ --
+# but the binary carries the font, so the image should carry its licence.
+!assets/fonts/OFL.txt

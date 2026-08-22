@@ -21,6 +21,7 @@ import (
 	"github.com/nekogravitycat/yt-vrc/internal/domain/event"
 	"github.com/nekogravitycat/yt-vrc/internal/domain/health"
 	"github.com/nekogravitycat/yt-vrc/internal/domain/port"
+	"github.com/nekogravitycat/yt-vrc/internal/domain/throttle"
 	"github.com/nekogravitycat/yt-vrc/internal/domain/video"
 	"github.com/nekogravitycat/yt-vrc/internal/infra/config"
 	"github.com/nekogravitycat/yt-vrc/internal/infra/fetch"
@@ -89,18 +90,30 @@ func run() error {
 	recorder := &health.Recorder{Persist: healthStore.Save}
 	recorder.Restore(healthStore.Load())
 
+	// One budget shared by every path that reaches YouTube: viewers,
+	// the scheduled probe, and the upgrade smoke test. Splitting it per
+	// caller would let the total drift past what YouTube is actually
+	// counting, which is requests from this address.
+	budget := &throttle.Limiter{
+		PerKey: cfg.ResolveLimitPerVideo,
+		Global: cfg.ResolveLimitGlobal,
+		Window: cfg.ResolveLimitWindow,
+	}
+
 	resolver := &ytdlp.Resolver{
 		// Locate, not a fixed path: a hot upgrade moves a marker on
 		// disk and the next resolve must pick it up (spec §4.5.2).
-		Locate:  toolchain.BinaryPath,
-		Proxy:   os.Getenv("RESOLVER_PROXY"),
-		Timeout: cfg.ResolveTimeout,
-		Clients: cfg.YtdlpClients,
-		Log:     log,
+		Locate:     toolchain.BinaryPath,
+		Proxy:      os.Getenv("RESOLVER_PROXY"),
+		Timeout:    cfg.ResolveTimeout,
+		Clients:    cfg.YtdlpClients,
+		JSRuntimes: cfg.YtdlpJSRuntimes,
+		Log:        log,
 	}
+	throttled := &throttle.Resolver{Next: resolver, Limiter: budget}
 
 	play := &playvideo.UseCase{
-		Resolver: resolver,
+		Resolver: throttled,
 		Fetcher:  fetch.New(cfg.FetchWorkers, cfg.FetchChunkBytes),
 		Packagers: map[video.Container]port.Packager{
 			video.ContainerHLS: &ffmpeg.HLSPackager{
@@ -108,6 +121,7 @@ func run() error {
 				FFprobePath:    cfg.FFprobePath,
 				SegmentSeconds: cfg.HLSSegmentSeconds,
 			},
+			video.ContainerMP4: &ffmpeg.MP4Packager{FFmpegPath: cfg.FFmpegPath},
 		},
 		Store:          assetStore,
 		Log:            log,
@@ -122,12 +136,19 @@ func run() error {
 	upgrader := &upgrade.UseCase{
 		Tool: toolchain,
 		Verifier: &ytdlp.SmokeTester{
-			Videos:  probeVideos,
-			Quality: cfg.DefaultQuality,
-			Timeout: cfg.ResolveTimeout,
-			Proxy:   os.Getenv("RESOLVER_PROXY"),
-			Clients: cfg.YtdlpClients,
-			Log:     log,
+			Videos:     probeVideos,
+			Quality:    cfg.DefaultQuality,
+			Timeout:    cfg.ResolveTimeout,
+			Proxy:      os.Getenv("RESOLVER_PROXY"),
+			Clients:    cfg.YtdlpClients,
+			JSRuntimes: cfg.YtdlpJSRuntimes,
+			Log:        log,
+			// Charged but never refused. A smoke test decides whether a
+			// candidate yt-dlp works at all, so blocking it would stop
+			// the upgrade rather than protect anything -- but its
+			// requests do reach YouTube, and four upgrade cycles is a
+			// dozen lookups of the same three videos.
+			Charge: budget.Charge,
 		},
 		Drain:         play.Drain,
 		DrainTimeout:  cfg.UpgradeDrainTimeout,
@@ -139,7 +160,7 @@ func run() error {
 	}
 
 	probe := &healthcheck.Probe{
-		Resolver: resolver,
+		Resolver: throttled,
 		Recorder: recorder,
 		Videos:   probeVideos,
 		Quality:  cfg.DefaultQuality,
@@ -180,6 +201,7 @@ func run() error {
 		Events:          events,
 		OverrideTTL:     cfg.GateOverrideTTL,
 		CacheLimitBytes: cfg.CacheMaxBytes,
+		Budget:          budget,
 		Upgrade:         upgrader,
 		Toolchain:       toolchain,
 		Health:          recorder,

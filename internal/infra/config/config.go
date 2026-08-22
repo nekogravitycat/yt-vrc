@@ -73,6 +73,17 @@ type Config struct {
 	// YtdlpClients is the ordered fallback chain of YouTube player
 	// clients (spec §3.2). Empty means yt-dlp's own default only.
 	YtdlpClients []string
+	// YtdlpJSRuntimes is passed to yt-dlp as --js-runtimes. The
+	// container sets it to node; a host with deno needs nothing.
+	YtdlpJSRuntimes string
+
+	// Outgoing resolve budget (implementation.md §18). This is the only
+	// limit that protects against the failure mode actually measured on
+	// this project -- YouTube rate-limiting repeated resolution of one
+	// video -- rather than against load.
+	ResolveLimitPerVideo int
+	ResolveLimitGlobal   int
+	ResolveLimitWindow   time.Duration
 
 	// Hot upgrade and health (spec §4.5, §4.6).
 	//
@@ -133,7 +144,16 @@ func Load() (*Config, error) {
 		DiscordUserID:       os.Getenv("DISCORD_USER_ID"),
 		DiscordActivityName: env("DISCORD_ACTIVITY_NAME", "VRChat"),
 
-		YtdlpClients: envList("YTDLP_CLIENTS", nil),
+		YtdlpClients:    envList("YTDLP_CLIENTS", nil),
+		YtdlpJSRuntimes: os.Getenv("YTDLP_JS_RUNTIMES"),
+
+		// Well under the measured trigger of roughly a dozen resolves of
+		// one video in a day (implementation.md §8.2), and far above
+		// what normal use reaches: singleflight already collapses the
+		// several people who paste one link at once into a single call.
+		ResolveLimitPerVideo: envInt("RESOLVE_LIMIT_PER_VIDEO", 5),
+		ResolveLimitGlobal:   envInt("RESOLVE_LIMIT_GLOBAL", 40),
+		ResolveLimitWindow:   envDur("RESOLVE_LIMIT_WINDOW", time.Hour),
 
 		YtdlpAsset:         os.Getenv("YTDLP_ASSET"),
 		YtdlpAutoUpgrade:   envBool("YTDLP_AUTO_UPGRADE", false),

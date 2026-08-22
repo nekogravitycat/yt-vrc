@@ -18,6 +18,7 @@ import (
 	"github.com/nekogravitycat/yt-vrc/internal/domain/health"
 	"github.com/nekogravitycat/yt-vrc/internal/domain/message"
 	"github.com/nekogravitycat/yt-vrc/internal/domain/port"
+	"github.com/nekogravitycat/yt-vrc/internal/domain/throttle"
 	"github.com/nekogravitycat/yt-vrc/internal/domain/video"
 	"github.com/nekogravitycat/yt-vrc/internal/infra/ffmpeg"
 	"github.com/nekogravitycat/yt-vrc/internal/usecase/playvideo"
@@ -53,6 +54,9 @@ type Server struct {
 	// CacheLimitBytes is reported by /s; enforcement lives in the store.
 	CacheLimitBytes int64
 
+	// Budget is the outgoing resolve allowance, read by /s so a refusal
+	// can be seen coming rather than only met. Optional.
+	Budget *throttle.Limiter
 	// Upgrade drives /u and puts the service into maintenance while a
 	// version swap is in flight. Nil leaves /u reporting unavailable.
 	Upgrade *upgrade.UseCase
@@ -306,6 +310,8 @@ func statusFor(err error) int {
 		return http.StatusBadRequest
 	case errorIs(err, video.ErrTooBusy):
 		return http.StatusServiceUnavailable
+	case errorIs(err, video.ErrThrottled):
+		return http.StatusTooManyRequests
 	case errorIs(err, context.DeadlineExceeded):
 		return http.StatusGatewayTimeout
 	default:

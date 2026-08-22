@@ -4,6 +4,7 @@ package healthcheck
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -68,6 +69,17 @@ func (p *Probe) Once(ctx context.Context) {
 	start := time.Now()
 	_, err := p.Resolver.Resolve(ctx, id, spec)
 	took := time.Since(start)
+
+	// A probe the limiter declined never reached YouTube, so it is no
+	// evidence either way and must not move the success rate. Skipping
+	// this tick is the right outcome: if the budget is that busy, the
+	// service is being used and /s has fresher data than a probe.
+	if errors.Is(err, video.ErrThrottled) {
+		if p.Log != nil {
+			p.Log.Debug("health probe skipped by the resolve budget", "id", id, "err", err)
+		}
+		return
+	}
 
 	if p.Recorder != nil {
 		p.Recorder.RecordResolve(err == nil, took, true)

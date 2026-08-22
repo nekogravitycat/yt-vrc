@@ -14,6 +14,7 @@ import (
 	"github.com/nekogravitycat/yt-vrc/internal/domain/availability"
 	"github.com/nekogravitycat/yt-vrc/internal/domain/health"
 	"github.com/nekogravitycat/yt-vrc/internal/domain/message"
+	"github.com/nekogravitycat/yt-vrc/internal/domain/throttle"
 	"github.com/nekogravitycat/yt-vrc/internal/domain/video"
 )
 
@@ -53,6 +54,15 @@ func PrepareError(id video.ID, err error) message.View {
 			"Try the same link again in a minute.",
 		}
 		v.Footer = "/s to see how many jobs are running"
+	case errors.Is(err, video.ErrThrottled):
+		// Deliberately says who did the refusing. Reading this as
+		// "YouTube blocked us" would send the user hunting a problem
+		// that has not happened -- the point of holding back here is
+		// that it has not happened.
+		v.Title = "Slowing Down"
+		v.Kind = message.KindWarning
+		v.Lines = throttleLines(err)
+		v.Footer = "/s to see the resolve budget"
 	case errors.Is(err, context.DeadlineExceeded):
 		v.Title = "Timed Out"
 		v.Lines = []string{"Preparing this video took too long.", "Try again in a moment."}
@@ -82,6 +92,8 @@ func ErrorSummary(err error) string {
 		return "bad link"
 	case errors.Is(err, video.ErrTooBusy):
 		return "server busy"
+	case errors.Is(err, video.ErrThrottled):
+		return "held back by the resolve budget"
 	case errors.Is(err, video.ErrPackageFailed):
 		return "packaging failed"
 	case errors.Is(err, context.DeadlineExceeded):
@@ -123,7 +135,8 @@ func Help(version string) message.View {
 			"/s status       /l list cache    /e recent events",
 			"/h this help    /u update yt-dlp /u/back undo it",
 			"/on force online                 /off automatic",
-			"/i/{id} info    /d/{id} drop     /p purge cache",
+			"/w/{id} prepare /r/{id} redo it  /i/{id} info",
+			"/d/{id} drop    /p purge cache",
 		},
 		Footer: "v" + version + " · a full youtube.com or youtu.be URL also works",
 	}
@@ -155,6 +168,9 @@ type StatusData struct {
 	Resolve      health.Stats
 	DiskFree     int64
 	Report       health.Report
+
+	// Budget is the outgoing resolve allowance (implementation.md §18).
+	Budget throttle.Usage
 }
 
 // Status summarises the service (spec §4.6).
@@ -213,6 +229,13 @@ func Status(d StatusData) message.View {
 	if d.Report.Disk != health.LevelOK {
 		v.AddRow("Disk free", humanBytes(d.DiskFree)+" (low)")
 	}
+	// Same rule for the resolve budget: silent while there is plenty of
+	// room, a row once it is close enough that a refusal would surprise
+	// someone. Being told "Slowing Down" with no way to see it coming is
+	// the failure this row prevents.
+	if line, show := budgetSummary(d.Budget); show {
+		v.AddRow("Lookups", line)
+	}
 
 	// The header colour is the only part of this frame readable across
 	// a room, so it tracks the worst metric rather than just the gate.
@@ -229,6 +252,65 @@ func Status(d StatusData) message.View {
 		v.Footer = "an upgrade is running · /u for progress"
 	}
 	return v
+}
+
+// budgetSummary reports the outgoing resolve allowance, and whether it
+// is worth a row at all.
+//
+// The threshold is three quarters of either dimension. Below that the
+// number answers a question nobody is asking; above it, the next new
+// video may well be refused, and that is worth seeing before it happens.
+func budgetSummary(u throttle.Usage) (string, bool) {
+	if u.Window <= 0 {
+		return "", false
+	}
+	near := func(used, limit int) bool { return limit > 0 && used*4 >= limit*3 }
+	if !near(u.Used, u.Limit) && !near(u.Busiest, u.PerKey) {
+		return "", false
+	}
+
+	per := humanWindow(u.Window)
+	if near(u.Busiest, u.PerKey) && !near(u.Used, u.Limit) {
+		// Naming the video matters: this budget is escaped by playing
+		// something else, and the user cannot know which one is holding
+		// it without being told.
+		return fmt.Sprintf("%s at %d of %d %s", u.BusiestKey, u.Busiest, u.PerKey, per), true
+	}
+	return fmt.Sprintf("%d of %d %s", u.Used, u.Limit, per), true
+}
+
+// humanWindow and humanWait render durations the way a person says
+// them. Go's own format produces "10m0s", which is fine in a log and
+// poor on a panel someone is reading from across a room.
+func humanWindow(d time.Duration) string {
+	switch {
+	case d == time.Hour:
+		return "per hour"
+	case d%time.Hour == 0:
+		return fmt.Sprintf("per %dh", d/time.Hour)
+	case d%time.Minute == 0:
+		return fmt.Sprintf("per %dm", d/time.Minute)
+	default:
+		return "per " + d.Round(time.Second).String()
+	}
+}
+
+func humanWait(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		// Rounding to the minute here would say "in 0s", which reads as
+		// "now" and invites the retry this is trying to prevent.
+		return "in under a minute"
+	case d < time.Hour:
+		return fmt.Sprintf("in %d min", d.Round(time.Minute)/time.Minute)
+	default:
+		h := d.Round(time.Minute) / time.Hour
+		m := (d.Round(time.Minute) % time.Hour) / time.Minute
+		if m == 0 {
+			return fmt.Sprintf("in %dh", h)
+		}
+		return fmt.Sprintf("in %dh %dm", h, m)
+	}
 }
 
 func ytdlpSummary(d StatusData) string {
@@ -374,6 +456,12 @@ func CacheList(items []*video.MediaAsset) message.View {
 func Preparing(title string, spec video.OutputSpec, p video.Progress) message.View {
 	v := message.View{Kind: message.KindProgress, Title: "Preparing Video", Subtitle: title}
 	v.AddRow("Output", fmt.Sprintf("%dp %s", spec.Quality, strings.ToUpper(string(spec.Container))))
+	// Named explicitly, because once the download completes the byte
+	// counts stop moving and a frozen "234 MB / 234 MB" reads as a
+	// stall rather than as the remux it actually is.
+	if p.Stage != "" {
+		v.AddRow("Stage", p.Stage)
+	}
 	if p.BytesTotal > 0 {
 		v.AddRow("Downloaded", fmt.Sprintf("%s / %s", humanBytes(p.BytesDone), humanBytes(p.BytesTotal)))
 	}
@@ -409,4 +497,42 @@ func humanBytes(n int64) string {
 		return fmt.Sprintf("%.1f KB", float64(n)/(1<<10))
 	}
 	return fmt.Sprintf("%d B", n)
+}
+
+// throttleLines explains a refusal this service made about itself.
+//
+// The two scopes need different advice, and getting that wrong wastes
+// the user's time: a per-video budget is fixed by playing something
+// else, while the service-wide one is not.
+func throttleLines(err error) []string {
+	var t *video.ThrottledError
+	if !errors.As(err, &t) {
+		return []string{"Holding back requests to YouTube for a moment."}
+	}
+	wait := "shortly"
+	if t.RetryAfter > 0 {
+		wait = humanWait(t.RetryAfter)
+	}
+	if t.Scope == "video" {
+		return []string{
+			"This video has been looked up several times recently.",
+			"Asking again now is what gets us blocked, so try " + wait + ".",
+			"Anything already cached still plays, and other videos are fine.",
+		}
+	}
+	return []string{
+		"The service has made its allowance of YouTube lookups.",
+		"Cached videos still play; new ones resume " + wait + ".",
+	}
+}
+
+// AlreadyWarm reports that /w had nothing to do, which is the answer a
+// viewer actually wants: the video will start instantly.
+func AlreadyWarm(a *video.MediaAsset) message.View {
+	v := message.View{Kind: message.KindSuccess, Title: "Ready To Play", Subtitle: a.Title}
+	v.AddRow("Output", fmt.Sprintf("%dp %s", a.Height, strings.ToUpper(string(a.Spec.Container))))
+	v.AddRow("Size", humanBytes(a.SizeBytes))
+	v.AddRow("Length", a.Duration.Round(time.Second).String())
+	v.Footer = "paste the video link to play it"
+	return v
 }

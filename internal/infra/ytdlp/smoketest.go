@@ -17,23 +17,34 @@ import (
 // signature routine -- leaves the binary running perfectly and returning
 // no playable format. Only a real resolve distinguishes them.
 type SmokeTester struct {
-	Videos  []video.ID
-	Quality video.QualityCap
-	Timeout time.Duration
-	Proxy   string
-	Clients []string
-	Log     *slog.Logger
+	Videos     []video.ID
+	Quality    video.QualityCap
+	Timeout    time.Duration
+	Proxy      string
+	Clients    []string
+	JSRuntimes string
+	Log        *slog.Logger
+	// Charge, when set, records each probe against the service's
+	// outgoing resolve budget. Deliberately not the budget's Allow: a
+	// smoke test that could be refused would turn a busy evening into a
+	// blocked upgrade, but these requests still reach YouTube and the
+	// count would be wrong without them.
+	Charge func(videoID string)
 }
 
 func (s *SmokeTester) Verify(ctx context.Context, binPath string) []port.SmokeTestResult {
 	out := make([]port.SmokeTestResult, 0, len(s.Videos))
 	for _, id := range s.Videos {
+		if s.Charge != nil {
+			s.Charge(id.String())
+		}
 		r := &Resolver{
-			BinPath: binPath,
-			Proxy:   s.Proxy,
-			Timeout: s.Timeout,
-			Clients: s.Clients,
-			Log:     s.Log,
+			BinPath:    binPath,
+			Proxy:      s.Proxy,
+			Timeout:    s.Timeout,
+			Clients:    s.Clients,
+			JSRuntimes: s.JSRuntimes,
+			Log:        s.Log,
 		}
 		start := time.Now()
 		spec := video.OutputSpec{Container: video.ContainerHLS, Quality: s.Quality}

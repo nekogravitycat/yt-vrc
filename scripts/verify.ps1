@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  M1 through M5 acceptance checks for yt-vrc.
+  M1 through M6 acceptance checks for yt-vrc.
 .DESCRIPTION
   Starts the server on a scratch data directory, exercises every
   endpoint, and verifies the produced media with ffprobe.
@@ -64,6 +64,13 @@ $env:LOG_LEVEL  = "info"
 # with a source -- rather than switching it off (spec 4.4).
 $env:FAKE_SIGNAL_ONLINE = "true"
 $env:GATE_ENABLED = "true"
+# This script deliberately resolves one video many times -- every URL
+# form, three quality caps, an mp4, a refresh -- which is precisely the
+# shape the outgoing budget exists to stop. Raised here rather than
+# disabled, so the limiter is still in the request path; the budget's
+# own behaviour is tested on a separate instance further down.
+$env:RESOLVE_LIMIT_PER_VIDEO = "30"
+$env:RESOLVE_LIMIT_GLOBAL = "100"
 Remove-Item (Join-Path $env:DATA_DIR "state\override.json") -ErrorAction SilentlyContinue
 $log = Join-Path $dataDir "server.log"
 $proc = Start-Process -FilePath $exe -RedirectStandardOutput $log `
@@ -283,6 +290,57 @@ try {
         $env:FAKE_SIGNAL_ONLINE = "true"
     }
 
+    Section "M6 - MP4 output (spec 4.2.1)"
+    if (-not $skipVideo) {
+        $mp4 = "$base/$VideoId.mp4"
+        $hdr = & curl.exe -s -o NUL -D - $mp4
+        Check "mp4 answers 200, not a redirect" ($hdr -match "200 OK") "$hdr"
+        Check "mp4 declares video/mp4" ($hdr -match "(?i)Content-Type: video/mp4") "$hdr"
+        $p = & ffprobe -v error -show_entries format=duration,format_name `
+             -show_entries stream=codec_name,height,channels -of default=nw=1 $mp4 2>&1
+        Check "mp4 video codec is h264" ($p -match "codec_name=h264") "$p"
+        Check "mp4 audio survives the remux" (($p -match "codec_name=aac") -and ($p -match "channels=2")) "$p"
+        Check "mp4 height is 1080" ($p -match "height=1080") "$p"
+
+        # Without faststart the moov atom lands after the media data and
+        # a player has to fetch the whole file before it can start.
+        $probe = Join-Path $dataDir "faststart.mp4"
+        & curl.exe -s -r 0-65535 -o $probe $mp4
+        $head = [System.IO.File]::ReadAllBytes($probe)
+        $text = [System.Text.Encoding]::ASCII.GetString($head)
+        $moov = $text.IndexOf("moov"); $mdat = $text.IndexOf("mdat")
+        Check "moov atom precedes mdat (faststart)" (($moov -ge 0) -and (($mdat -lt 0) -or ($moov -lt $mdat))) "moov=$moov mdat=$mdat"
+
+        $hdr = & curl.exe -s -r 0-1023 -o NUL -D - $mp4
+        Check "mp4 supports Range" (($hdr -match "206") -and ($hdr -match "Content-Range: bytes 0-1023/")) "$hdr"
+    }
+
+    Section "M6 - warm and refresh (spec 4.1.3)"
+    if (-not $skipVideo) {
+        # Already prepared above, so /w has nothing to do -- which is the
+        # answer that matters to a viewer about to paste the link.
+        $dbg = & curl.exe -s "$base/w/$VideoId`?debug=1"
+        Check "/w on a cached video reports it is ready" ($dbg -match "Ready To Play") "$dbg"
+        $dbg = & curl.exe -s "$base/warm/$VideoId`?debug=1"
+        Check "the long form works too" ($dbg -match "Ready To Play") "$dbg"
+        # Nine characters, so it fails the 11-character ID rule before
+        # anything reaches YouTube. "notavideoid" would not do: it is
+        # exactly 11 and therefore a perfectly valid ID that happens not
+        # to exist, which costs a real lookup to discover.
+        $dbg = & curl.exe -s "$base/w/not-an-id`?debug=1"
+        Check "/w rejects a malformed id without a lookup" ($dbg -match "Unrecognised") "$dbg"
+
+        # /r drops every variant of the video, not just the requested
+        # one: a viewer reaching for it has no reason to know 720p is a
+        # separate cache entry.
+        $dbg = & curl.exe -s "$base/r/$VideoId`?debug=1"
+        Check "/r rebuilds the artifact" ($dbg -match "Ready To Play|Preparing Video") "$dbg"
+        $dbg = & curl.exe -s "$base/e?debug=1"
+        Check "/r records what it dropped" ($dbg -match "refresh dropped \d+ cached variant") "$dbg"
+    }
+    $dbg = & curl.exe -s "$base/h?debug=1"
+    Check "help lists /w and /r" (($dbg -match "/w/\{id\}") -and ($dbg -match "/r/\{id\}")) "$dbg"
+
     Section "M5 - cache management endpoints (spec 4.1.3)"
     if (-not $skipVideo) {
         $dbg = & curl.exe -s "$base/i/$VideoId`?debug=1"
@@ -385,6 +443,55 @@ try {
         $env:DATA_DIR = Join-Path $dataDir "data"
         $env:LISTEN_ADDR = ":$Port"
         Remove-Item Env:YTDLP_MODE -ErrorAction SilentlyContinue
+    }
+
+    Section "Outgoing resolve budget (implementation.md 18)"
+    # Its own instance with a tiny budget, so the numbers can be reached
+    # in a couple of requests without spending the main run's allowance.
+    # Non-existent IDs keep this to failed resolves: no downloads, and
+    # the point under test is precisely that a *failed* lookup is
+    # charged, because that is the one a person retries by hand.
+    $thPort = $Port + 3
+    $thData = Join-Path $dataDir "throttle"
+    Remove-Item -Recurse -Force $thData -ErrorAction SilentlyContinue
+    $env:DATA_DIR = $thData
+    $env:LISTEN_ADDR = ":$thPort"
+    $env:RESOLVE_LIMIT_PER_VIDEO = "1"
+    $env:RESOLVE_LIMIT_GLOBAL = "2"
+    $env:RESOLVE_LIMIT_WINDOW = "30m"
+    $thLog = Join-Path $dataDir "throttle.log"
+    $thProc = Start-Process -FilePath $exe -RedirectStandardOutput $thLog `
+              -RedirectStandardError (Join-Path $dataDir "throttle.err") `
+              -WorkingDirectory $dataDir -PassThru -WindowStyle Hidden
+    Start-Sleep -Seconds 2
+    $tbase = "http://localhost:$thPort"
+    try {
+        $dbg = & curl.exe -s "$tbase/aaaaaaaaaaa`?debug=1"
+        Check "the first lookup reaches YouTube" ($dbg -match "Video Unavailable") "$dbg"
+        $dbg = & curl.exe -s "$tbase/aaaaaaaaaaa`?debug=1"
+        Check "a repeat of the same video is held back" ($dbg -match "Slowing Down") "$dbg"
+        Check "the refusal names this video, not the service" ($dbg -match "other videos are fine") "$dbg"
+        # A held-back lookup never reached YouTube, so it is no evidence
+        # about whether resolving works. Letting it count would let the
+        # service's own restraint drive /s to critical.
+        $dbg = & curl.exe -s "$tbase/s?debug=1"
+        Check "held-back lookups stay out of the success rate" ($dbg -match "(?m)^\s+Resolves\s+0% of 1\b") "$dbg"
+        Check "status shows the budget once it is nearly spent" ($dbg -match "(?m)^\s+Lookups\s+aaaaaaaaaaa at 1 of 1 per 30m") "$dbg"
+
+        # A different video: the per-video budget must not touch it, but
+        # the global one now runs out.
+        $dbg = & curl.exe -s "$tbase/bbbbbbbbbbb`?debug=1"
+        Check "another video is unaffected by the first one's budget" ($dbg -match "Video Unavailable") "$dbg"
+        $dbg = & curl.exe -s "$tbase/ccccccccccc`?debug=1"
+        Check "the service-wide budget refuses a third video" ($dbg -match "Slowing Down") "$dbg"
+        Check "that refusal names the service, not the video" ($dbg -match "allowance of YouTube lookups") "$dbg"
+    } finally {
+        if ($thProc -and -not $thProc.HasExited) { Stop-Process -Id $thProc.Id -Force }
+        $env:DATA_DIR = Join-Path $dataDir "data"
+        $env:LISTEN_ADDR = ":$Port"
+        foreach ($v in @("RESOLVE_LIMIT_PER_VIDEO","RESOLVE_LIMIT_GLOBAL","RESOLVE_LIMIT_WINDOW")) {
+            Remove-Item "Env:$v" -ErrorAction SilentlyContinue
+        }
     }
 
     Section "M2 - mp4 variant and debug view"

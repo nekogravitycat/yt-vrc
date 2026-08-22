@@ -58,10 +58,94 @@ func (s *Server) serveCommand(w http.ResponseWriter, r *http.Request, route Rout
 	case "upgrade":
 		s.upgrade(w, r, route, spec)
 
+	case "warm":
+		s.warm(w, r, route, spec, false)
+
+	case "refresh":
+		s.warm(w, r, route, spec, true)
+
 	default:
 		// Defined in spec §4.1.3 but scheduled for a later milestone.
 		s.deliver(w, r, route.Command, presenter.NotImplemented(route.Command), spec, http.StatusNotImplemented)
 	}
+}
+
+// warmGrace is how long /w waits to see whether the job fails before
+// answering. Long enough to cover one resolve (Phase 0 median 1.6s), so
+// a bad link is reported as a bad link rather than as "preparing".
+const warmGrace = 4 * time.Second
+
+// warm serves /w (prepare ahead of playback) and /r (do it again from
+// scratch). They are one handler because they differ in exactly one
+// step: whether what is already cached is thrown away first.
+func (s *Server) warm(w http.ResponseWriter, r *http.Request, route Route, spec video.OutputSpec, refresh bool) {
+	cmd := "warm"
+	if refresh {
+		cmd = "refresh"
+	}
+	id, err := videoIDArg(route.Args)
+	if err != nil {
+		s.deliver(w, r, cmd, presenter.Unrecognised(), spec, http.StatusBadRequest)
+		return
+	}
+	slot := cmd + "-" + id.String()
+	key := spec.CacheKey(id)
+
+	if refresh {
+		// Every variant, not just the requested one. /r is the "this
+		// artifact is wrong" button, and a viewer who reaches for it has
+		// no reason to know that 720p is a separate cache entry from the
+		// 1080p they were watching.
+		var dropped int
+		for _, a := range s.Play.Store.List(0) {
+			if a.VideoID == id {
+				if err := s.Play.Store.Drop(a.Key); err == nil {
+					dropped++
+				}
+			}
+		}
+		if dropped > 0 {
+			s.record(event.Event{Kind: event.KindCache, VideoID: id.String(),
+				Summary: fmt.Sprintf("refresh dropped %d cached variant(s)", dropped)})
+		}
+	} else if asset, ok := s.Play.Store.Get(key); ok {
+		s.deliver(w, r, slot, presenter.AlreadyWarm(asset), spec, http.StatusOK)
+		return
+	}
+
+	// Already running: report on it rather than asking for it again.
+	// singleflight would collapse the duplicate anyway, but answering
+	// from the live job says something useful instead of waiting out
+	// the grace period to say nothing.
+	if title, p, ok := s.Play.Progress(key); ok {
+		s.deliver(w, r, slot, presenter.Preparing(title, spec, p), spec, http.StatusAccepted)
+		return
+	}
+
+	err = s.Play.Warm(r.Context(), id, spec, warmGrace, func(err error) {
+		if err == nil {
+			s.Log.Info("warmed", "id", id, "key", key, "cmd", cmd)
+			return
+		}
+		// The response has almost certainly gone out by now, so the
+		// event log is the only place this failure can surface.
+		s.Log.Error("warm failed", "id", id, "key", key, "cmd", cmd, "err", err)
+		s.record(event.Event{Kind: event.KindError, VideoID: id.String(),
+			Summary: presenter.ErrorSummary(err), Detail: err.Error()})
+	})
+	if err != nil {
+		s.record(event.Event{Kind: event.KindError, VideoID: id.String(),
+			Summary: presenter.ErrorSummary(err), Detail: err.Error()})
+		s.deliver(w, r, slot, presenter.PrepareError(id, err), spec, statusFor(err))
+		return
+	}
+
+	if asset, ok := s.Play.Store.Get(key); ok {
+		s.deliver(w, r, slot, presenter.AlreadyWarm(asset), spec, http.StatusOK)
+		return
+	}
+	title, p, _ := s.Play.Progress(key)
+	s.deliver(w, r, slot, presenter.Preparing(title, spec, p), spec, http.StatusAccepted)
 }
 
 func (s *Server) statusView(r *http.Request) presenter.StatusData {
@@ -80,6 +164,9 @@ func (s *Server) statusView(r *http.Request) presenter.StatusData {
 		ActiveJobs: s.Play.ActiveJobs(),
 		MaxJobs:    s.Play.MaxJobs,
 		Managed:    true,
+	}
+	if s.Budget != nil {
+		d.Budget = s.Budget.Usage()
 	}
 	if s.Gate != nil {
 		_, d.Gate = s.Gate.IsOpen(r.Context())

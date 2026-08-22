@@ -1,0 +1,35 @@
+services:
+  yt-vrc:
+    build:
+      context: .
+      args:
+        VERSION: ${VERSION:-docker}
+    image: yt-vrc:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      # One volume holds the yt-dlp install, the media cache, the
+      # message renders and the persisted state. Copying it moves the
+      # whole service (spec §7.1).
+      - yt-vrc-data:/data
+    environment:
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-https://v.gravity.tw}
+      # Credentials come from the real environment here, never from a
+      # .env baked into the image. Compose reads ./.env on the host and
+      # substitutes below, so the file stays on the host.
+      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:?set DISCORD_BOT_TOKEN in .env}
+      DISCORD_USER_ID: ${DISCORD_USER_ID:?set DISCORD_USER_ID in .env}
+    # The remux is short and CPU-bound; without a cap three concurrent
+    # jobs can take the whole machine, which on a shared lab box is how
+    # you get noticed.
+    cpus: "2.0"
+    mem_limit: 512m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  yt-vrc-data:

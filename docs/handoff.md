@@ -1,6 +1,6 @@
 # 專案現況與交接
 
-**更新於**：2026-08-22（M4 驗證完成、M3 Discord 實測通過）
+**更新於**：2026-08-22（M1–M6 全數完成，容器化完成）
 **用途**：讓新的工作階段快速上手。閱讀順序建議為本文件 → `implementation.md` → `spec.md`。
 
 ---
@@ -25,7 +25,10 @@
 | M3 上線閘門 | **完成，Discord 訊號實測通過** | 真實憑證下驗過，含初始 presence 快照（implementation.md §17.7）。VRChat 內的訊息影片仍待確認 |
 | M4 熱更新與健康度 | **完成，驗收條件達成** | 真實升級與回滾均已實跑，不重啟生效（implementation.md §17） |
 | M5 韌性與快取 | **完成**（滑動視窗刻意廢除） | singleflight、`MAX_CONCURRENT_JOBS`、LRU、client fallback、`/l` `/e` `/p` `/d` `/i` 全數完成；廢除理由見 implementation.md §14.2 |
-| M6 MP4 與預熱 | 未開始 | 訊息影片已支援 MP4，但影片本體的 MP4 packager 未做 |
+| M6 MP4 與預熱 | **完成** | MP4 packager（faststart 實測通過）、`/w`、`/r`；spec §4.2.3 的 MP4 進度互動不需要，理由見 implementation.md §19.1 |
+
+另已完成 spec 之外的兩項：**對外解析額度**（implementation.md §18）與
+**容器映像**（§20）。
 
 另已修正 implementation.md §11.3 的訊息影片網址問題（穩定 slot 路徑，見 §13）。
 
@@ -33,7 +36,17 @@
 `internal/domain/availability`、`internal/domain/health`、`internal/infra/config`、
 `internal/infra/store`、`internal/infra/ytdlp`、`internal/usecase/playvideo`、
 `internal/usecase/upgrade`、`internal/usecase/healthcheck`，`-race` 下全過。
-`scripts/verify.ps1` 共 84 項，全過。
+`scripts/verify.ps1` 共 105 項，全過。
+
+### 2.0a 對外解析額度（新增，implementation.md §18）
+
+在此之前沒有任何東西限制「一段時間內總共打了幾次 yt-dlp」——singleflight 與
+`MAX_CONCURRENT_JOBS` 都只涵蓋同一瞬間。而 §3.3 實測的觸發條件是跨時間的。
+
+`RESOLVE_LIMIT_PER_VIDEO`（預設 5）、`RESOLVE_LIMIT_GLOBAL`（預設 40）、
+`RESOLVE_LIMIT_WINDOW`（預設 1h）。三個容易寫錯的點都已處理：**失敗的解析
+一樣扣額度**（被擋的影片正是使用者最會反覆重試的）、**被自己擋下的解析不計入
+健康度**（否則自我克制會把 `/s` 打成紅色）、**煙霧測試只扣款不被拒絕**。
 
 ### 2.1 M4 驗證期間修掉的三個 bug
 
@@ -188,16 +201,16 @@ HiNet IP 完成。
 
 ## 8. 建議的下一步
 
-依序：
+程式碼上的里程碑已全數完成。剩下的都需要人或現場環境：
 
 1. **VRChat 內實測閘門與新端點** —— `/on`、`/off`、`/e`、`/p`、`/i`、`/d`、
-   `/u` 的訊息影片都只在瀏覽器驗證過。需要作者戴上頭盔，無法自動化
-2. **Dockerfile** —— 需含 `python3`（yt-dlp zipapp 的執行環境）與新版 deno
-   （解 `n` 參數挑戰用；分塊下載已不依賴它，但缺少會使部分格式無法取得），
-   並設 `YTDLP_MODE=managed`。**不要用 `yt-dlp_linux`**：它連結 glibc，
-   在 Alpine（musl）上起不來。注意 `.env` 不進映像——憑證走真實環境變數
-3. **M6 MP4 路徑與預熱** —— `/w`、`/r`，以及影片本體的 MP4 packager
-4. **實驗室網路的解析成功率**（§7.3）—— spec §3.1 列為部署前的必要驗收條件
+   `/u`、`/w`、`/r` 的訊息影片都只在瀏覽器驗證過。需要作者戴上頭盔
+2. **MP4 路徑在 Unity VideoPlayer 世界中的實測** —— spec §12 M6 的驗收條件。
+   產物本身已驗（h264 + aac、faststart、Range 206），但沒有在使用
+   Unity VideoPlayer 的世界裡播過
+3. **實驗室網路的解析成功率**（§7.3）—— spec §3.1 列為部署前的必要驗收條件
+4. **實際以容器部署** —— 映像已建置並實跑過（bootstrap、解析、播放皆正常），
+   但目前對外服務仍是 Windows 上的 `go run`。切換時記得 `.env` 留在主機
 
 ---
 
@@ -212,6 +225,7 @@ internal/
     message/                    View 與內容雜湊
     event/                      /e 與 /s 讀的事件型別
     health/                     滾動解析視窗與 spec §4.6 的門檻評分
+    throttle/                   對外解析額度 ★ spec 中沒有，見 §2.0a
     port/                       Resolver / MediaFetcher / Packager / AssetStore
                                 / ToolchainManager / ToolchainVerifier
   usecase/
@@ -226,7 +240,7 @@ internal/
                                 原子切換、煙霧測試、非受管模式
     diskfree/                   磁碟可用空間（Windows／Unix 兩份實作）
     fetch/                      並行分塊下載器 ★ spec 中沒有，但為必要
-    ffmpeg/                     HLS packager、訊息影片 renderer
+    ffmpeg/                     HLS packager、MP4 packager、訊息影片 renderer
     render/                     PNG 版面（嵌入 Noto Sans TC）
     signal/                     Discord Presence ★（未實測）、開發用 fake
     state/                      覆寫與事件記錄的持久化

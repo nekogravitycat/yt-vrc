@@ -37,7 +37,15 @@ type Resolver struct {
 	// (implementation.md §8.2), so retrying an unavailable or
 	// age-restricted video would trade a clear error for a block.
 	Clients []string
-	Log     *slog.Logger
+	// JSRuntimes names the JavaScript runtimes yt-dlp may use for
+	// YouTube's `n` parameter challenge, as --js-runtimes takes them.
+	//
+	// It has to be said out loud because yt-dlp enables deno and nothing
+	// else by default: a perfectly good node on PATH is reported as
+	// "unavailable" until it is named. Empty leaves yt-dlp's default
+	// alone, which is right for a host that has deno or has neither.
+	JSRuntimes string
+	Log        *slog.Logger
 }
 
 // DefaultClients is the fallback chain used when none is configured.
@@ -140,6 +148,9 @@ func (r *Resolver) resolveWith(ctx context.Context, id video.ID, spec video.Outp
 	}
 	if r.Proxy != "" {
 		args = append(args, "--proxy", r.Proxy)
+	}
+	if r.JSRuntimes != "" {
+		args = append(args, "--js-runtimes", r.JSRuntimes)
 	}
 	if client != "" && client != "default" {
 		args = append(args, "--extractor-args", "youtube:player_client="+client)
