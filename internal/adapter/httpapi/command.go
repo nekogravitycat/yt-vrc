@@ -16,18 +16,20 @@ import (
 	"github.com/nekogravitycat/yt-vrc/internal/usecase/upgrade"
 )
 
-// adminCommands mutate state, spend resources, or change who is served.
-// NOTE: checked against AdminIPs independent of the current /mode — a
-// friend allowed to watch in whitelist mode must not thereby gain
-// purge/mode power.
+// adminCommands mutate state, spend resources, change who is served, or
+// expose internal details (cache contents, error text, per-video status).
+// NOTE: checked independent of /mode — a friend allowed to watch in
+// whitelist mode must not thereby gain purge/mode/info power.
 var adminCommands = map[string]bool{
 	"enable": true, "disable": true, "purge": true,
 	"drop": true, "upgrade": true, "mode": true,
+	"list": true, "errors": true, "info": true,
 }
 
-// serveCommand handles the management endpoints. None consult the
-// availability gate (CRITICAL, see Server.serveVideo) — /s and /on must
-// stay reachable to diagnose and fix a wrongly closed gate.
+// serveCommand handles the management endpoints. Most skip the
+// availability gate (CRITICAL, see Server.serveVideo) so /s and /on stay
+// reachable to fix a wrongly closed gate; warm/refresh are the exception
+// — see Server.warm.
 func (s *Server) serveCommand(w http.ResponseWriter, r *http.Request, route Route) {
 	spec := route.Spec
 
@@ -105,6 +107,19 @@ func (s *Server) warm(w http.ResponseWriter, r *http.Request, route Route, spec 
 		s.deliver(w, r, cmd, presenter.Unrecognised(), spec, http.StatusBadRequest)
 		return
 	}
+
+	// CRITICAL: warm/refresh spend a real yt-dlp resolve against the
+	// outgoing budget, same as serveVideo — without this check, anyone
+	// who knows the domain could call /w on distinct IDs while the gate
+	// is closed and drain the global budget with nobody watching.
+	if s.Gate != nil {
+		if open, reason := s.Gate.Allow(r.Context(), clientIP(r)); !open {
+			s.Log.Info("gate closed", "id", id, "cmd", cmd, "source", reason.Source)
+			s.deliver(w, r, "gate", presenter.GateClosed(reason), spec, http.StatusServiceUnavailable)
+			return
+		}
+	}
+
 	slot := cmd + "-" + id.String()
 	key := spec.CacheKey(id)
 

@@ -192,8 +192,11 @@ func (g *Gate) CurrentMode() AccessMode {
 // SetMode switches the access mode (spec-adjacent /mode command).
 func (g *Gate) SetMode(m AccessMode) {
 	g.mu.Lock()
+	defer g.mu.Unlock()
 	g.mode = m
-	g.mu.Unlock()
+	// NOTE: persist while still holding the lock, so two concurrent
+	// writers (SetMode, applyOverride) can't land out of order and
+	// silently restore stale state after a restart.
 	if g.ModeStore != nil {
 		g.ModeStore.Save(m)
 	}
@@ -253,13 +256,13 @@ func (g *Gate) applyOverride(o Override) {
 		g.since = g.now()
 		reason.Since = g.since
 	}
-	store := g.Overrides
+	// NOTE: persist while locked — same ordering guarantee as SetMode.
+	if g.Overrides != nil {
+		g.Overrides.Save(o)
+	}
 	hook := g.OnTransition
 	g.mu.Unlock()
 
-	if store != nil {
-		store.Save(o)
-	}
 	if before != after && hook != nil {
 		hook(reason)
 	}

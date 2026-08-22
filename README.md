@@ -49,8 +49,8 @@ are themselves playable videos — there is no other interface.
 | `/h` | `/help` | Endpoint cheat sheet |
 | `/l` | `/list` | Recent cache contents |
 | `/e` | `/errors` | Recent error log |
-| `/w/{id}` | `/warm/{id}` | Start preparing a video without waiting for it |
-| `/r/{id}` | `/refresh/{id}` | Drop every cached variant of a video and re-prepare it |
+| `/w/{id}` | `/warm/{id}` | Start preparing a video without waiting for it — subject to the availability gate, same as playback |
+| `/r/{id}` | `/refresh/{id}` | Drop every cached variant of a video and re-prepare it — subject to the availability gate, same as playback |
 | `/i/{id}` | `/info/{id}` | What's known about a cached video: title, length, formats, size |
 | `/on` | `/enable` | Force the availability gate open (default 4h, `GATE_OVERRIDE_TTL`) |
 | `/off` | `/disable` | Release the manual override, return to automatic detection |
@@ -67,10 +67,15 @@ response video is delivered as; otherwise it follows `DEFAULT_CONTAINER`.
 Two independent mechanisms, neither on by default:
 
 **`ADMIN_IPS`** — comma-separated client addresses allowed to run
-`/on /off /p /d /u /mode`. These commands mutate state, spend resources,
-or change who the service serves, so they're checked against this list
-regardless of whichever mode `/mode` currently has playback under. Empty
-(the default) means unrestricted.
+`/on /off /p /d /u /mode /l /e /i`. These commands mutate state, spend
+resources, change who the service serves, or expose internal details
+(cache contents, error text, per-video status), so they're checked
+against this list regardless of whichever mode `/mode` currently has
+playback under. Empty (the default) means unrestricted.
+
+`/w` and `/r` are not on this list — they stay open to anyone the
+availability gate would already let watch a video, since they do the
+same underlying resolve work as playback (see Availability gate below).
 
 **`/mode`** — selects the policy that governs who can *play video*,
 switchable at runtime and persisted across restarts:
@@ -98,9 +103,10 @@ and `DISCORD_USER_ID` must be set to enable it (Presence Intent, no guild
 permissions needed). With no signal configured, the gate stays closed and
 `/on` is the only way to open it. Going offline is debounced by
 `GATE_GRACE_PERIOD` (default 10 minutes) so a brief Discord reconnect or
-game restart doesn't cut off active viewers. Command endpoints are always
+game restart doesn't cut off active viewers. Command endpoints are
 reachable regardless of gate state, so the service can diagnose and
-reopen itself.
+reopen itself — except `/w` and `/r`, which do real resolve work and so
+follow the same gate as playback.
 
 ## Configuration
 
@@ -116,7 +122,7 @@ file — see `.env.example`). Common settings:
 | `FETCH_WORKERS` | `8` | Parallelism for chunked downloads |
 | `FFMPEG_PATH` / `YTDLP_PATH` | `ffmpeg` / `yt-dlp` | External tool locations |
 | `GATE_ENABLED` | `true` | `false` removes the availability check entirely |
-| `ADMIN_IPS` | empty | Restricts `/on /off /p /d /u /mode` — see Access control |
+| `ADMIN_IPS` | empty | Restricts `/on /off /p /d /u /mode /l /e /i` — see Access control |
 | `WHITELIST_IPS` | empty | Who `/mode/whitelist` admits |
 
 For the complete list, see `CLAUDE.md`.

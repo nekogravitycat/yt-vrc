@@ -109,8 +109,13 @@ source (local process detection, a heartbeat endpoint) means a new
 - **The availability gate is fail-closed.** `GATE_ENABLED` defaults true;
   with it on and zero configured signal sources, the gate stays closed and
   only `/on` opens it — an unconfigured detector is not evidence anyone is
-  playing. Command endpoints (including `/on`) are always exempt from the
-  gate so the service can diagnose and reopen itself.
+  playing. Command endpoints (including `/on`) are exempt from the gate
+  so the service can diagnose and reopen itself, **except `/w` and `/r`**:
+  they do the identical underlying work as `serveVideo` (`Play.Prepare`
+  via `Play.Warm`), spending a real slot in the outgoing resolve budget,
+  so they check `Gate.Allow` themselves — otherwise anyone who knows the
+  domain could call `/w` on distinct video IDs while the gate is closed
+  and exhaust the global resolve budget with nobody watching.
 - **The manual override (`/on`/`/off`) and the `/mode` selection both
   persist to `DATA_DIR/state/*.json`.** Without persistence, a restart
   silently drops back to the fail-closed default and the only way to
@@ -140,9 +145,11 @@ See `README.md` for the full end-user command reference (all commands
 double as their long form, e.g. `/s` = `/status`). The two admin-only
 additions worth knowing while developing:
 
-- `ADMIN_IPS` gates `/on /off /p /d /u /mode` independent of whatever
-  `/mode` currently has video playback under — a friend allowed to watch
-  in whitelist mode must not thereby gain purge/upgrade/mode-switch power.
+- `ADMIN_IPS` gates `/on /off /p /d /u /mode /l /e /i` independent of
+  whatever `/mode` currently has video playback under — a friend allowed
+  to watch in whitelist mode must not thereby gain purge/upgrade/mode-
+  switch/info power. `/w` and `/r` are deliberately not on this list —
+  see the gate fact above.
 - `WHITELIST_IPS` is who `/mode/whitelist` admits; kept as a separate list
   from `ADMIN_IPS` on purpose.
 
@@ -176,7 +183,7 @@ already-set environment variable always wins; see `.env.example`).
 | `GATE_GRACE_PERIOD` | `10m` | offline debounce |
 | `GATE_OVERRIDE_TTL` | `4h` | `/on` default duration |
 | `GATE_POLL_INTERVAL` | `30s` | background re-evaluation; needed because debounce measures from last *observed* online moment |
-| `ADMIN_IPS` | empty (unrestricted) | comma-separated; gates `/on /off /p /d /u /mode` |
+| `ADMIN_IPS` | empty (unrestricted) | comma-separated; gates `/on /off /p /d /u /mode /l /e /i` |
 | `WHITELIST_IPS` | empty | comma-separated; who `/mode/whitelist` admits |
 | `DISCORD_BOT_TOKEN` / `DISCORD_USER_ID` | — | both required to register the Discord signal at all |
 | `DISCORD_ACTIVITY_NAME` | `VRChat` | activity name matched in presence |

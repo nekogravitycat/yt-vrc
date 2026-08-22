@@ -179,6 +179,12 @@ func (m *MessageRenderer) encode(ctx context.Context, frame, dir string, spec vi
 
 // Open serves a file from a rendered message directory.
 func (m *MessageRenderer) Open(key video.CacheKey, name string) (io.ReadSeekCloser, time.Time, error) {
+	// CRITICAL: key comes straight from the request path and, unlike
+	// FSStore.Open's key, is never checked against an in-memory index —
+	// validate it explicitly rather than relying on ServeMux's path.Clean.
+	if err := safeName(string(key)); err != nil {
+		return nil, time.Time{}, err
+	}
 	if err := safeName(name); err != nil {
 		return nil, time.Time{}, err
 	}

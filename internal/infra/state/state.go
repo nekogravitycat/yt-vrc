@@ -165,22 +165,20 @@ func (l *EventLog) Append(e event.Event) {
 		e.At = time.Now()
 	}
 	l.mu.Lock()
+	defer l.mu.Unlock()
 	l.recent = append(l.recent, e)
 	if len(l.recent) > l.max {
 		l.recent = l.recent[len(l.recent)-l.max:]
 	}
 	l.writes++
 	// Rewriting only every so often keeps appends cheap while bounding
-	// the file at roughly twice the retention.
-	compact := l.writes >= l.max
-	snapshot := make([]event.Event, len(l.recent))
-	copy(snapshot, l.recent)
-	if compact {
+	// the file at roughly twice the retention. NOTE: done while still
+	// holding the lock, so two concurrent rewrites can't land out of
+	// order and silently drop newer events from disk.
+	if l.writes >= l.max {
 		l.writes = 0
-	}
-	l.mu.Unlock()
-
-	if compact {
+		snapshot := make([]event.Event, len(l.recent))
+		copy(snapshot, l.recent)
 		l.rewrite(snapshot)
 		return
 	}
