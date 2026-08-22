@@ -117,3 +117,12 @@ func tail(s string, n int) string {
 	}
 	return strings.Join(lines, "; ")
 }
+
+// safeName rejects anything that could escape an artifact directory;
+// these names arrive straight from request paths.
+func safeName(name string) error {
+	if name == "" || strings.Contains(name, "..") || strings.ContainsAny(name, `/\`) {
+		return fmt.Errorf("invalid file name %q", name)
+	}
+	return nil
+}

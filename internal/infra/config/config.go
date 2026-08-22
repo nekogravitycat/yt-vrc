@@ -34,6 +34,11 @@ type Config struct {
 	FetchWorkers    int
 	FetchChunkBytes int64
 
+	// Message videos. 15s is long enough to read a frame and short
+	// enough to loop unobtrusively (spec §4.3.3).
+	MessageSeconds      int
+	MessageCacheEntries int
+
 	ResolveTimeout time.Duration
 	PrepareTimeout time.Duration
 	MaxDuration    time.Duration
@@ -43,20 +48,22 @@ type Config struct {
 
 func Load() (*Config, error) {
 	c := &Config{
-		ListenAddr:        env("LISTEN_ADDR", ":8080"),
-		PublicBaseURL:     strings.TrimRight(env("PUBLIC_BASE_URL", "http://localhost:8080"), "/"),
-		DataDir:           env("DATA_DIR", "./data"),
-		HLSSegmentSeconds: envInt("HLS_SEGMENT_SECONDS", 6),
-		FFmpegPath:        env("FFMPEG_PATH", "ffmpeg"),
-		FFprobePath:       env("FFPROBE_PATH", "ffprobe"),
-		YtdlpPath:         env("YTDLP_PATH", "yt-dlp"),
-		YtdlpMode:         env("YTDLP_MODE", "path"),
-		FetchWorkers:      envInt("FETCH_WORKERS", 8),
-		FetchChunkBytes:   int64(envInt("FETCH_CHUNK_BYTES", 4<<20)),
-		ResolveTimeout:    envDur("RESOLVE_TIMEOUT", 30*time.Second),
-		PrepareTimeout:    envDur("PREPARE_TIMEOUT", 10*time.Minute),
-		MaxDuration:       envDur("MAX_DURATION", 4*time.Hour),
-		LogLevel:          env("LOG_LEVEL", "info"),
+		ListenAddr:          env("LISTEN_ADDR", ":8080"),
+		PublicBaseURL:       strings.TrimRight(env("PUBLIC_BASE_URL", "http://localhost:8080"), "/"),
+		DataDir:             env("DATA_DIR", "./data"),
+		HLSSegmentSeconds:   envInt("HLS_SEGMENT_SECONDS", 6),
+		FFmpegPath:          env("FFMPEG_PATH", "ffmpeg"),
+		FFprobePath:         env("FFPROBE_PATH", "ffprobe"),
+		YtdlpPath:           env("YTDLP_PATH", "yt-dlp"),
+		YtdlpMode:           env("YTDLP_MODE", "path"),
+		FetchWorkers:        envInt("FETCH_WORKERS", 8),
+		FetchChunkBytes:     int64(envInt("FETCH_CHUNK_BYTES", 4<<20)),
+		MessageSeconds:      envInt("MESSAGE_SECONDS", 15),
+		MessageCacheEntries: envInt("MESSAGE_CACHE_ENTRIES", 200),
+		ResolveTimeout:      envDur("RESOLVE_TIMEOUT", 30*time.Second),
+		PrepareTimeout:      envDur("PREPARE_TIMEOUT", 10*time.Minute),
+		MaxDuration:         envDur("MAX_DURATION", 4*time.Hour),
+		LogLevel:            env("LOG_LEVEL", "info"),
 	}
 
 	dq, err := video.ParseQuality(env("DEFAULT_QUALITY", "1080"))

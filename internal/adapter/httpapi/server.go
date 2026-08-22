@@ -4,23 +4,36 @@ package httpapi
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
+	"github.com/nekogravitycat/yt-vrc/internal/adapter/presenter"
+	"github.com/nekogravitycat/yt-vrc/internal/domain/message"
 	"github.com/nekogravitycat/yt-vrc/internal/domain/video"
 	"github.com/nekogravitycat/yt-vrc/internal/infra/ffmpeg"
 	"github.com/nekogravitycat/yt-vrc/internal/usecase/playvideo"
 )
 
+// MessageService renders views to playable media and serves them back.
+type MessageService interface {
+	Render(ctx context.Context, v message.View, spec video.OutputSpec) (*video.MediaAsset, error)
+	Open(key video.CacheKey, name string) (io.ReadSeekCloser, time.Time, error)
+}
+
 type Server struct {
 	Play     *playvideo.UseCase
+	Messages MessageService
 	Defaults Defaults
 	Log      *slog.Logger
 	Version  string
 }
+
+// messagePrefix namespaces rendered messages so they cannot collide with
+// video cache keys.
+const messagePrefix = "m"
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -28,22 +41,24 @@ func (s *Server) Handler() http.Handler {
 	return s.recoverPanic(s.logRequest(mux))
 }
 
-// assetSuffixes are the files a player fetches from inside an artifact,
-// as referenced by the playlist we serve.
 func isAssetFile(name string) bool {
-	return strings.HasSuffix(name, ".ts") || name == ffmpeg.PlaylistName
+	return strings.HasSuffix(name, ".ts") ||
+		strings.HasSuffix(name, ".mp4") ||
+		strings.HasSuffix(name, ".m3u8")
 }
 
 func (s *Server) route(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.EscapedPath()
+	segs := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 
-	// Segment requests arrive as /{key}/{file}; they are matched before
-	// path parsing because a cache key is not a video ID.
-	if segs := strings.Split(strings.Trim(path, "/"), "/"); len(segs) == 2 && isAssetFile(segs[1]) {
-		if strings.Count(segs[0], "_") == 2 {
-			s.serveAsset(w, r, video.CacheKey(segs[0]), segs[1])
-			return
-		}
+	// Rendered message media: /m/{hash}_{container}/{file}
+	if len(segs) == 3 && segs[0] == messagePrefix && isAssetFile(segs[2]) {
+		s.serveFrom(w, r, s.Messages.Open, video.CacheKey(segs[1]), segs[2])
+		return
+	}
+	// Video artifact files: /{cachekey}/{file}
+	if len(segs) == 2 && isAssetFile(segs[1]) && strings.Count(segs[0], "_") == 2 {
+		s.serveFrom(w, r, s.Play.Open, video.CacheKey(segs[0]), segs[1])
+		return
 	}
 
 	// A pasted "…/watch?v=ID" arrives with its query parsed as this
@@ -55,7 +70,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 
 	route, err := ParsePath(raw, s.Defaults)
 	if err != nil {
-		s.fail(w, r, http.StatusNotFound, "無法辨識的指令或影片連結，請輸入 /h 查看說明")
+		s.deliver(w, r, presenter.Unrecognised(), s.Defaults.spec(), http.StatusNotFound)
 		return
 	}
 
@@ -70,24 +85,52 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 func (s *Server) serveVideo(w http.ResponseWriter, r *http.Request, route Route) {
 	asset, err := s.Play.Prepare(r.Context(), route.VideoID, route.Spec)
 	if err != nil {
-		s.failPrepare(w, r, route.VideoID, err)
+		s.Log.Error("prepare failed", "id", route.VideoID, "err", err)
+		s.deliver(w, r, presenter.PrepareError(route.VideoID, err), route.Spec, statusFor(err))
+		return
+	}
+	entry := ffmpeg.MessageEntrypoint(asset.Spec.Container)
+	if asset.Spec.Container == video.ContainerMP4 {
+		entry = "video.mp4"
+	}
+	// Redirect so the player resolves segment URLs against the
+	// artifact directory rather than the request path.
+	http.Redirect(w, r, "/"+string(asset.Key)+"/"+entry, http.StatusFound)
+}
+
+// deliver renders a view and points the player at it.
+//
+// The player is the only display this user has, so the response body is
+// always media (spec §10). The classification still reaches the logs,
+// and ?debug=1 returns it as text for terminal debugging.
+func (s *Server) deliver(w http.ResponseWriter, r *http.Request, v message.View, spec video.OutputSpec, code int) {
+	if r.URL.Query().Has("debug") {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(code)
+		writeViewText(w, v)
 		return
 	}
 
-	switch asset.Spec.Container {
-	case video.ContainerHLS:
-		// Redirect rather than serve inline so the player resolves
-		// segment URLs against the artifact directory.
-		http.Redirect(w, r, "/"+string(asset.Key)+"/"+ffmpeg.PlaylistName, http.StatusFound)
-	default:
-		s.serveAsset(w, r, asset.Key, "video.mp4")
+	asset, err := s.Messages.Render(r.Context(), v, spec)
+	if err != nil {
+		// Falling back to text is strictly better than a blank player.
+		s.Log.Error("message render failed", "err", err)
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusInternalServerError)
+		writeViewText(w, v)
+		return
 	}
+	http.Redirect(w, r,
+		"/"+messagePrefix+"/"+string(asset.Key)+"/"+ffmpeg.MessageEntrypoint(spec.Container),
+		http.StatusFound)
 }
 
-func (s *Server) serveAsset(w http.ResponseWriter, r *http.Request, key video.CacheKey, name string) {
-	f, modTime, err := s.Play.Open(key, name)
+type opener func(key video.CacheKey, name string) (io.ReadSeekCloser, time.Time, error)
+
+func (s *Server) serveFrom(w http.ResponseWriter, r *http.Request, open opener, key video.CacheKey, name string) {
+	f, modTime, err := open(key, name)
 	if err != nil {
-		s.fail(w, r, http.StatusNotFound, "找不到這個檔案，可能已從快取移除")
+		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
 	defer f.Close()
@@ -106,38 +149,43 @@ func (s *Server) serveAsset(w http.ResponseWriter, r *http.Request, key video.Ca
 	http.ServeContent(w, r, name, modTime, f)
 }
 
-// failPrepare maps domain errors onto messages. From M2 these become
-// message videos rather than text (spec §10).
-func (s *Server) failPrepare(w http.ResponseWriter, r *http.Request, id video.ID, err error) {
-	s.Log.Error("prepare failed", "id", id, "err", err)
+func statusFor(err error) int {
 	switch {
-	case errors.Is(err, video.ErrNotFound):
-		s.fail(w, r, http.StatusNotFound, "影片不存在、為私人影片或已被移除")
-	case errors.Is(err, video.ErrLiveStream):
-		s.fail(w, r, http.StatusUnprocessableEntity, "暫不支援直播與首播")
-	case errors.Is(err, video.ErrNeedsRecode):
-		s.fail(w, r, http.StatusUnprocessableEntity, "此影片格式需要轉碼，暫不支援")
-	case errors.Is(err, video.ErrInvalidVideoID):
-		s.fail(w, r, http.StatusBadRequest, "無法辨識的影片連結")
-	case errors.Is(err, os.ErrDeadlineExceeded), errors.Is(err, context.DeadlineExceeded):
-		s.fail(w, r, http.StatusGatewayTimeout, "準備逾時，請稍後再試")
+	case errorIs(err, video.ErrNotFound):
+		return http.StatusNotFound
+	case errorIs(err, video.ErrLiveStream), errorIs(err, video.ErrNeedsRecode):
+		return http.StatusUnprocessableEntity
+	case errorIs(err, video.ErrInvalidVideoID):
+		return http.StatusBadRequest
+	case errorIs(err, context.DeadlineExceeded):
+		return http.StatusGatewayTimeout
 	default:
-		s.fail(w, r, http.StatusInternalServerError, "準備影片時發生錯誤："+err.Error())
+		return http.StatusInternalServerError
 	}
 }
 
-func (s *Server) fail(w http.ResponseWriter, r *http.Request, code int, msg string) {
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(code)
-	w.Write([]byte(msg + "\n"))
+func writeViewText(w io.Writer, v message.View) {
+	io.WriteString(w, "["+string(v.Kind)+"] "+v.Title+"\n")
+	if v.Subtitle != "" {
+		io.WriteString(w, v.Subtitle+"\n")
+	}
+	for _, row := range v.Rows {
+		io.WriteString(w, "  "+row.Label+"\t"+row.Value+"\n")
+	}
+	for _, line := range v.Lines {
+		io.WriteString(w, "  "+line+"\n")
+	}
+	if v.Footer != "" {
+		io.WriteString(w, "\n"+v.Footer+"\n")
+	}
 }
 
 func (s *Server) recoverPanic(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
-			if v := recover(); v != nil {
-				s.Log.Error("panic", "err", v, "path", r.URL.Path)
-				s.fail(w, r, http.StatusInternalServerError, "伺服器內部錯誤")
+			if rec := recover(); rec != nil {
+				s.Log.Error("panic", "err", rec, "path", r.URL.Path)
+				http.Error(w, "internal error", http.StatusInternalServerError)
 			}
 		}()
 		next.ServeHTTP(w, r)
@@ -151,3 +199,9 @@ func (s *Server) logRequest(next http.Handler) http.Handler {
 		s.Log.Debug("request", "method", r.Method, "path", r.URL.Path, "took", time.Since(start))
 	})
 }
+
+func (d Defaults) spec() video.OutputSpec {
+	return video.OutputSpec{Container: d.Container, Quality: d.Quality}
+}
+
+func errorIs(err, target error) bool { return errors.Is(err, target) }

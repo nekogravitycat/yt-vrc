@@ -21,6 +21,7 @@ import (
 	"github.com/nekogravitycat/yt-vrc/internal/infra/config"
 	"github.com/nekogravitycat/yt-vrc/internal/infra/fetch"
 	"github.com/nekogravitycat/yt-vrc/internal/infra/ffmpeg"
+	"github.com/nekogravitycat/yt-vrc/internal/infra/render"
 	"github.com/nekogravitycat/yt-vrc/internal/infra/store"
 	"github.com/nekogravitycat/yt-vrc/internal/infra/ytdlp"
 	"github.com/nekogravitycat/yt-vrc/internal/usecase/playvideo"
@@ -75,8 +76,20 @@ func run() error {
 		TempDir:     tmp,
 	}
 
+	messages := &ffmpeg.MessageRenderer{
+		FFmpegPath: cfg.FFmpegPath,
+		PNG:        render.New(),
+		Dir:        filepath.Join(cfg.DataDir, "messages"),
+		Seconds:    cfg.MessageSeconds,
+		MaxEntries: cfg.MessageCacheEntries,
+	}
+	if err := os.MkdirAll(messages.Dir, 0o755); err != nil {
+		return err
+	}
+
 	srv := &httpapi.Server{
-		Play: play,
+		Play:     play,
+		Messages: messages,
 		Defaults: httpapi.Defaults{
 			Container:  cfg.DefaultContainer,
 			Quality:    cfg.DefaultQuality,
