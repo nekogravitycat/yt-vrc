@@ -109,7 +109,11 @@ try {
     Section "M1 - HLS output correctness"
     if (-not $skipVideo) {
     $key = "${VideoId}_1080_hls"
-    $playlist = "$base/$key/master.m3u8"
+    # The master playlist declares the variant; EXTINF lives in media.
+    $master = & curl.exe -s "$base/$key/master.m3u8"
+    Check "master declares a variant" ($master -match "EXT-X-STREAM-INF") "no STREAM-INF"
+    Check "master declares codecs" ($master -match 'CODECS="avc1') "no CODECS attribute"
+    $playlist = "$base/$key/media.m3u8"
     $pl = & curl.exe -s $playlist
     Check "playlist is VOD"        ($pl -match "EXT-X-PLAYLIST-TYPE:VOD") "missing VOD tag"
     Check "playlist is terminated" ($pl -match "EXT-X-ENDLIST")           "missing ENDLIST"
@@ -208,7 +212,7 @@ try {
         Check "video URL declares HLS content type" ($hdr -match "(?i)application/vnd.apple.mpegurl") "wrong content type"
         $pl = & curl.exe -s "$base/$VideoId"
         Check "playlist is EXT-X-VERSION 3" ($pl -match "EXT-X-VERSION:3") "AVPro prefers v3"
-        Check "segment URIs are absolute" ($pl -match "(?m)^/$VideoId") "segments not rewritten"
+        Check "media playlist URI is absolute" ($pl -match "(?m)^/$VideoId") "not rewritten"
     }
 
     Section "M2 - mp4 variant and debug view"

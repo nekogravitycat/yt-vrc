@@ -240,7 +240,7 @@ func errorIs(err, target error) bool { return errors.Is(err, target) }
 // player would resolve them against the wrong base, so the URIs are made
 // absolute on the way out.
 func (s *Server) servePlaylist(w http.ResponseWriter, r *http.Request, open opener, key video.CacheKey, prefix string) {
-	f, modTime, err := open(key, ffmpeg.PlaylistName)
+	f, modTime, err := open(key, ffmpeg.MasterName)
 	if err != nil {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
@@ -263,5 +263,5 @@ func (s *Server) servePlaylist(w http.ResponseWriter, r *http.Request, open open
 	body := strings.Join(lines, "\n")
 
 	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-	http.ServeContent(w, r, ffmpeg.PlaylistName, modTime, strings.NewReader(body))
+	http.ServeContent(w, r, ffmpeg.MasterName, modTime, strings.NewReader(body))
 }

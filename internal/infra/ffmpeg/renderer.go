@@ -26,10 +26,11 @@ type PNGRenderer interface {
 // Rendered messages are keyed by content hash, so repeated identical
 // messages are encoded once (spec §4.3.3).
 type MessageRenderer struct {
-	FFmpegPath string
-	PNG        PNGRenderer
-	Dir        string // {DATA_DIR}/messages
-	Seconds    int
+	FFmpegPath  string
+	FFprobePath string
+	PNG         PNGRenderer
+	Dir         string // {DATA_DIR}/messages
+	Seconds     int
 	// MaxEntries bounds the message cache. Status views embed live
 	// numbers, so each distinct reading hashes differently and would
 	// otherwise accumulate without limit.
@@ -130,7 +131,7 @@ func MessageEntrypoint(c video.Container) string {
 	if c == video.ContainerMP4 {
 		return "message.mp4"
 	}
-	return PlaylistName
+	return MasterName
 }
 
 func (m *MessageRenderer) encode(ctx context.Context, frame, dir string, spec video.OutputSpec) error {
@@ -145,6 +146,12 @@ func (m *MessageRenderer) encode(ctx context.Context, frame, dir string, spec vi
 		"-r", "15",
 		"-c:v", "libx264", "-preset", "veryfast", "-tune", "stillimage",
 		"-pix_fmt", "yuv420p",
+		// Force a keyframe every 3s. libx264 defaults to a 250-frame
+		// GOP, which at 15fps exceeds the whole clip, leaving one
+		// keyframe and therefore a single unsplittable segment. Players
+		// handle a normally segmented playlist far more predictably.
+		"-g", "45", "-keyint_min", "45",
+		"-force_key_frames", "expr:gte(t,n_forced*3)",
 		"-c:a", "aac", "-b:a", "64k",
 		"-shortest",
 	}
@@ -153,11 +160,11 @@ func (m *MessageRenderer) encode(ctx context.Context, frame, dir string, spec vi
 	} else {
 		args = append(args,
 			"-f", "hls",
-			"-hls_time", "5",
+			"-hls_time", "3",
 			"-hls_playlist_type", "vod",
 			"-hls_list_size", "0",
 			"-hls_segment_filename", filepath.Join(dir, "seg_%05d.ts"),
-			filepath.Join(dir, PlaylistName))
+			filepath.Join(dir, MediaName))
 	}
 
 	cmd := exec.CommandContext(ctx, m.FFmpegPath, args...)
@@ -165,6 +172,9 @@ func (m *MessageRenderer) encode(ctx context.Context, frame, dir string, spec vi
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("rendering message: %v: %s", err, tail(stderr.String(), 10))
+	}
+	if spec.Container == video.ContainerHLS {
+		return writeMaster(ctx, m.FFprobePath, dir, float64(m.Seconds))
 	}
 	return nil
 }

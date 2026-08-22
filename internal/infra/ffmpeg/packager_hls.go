@@ -14,10 +14,7 @@ import (
 	"github.com/nekogravitycat/yt-vrc/internal/domain/video"
 )
 
-const (
-	PlaylistName = "master.m3u8"
-	segmentGlob  = "seg_*.ts"
-)
+const segmentGlob = "seg_*.ts"
 
 // HLSPackager remuxes local track files into an HLS artifact.
 //
@@ -29,6 +26,7 @@ const (
 // would put every seek in the wrong place (implementation.md §2.2).
 type HLSPackager struct {
 	FFmpegPath     string
+	FFprobePath    string
 	SegmentSeconds int
 }
 
@@ -59,7 +57,7 @@ func (p *HLSPackager) Package(ctx context.Context, res *video.Resolution, srcVid
 		// only ever needed for the mid-stream resume this design dropped.
 		"-hls_list_size", "0",
 		"-hls_segment_filename", filepath.Join(destDir, "seg_%05d.ts"),
-		filepath.Join(destDir, PlaylistName),
+		filepath.Join(destDir, MediaName),
 	)
 
 	cmd := exec.CommandContext(ctx, p.FFmpegPath, args...)
@@ -69,9 +67,11 @@ func (p *HLSPackager) Package(ctx context.Context, res *video.Resolution, srcVid
 		return nil, fmt.Errorf("%w: %v: %s", video.ErrPackageFailed, err, tail(stderr.String(), 20))
 	}
 
-	playlist := filepath.Join(destDir, PlaylistName)
-	if _, err := os.Stat(playlist); err != nil {
+	if _, err := os.Stat(filepath.Join(destDir, MediaName)); err != nil {
 		return nil, fmt.Errorf("%w: no playlist produced", video.ErrPackageFailed)
+	}
+	if err := writeMaster(ctx, p.FFprobePath, destDir, res.Duration.Seconds()); err != nil {
+		return nil, fmt.Errorf("%w: master playlist: %v", video.ErrPackageFailed, err)
 	}
 
 	size, err := dirSize(destDir)

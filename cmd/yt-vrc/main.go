@@ -67,6 +67,7 @@ func run() error {
 		Packagers: map[video.Container]port.Packager{
 			video.ContainerHLS: &ffmpeg.HLSPackager{
 				FFmpegPath:     cfg.FFmpegPath,
+				FFprobePath:    cfg.FFprobePath,
 				SegmentSeconds: cfg.HLSSegmentSeconds,
 			},
 		},
@@ -78,11 +79,12 @@ func run() error {
 	}
 
 	messages := &ffmpeg.MessageRenderer{
-		FFmpegPath: cfg.FFmpegPath,
-		PNG:        render.New(),
-		Dir:        filepath.Join(cfg.DataDir, "messages"),
-		Seconds:    cfg.MessageSeconds,
-		MaxEntries: cfg.MessageCacheEntries,
+		FFmpegPath:  cfg.FFmpegPath,
+		FFprobePath: cfg.FFprobePath,
+		PNG:         render.New(),
+		Dir:         filepath.Join(cfg.DataDir, "messages"),
+		Seconds:     cfg.MessageSeconds,
+		MaxEntries:  cfg.MessageCacheEntries,
 	}
 	if err := os.MkdirAll(messages.Dir, 0o755); err != nil {
 		return err
