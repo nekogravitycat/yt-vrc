@@ -22,13 +22,16 @@
 |---|---|---|
 | M1 播放路徑 | **完成，VRChat 驗收通過** | 播放與 seek 均已實測（implementation.md §11.5） |
 | M2 訊息影片 | **完成，VRChat 驗收通過** | 顯示文字為英文 |
-| M3 上線閘門 | 未開始 | 下一個工作項目 |
-| M4 熱更新與健康度 | 未開始 | |
-| M5 韌性與快取 | **部分完成** | singleflight 已提前實作；LRU 淘汰、長影片滑動視窗、client fallback 鏈未做 |
+| M3 上線閘門 | **完成，待 VRChat 實測** | Discord 實作未經真實憑證驗證（implementation.md §12.4） |
+| M4 熱更新與健康度 | 未開始 | 下一個工作項目 |
+| M5 韌性與快取 | **完成**（滑動視窗刻意廢除） | singleflight、`MAX_CONCURRENT_JOBS`、LRU、client fallback、`/l` `/e` `/p` `/d` `/i` 全數完成；廢除理由見 implementation.md §14.2 |
 | M6 MP4 與預熱 | 未開始 | 訊息影片已支援 MP4，但影片本體的 MP4 packager 未做 |
 
-程式碼規模：21 個 Go 檔、約 3,000 行。測試：`internal/adapter/httpapi`、
-`internal/usecase/playvideo`，`-race` 下全過。
+另已修正 implementation.md §11.3 的訊息影片網址問題（穩定 slot 路徑，見 §13）。
+
+程式碼規模：30 個 Go 檔、約 4,500 行。測試：`internal/adapter/httpapi`、
+`internal/domain/availability`、`internal/infra/store`、`internal/usecase/playvideo`，
+`-race` 下全過。`scripts/verify.ps1` 共 72 項，全過。
 
 ---
 
@@ -82,10 +85,13 @@
 
 ```powershell
 $env:DATA_DIR = ".\data"
+# 閘門是 fail-closed。沒有訊號來源時所有影片端點都會回「服務離線」，
+# 開發時用假訊號打開（或啟動後在瀏覽器／VRChat 輸入 /on）。
+$env:FAKE_SIGNAL_ONLINE = "true"
 go run .\cmd\yt-vrc          # 預設 :8080
 ```
 
-### 5.2 自動化驗收（50 項）
+### 5.2 自動化驗收（72 項）
 
 ```powershell
 .\scripts\verify.ps1                      # 預設影片
@@ -145,7 +151,16 @@ CDN 大量提供影片，啟用快取正是踩在該條款上。
    需要一支冷啟動超過 10 秒的影片才能測
 3. **長影片（60 分鐘以上）的冷啟動是否可接受**
 
-### 7.2 實驗室網路的解析成功率
+### 7.2 M3 的 VRChat 實測
+
+閘門的所有行為都只在瀏覽器／curl 驗證過（`scripts/verify.ps1` 72 項全過），
+尚未在 VRChat 內確認：
+
+1. 灰色的「Service Offline」訊息影片在 AVPro 中是否正常播放
+2. `/on`、`/off`、`/e`、`/p`、`/i`、`/d` 的訊息影片
+3. Discord Presence 訊號（憑證未取得，程式碼從未執行過）
+
+### 7.3 實驗室網路的解析成功率
 
 spec §3.1 列為部署前的**必要驗收條件**，尚未執行。目前所有測試都在家中
 HiNet IP 完成。
@@ -156,14 +171,15 @@ HiNet IP 完成。
 
 依序：
 
-1. **修正 §11.3 的訊息影片網址問題** —— `/s` 的內容雜湊隨即時資料變動，
-   而 VRChat 會快取網址解析結果，導致過期畫面或 404
-2. **M3 上線閘門** —— Discord 憑證尚未取得，因此先做 manual override
-   （`/on`、`/off`）與環境變數驅動的 fake signal，Discord 實作照介面寫好待測
-3. **`MAX_CONCURRENT_JOBS` 併發上限**（spec §8）—— 程式碼很小，同屬防封鎖
-4. **M5 剩餘部分** —— LRU 淘汰、長影片滑動視窗、client fallback 鏈
-5. **Dockerfile** —— 需含新版 deno（yt-dlp 解 `n` 參數挑戰用；目前分塊下載
+1. **取得 Discord Bot 憑證並實測 M3** —— `internal/infra/signal/discord.go`
+   已照介面寫好但**從未跑過**。需要 Developer Portal 啟用 Presence Intent，
+   且 Bot 與被監測使用者同在一個 guild
+2. **VRChat 內實測閘門與新端點** —— `/on`、`/off`、`/e`、`/p`、`/i`、`/d`
+   的訊息影片都只在瀏覽器驗證過
+3. **Dockerfile** —— 需含新版 deno（yt-dlp 解 `n` 參數挑戰用；目前分塊下載
    已不依賴它，但缺少會使部分格式無法取得）
+4. **M4 熱更新與健康度** —— ToolchainManager、`/u`、煙霧測試、主動探測
+5. **M6 MP4 路徑與預熱** —— `/w`、`/r`，以及影片本體的 MP4 packager
 
 ---
 
@@ -174,18 +190,22 @@ cmd/yt-vrc/main.go              組裝與啟動（唯一連接具體實作之處
 internal/
   domain/                       無外部相依
     video/                      ID、OutputSpec、CacheKey、MediaAsset、領域錯誤
+    availability/               Signal 介面 ★ 核心解耦點、Gate 聚合與去抖動
     message/                    View 與內容雜湊
+    event/                      /e 與 /s 讀的事件型別
     port/                       Resolver / MediaFetcher / Packager / AssetStore
-  usecase/playvideo/            解析→下載→封裝，含雙層 singleflight
+  usecase/playvideo/            解析→下載→封裝，含雙層 singleflight 與併發上限
   adapter/
-    httpapi/                    路徑解析（spec §4.1.4）、HTTP handler
+    httpapi/                    路徑解析（spec §4.1.4）、HTTP handler、訊息 slot 表
     presenter/                  領域結果 → View
   infra/
     ytdlp/                      Resolver 實作（--dump-single-json）
     fetch/                      並行分塊下載器 ★ spec 中沒有，但為必要
     ffmpeg/                     HLS packager、訊息影片 renderer
     render/                     PNG 版面（嵌入 Noto Sans TC）
-    store/                      檔案系統 AssetStore
+    signal/                     Discord Presence ★（未實測）、開發用 fake
+    state/                      覆寫與事件記錄的持久化
+    store/                      檔案系統 AssetStore，含 LRU 淘汰
     config/                     環境變數設定
 ```
 
@@ -203,6 +223,12 @@ internal/
   由畫質推導，僅以 `video_id` 為鍵會讓 720p 請求拿到 1080p 軌道
 - **共用工作使用 `context.WithoutCancel`** —— 先送請求者放棄時不得中斷其他
   仍在等待的觀看者
+- **閘門是 fail-closed** —— 啟用（預設）且無訊號來源時，所有影片端點回
+  「服務離線」，只有 `/on` 能打開。命令端點永不受閘門限制
+- **`/on` 的覆寫寫入 `/data/state/override.json`** —— 沒有持久化的話，重啟
+  會靜默地讓服務整個停擺
+- **命令端點的媒體走穩定 slot 路徑** —— `/m/status_hls/…`，內容雜湊只用於
+  磁碟去重。被 slot 指到的產物不可被淘汰（見 implementation.md §13）
 
 ### 9.2 AVPro 的硬性要求（實測，詳見 implementation.md §10、§11）
 

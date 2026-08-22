@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  M1 + M2 acceptance checks for yt-vrc.
+  M1, M2, M3 and the completed parts of M5 acceptance checks for yt-vrc.
 .DESCRIPTION
   Starts the server on a scratch data directory, exercises every
   endpoint, and verifies the produced media with ffprobe.
@@ -59,6 +59,12 @@ if (-not $KeepData) { Remove-Item -Recurse -Force (Join-Path $dataDir "data") -E
 $env:DATA_DIR   = Join-Path $dataDir "data"
 $env:LISTEN_ADDR = ":$Port"
 $env:LOG_LEVEL  = "info"
+# The gate is fail-closed, so a run with no detection source would refuse
+# every video. The fake source keeps the gate in its real shape -- enabled,
+# with a source -- rather than switching it off (spec 4.4).
+$env:FAKE_SIGNAL_ONLINE = "true"
+$env:GATE_ENABLED = "true"
+Remove-Item (Join-Path $env:DATA_DIR "state\override.json") -ErrorAction SilentlyContinue
 $log = Join-Path $dataDir "server.log"
 $proc = Start-Process -FilePath $exe -RedirectStandardOutput $log `
         -RedirectStandardError (Join-Path $dataDir "server.err") -PassThru -WindowStyle Hidden
@@ -187,7 +193,9 @@ try {
                     "nonsense"="unrecognised"; "aaaaaaaaaaa"="missing video" }
     foreach ($e in $endpoints.GetEnumerator()) {
         $body = & curl.exe -sL "$base/$($e.Key)"
-        $isMsg = ($body -match "#EXTM3U") -and ($body -match "/m/[0-9a-f]+_hls/")
+        # Message media lives under a stable slot name now, not a
+        # content hash (implementation.md 11.3).
+        $isMsg = ($body -match "#EXTM3U") -and ($body -match "/m/[A-Za-z0-9-]+_hls/")
         Check "$($e.Value) -> message video" $isMsg "body was not a message playlist"
         if ($isMsg) {
             $p = & ffprobe -v error -show_entries format=duration `
@@ -214,6 +222,83 @@ try {
         Check "playlist is EXT-X-VERSION 3" ($pl -match "EXT-X-VERSION:3") "AVPro prefers v3"
         Check "media playlist URI is absolute" ($pl -match "(?m)^/$VideoId") "not rewritten"
     }
+
+    Section "Stable message URLs (implementation.md 11.3)"
+    # /s embeds live counters, so its content hash changes constantly.
+    # The URL handed to the player must not, or VRChat replays a stale
+    # frame or fetches a 404 once the old render is pruned.
+    function Get-SlotUrl { (& curl.exe -s "$base/s" | Where-Object { $_ -match "^/m/" } | Select-Object -First 1).Trim() }
+    $urlA = Get-SlotUrl
+    & curl.exe -s -o NUL "$base/$VideoId" | Out-Null   # moves the cache counters /s reports
+    $urlB = Get-SlotUrl
+    Check "status media URL is stable across content change" ($urlA -eq $urlB) "$urlA vs $urlB"
+    Check "status media URL is a named slot" ($urlA -match "^/m/status_hls/") "$urlA"
+    Check "the earlier URL still resolves" ((Get-Code $urlA.TrimStart("/")) -eq "200") "got $(Get-Code $urlA.TrimStart('/'))"
+    $hdr = & curl.exe -s -o NUL -D - "$base$urlA"
+    Check "slot media is no-store" ($hdr -match "(?i)Cache-Control: no-store") "$hdr"
+    $hdr = & curl.exe -s -o NUL -D - "$base/$VideoId`_1080_hls/media.m3u8"
+    Check "video artifacts stay immutable" ($hdr -match "(?i)immutable") "$hdr"
+
+    Section "M3 - availability gate (spec 4.4)"
+    $dbg = & curl.exe -s "$base/s?debug=1"
+    Check "status lists the detection source" ($dbg -match "fake") "$dbg"
+    $dbg = & curl.exe -s "$base/on?debug=1"
+    Check "/on reports a manual override" ($dbg -match "Forced Online") "$dbg"
+    $dbg = & curl.exe -s "$base/s?debug=1"
+    Check "override outranks the source" ($dbg -match "open . manual") "$dbg"
+    $dbg = & curl.exe -s "$base/off?debug=1"
+    Check "/off returns to automatic detection" ($dbg -match "Override Cleared") "$dbg"
+    $dbg = & curl.exe -s "$base/e?debug=1"
+    Check "gate changes reach the event log" ($dbg -match "override cleared") "$dbg"
+
+    Section "M3 - fail-closed with no source"
+    # A second instance with nothing configured: the interesting case is
+    # that video stops while the management endpoints that diagnose and
+    # reopen it keep working (spec 4.4.1).
+    $closedPort = $Port + 1
+    $closedData = Join-Path $dataDir "closed"
+    Remove-Item -Recurse -Force $closedData -ErrorAction SilentlyContinue
+    $env:DATA_DIR = $closedData
+    $env:LISTEN_ADDR = ":$closedPort"
+    Remove-Item Env:FAKE_SIGNAL_ONLINE
+    $closedLog = Join-Path $dataDir "closed.log"
+    $closedProc = Start-Process -FilePath $exe -RedirectStandardOutput $closedLog `
+                  -RedirectStandardError (Join-Path $dataDir "closed.err") -PassThru -WindowStyle Hidden
+    Start-Sleep -Seconds 2
+    $cbase = "http://localhost:$closedPort"
+    try {
+        $dbg = & curl.exe -s "$cbase/$VideoId`?debug=1"
+        Check "video refused while the gate is closed" ($dbg -match "Service Offline") "$dbg"
+        Check "the refusal is still playable media" `
+              ((& curl.exe -s -o NUL -w "%{http_code}" "$cbase/$VideoId") -eq "200") "not a 200"
+        $dbg = & curl.exe -s "$cbase/s?debug=1"
+        Check "/s works with the gate closed" ($dbg -match "Service Status") "$dbg"
+        & curl.exe -s -o NUL "$cbase/on"
+        $dbg = & curl.exe -s "$cbase/$VideoId`?debug=1"
+        Check "/on reopens the service" ($dbg -notmatch "Service Offline") "$dbg"
+    } finally {
+        if (-not $closedProc.HasExited) { Stop-Process -Id $closedProc.Id -Force }
+        $env:DATA_DIR = Join-Path $dataDir "data"
+        $env:LISTEN_ADDR = ":$Port"
+        $env:FAKE_SIGNAL_ONLINE = "true"
+    }
+
+    Section "M5 - cache management endpoints (spec 4.1.3)"
+    if (-not $skipVideo) {
+        $dbg = & curl.exe -s "$base/i/$VideoId`?debug=1"
+        Check "/i reports the cached variant" ($dbg -match "Video Info") "$dbg"
+    }
+    $dbg = & curl.exe -s "$base/p?debug=1"
+    $token = ([regex]::Match($dbg, "/p/([A-Z0-9]{4})")).Groups[1].Value
+    Check "/p issues a confirmation token" ($token.Length -eq 4) "$dbg"
+    $dbg = & curl.exe -s "$base/p/ZZZZ?debug=1"
+    Check "a wrong token is rejected" ($dbg -match "Token Rejected") "$dbg"
+    $dbg = & curl.exe -s "$base/p/$token`?debug=1"
+    Check "the issued token purges" ($dbg -match "Cache Purged") "$dbg"
+    $dbg = & curl.exe -s "$base/l?debug=1"
+    Check "cache is empty after purge" ($dbg -match "Nothing cached") "$dbg"
+    $dbg = & curl.exe -s "$base/d/$VideoId`?debug=1"
+    Check "/d on a missing video says so" ($dbg -match "Nothing to Drop") "$dbg"
 
     Section "M2 - mp4 variant and debug view"
     Check "help as mp4"  ((Get-FinalCode "h.mp4") -eq "200") "got $(Get-FinalCode 'h.mp4')"

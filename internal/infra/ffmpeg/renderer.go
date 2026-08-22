@@ -35,6 +35,11 @@ type MessageRenderer struct {
 	// numbers, so each distinct reading hashes differently and would
 	// otherwise accumulate without limit.
 	MaxEntries int
+	// Pinned lists renders that must not be pruned no matter how old:
+	// a stable message URL handed to a player outlives the render that
+	// was current when it was issued, and pruning it turns the next
+	// playback into a 404 (implementation.md §11.3).
+	Pinned func() []string
 
 	mu       sync.Mutex
 	inflight map[string]*sync.Mutex
@@ -223,8 +228,22 @@ func (m *MessageRenderer) prune() {
 	if len(all) <= m.MaxEntries {
 		return
 	}
+	pinned := map[string]bool{}
+	if m.Pinned != nil {
+		for _, k := range m.Pinned() {
+			pinned[k] = true
+		}
+	}
 	sort.Slice(all, func(i, j int) bool { return all[i].mod.After(all[j].mod) })
-	for _, a := range all[m.MaxEntries:] {
+	kept := 0
+	for _, a := range all {
+		if pinned[a.name] {
+			continue
+		}
+		if kept < m.MaxEntries {
+			kept++
+			continue
+		}
 		os.RemoveAll(filepath.Join(m.Dir, a.name))
 	}
 }

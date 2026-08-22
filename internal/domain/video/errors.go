@@ -17,4 +17,11 @@ var (
 	ErrBotDetected   = errors.New("blocked as automated traffic")
 	ErrAgeRestricted = errors.New("age restricted")
 	ErrPackageFailed = errors.New("packaging failed")
+	// ErrTooBusy means MAX_CONCURRENT_JOBS is saturated. Refusing is
+	// preferable to queueing: unbounded parallel resolution is exactly
+	// the traffic shape YouTube blocks (implementation.md §8.2).
+	ErrTooBusy = errors.New("too many jobs running")
+	// ErrGateClosed means the service is not currently serving video
+	// because nobody is detected to be playing (spec §4.4).
+	ErrGateClosed = errors.New("service is offline")
 )

@@ -84,6 +84,17 @@ $env:LISTEN_ADDR = ":8080"
 go run .\cmd\yt-vrc
 ```
 
+**上線閘門會擋住影片端點。** 自 M3 起服務預設 fail-closed：沒有設定
+`DISCORD_BOT_TOKEN` 與 `DISCORD_USER_ID` 時，所有影片端點回傳灰色的
+「Service Offline」訊息影片。要開始看影片，在 VRChat 或瀏覽器輸入一次：
+
+```
+v.gravity.tw/on
+```
+
+有效期預設 4 小時（`GATE_OVERRIDE_TTL`），且會寫入 `data/state/override.json`，
+**重啟後仍然有效**。`/s`、`/h`、`/e` 等管理端點永不受閘門限制。
+
 ### 3.5 確認
 
 ```powershell
@@ -91,7 +102,8 @@ curl.exe -sI https://v.gravity.tw/h
 curl.exe -sL -o NUL -w "%{http_code}`n" https://v.gravity.tw/h
 ```
 
-預期分別為 302 與 200。若回傳 Cloudflare 錯誤 1033 或 404，表示 §3.3 的主機
+兩者都應為 200——訊息影片自 implementation.md §10 起改為**內嵌回傳**，不再轉址
+（AVPro 不跟隨轉址）。若回傳 Cloudflare 錯誤 1033 或 404，表示 §3.3 的主機
 名稱尚未加入。
 
 ---
@@ -161,6 +173,16 @@ Caddy 會自動申請並續期 Let's Encrypt 憑證。
 | 4 | `v.gravity.tw/dQw4w9WgXcQ/720` | 播放且畫質較低 | |
 | 5 | 一支 60 分鐘以上的影片 | 冷啟動 10 秒內開始播放 | |
 
+### 6.1a M3 驗收（上線閘門）
+
+| # | 輸入 | 預期 | 結果 |
+|---|---|---|---|
+| 5a | `v.gravity.tw/dQw4w9WgXcQ`（未先 `/on`） | 灰色「Service Offline」，可播放 | |
+| 5b | `v.gravity.tw/on` | 綠色「Service Forced Online」，顯示到期時間 | |
+| 5c | 重試 5a | 正常播放 | |
+| 5d | `v.gravity.tw/s` | 「Availability: open · manual」 | |
+| 5e | `v.gravity.tw/off` | 綠色「Override Cleared」，之後 5a 又回到離線 | |
+
 ### 6.2 M2 驗收
 
 | # | 輸入 | 預期 | 結果 |
@@ -198,4 +220,6 @@ Caddy 會自動申請並續期 Let's Encrypt 憑證。
 | 錯誤 524 | 冷啟動超過 Cloudflare 的 100 秒上限。改用較短的影片，或採 §4 方案 |
 | 播放到一半停止 | 檢查服務端記錄是否有 ffmpeg 或下載錯誤 |
 | 顯示「Blocked by YouTube」 | 該影片被速率限制，換一支或稍後再試（implementation.md §8.2） |
+| 顯示「Service Offline」 | 上線閘門關閉。輸入 `/on`（§3.4）。`/s` 會說明是哪個來源判定的 |
+| 顯示「Server Busy」 | 同時準備的影片達到 `MAX_CONCURRENT_JOBS`（預設 3），稍候再試 |
 | seek 後畫面錯亂 | 記錄下來——這會推翻 implementation.md §3 的設計假設 |

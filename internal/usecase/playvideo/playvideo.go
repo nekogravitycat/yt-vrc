@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"golang.org/x/sync/singleflight"
@@ -28,6 +29,12 @@ type UseCase struct {
 	PrepareTimeout time.Duration
 	// TempDir holds downloaded tracks; they are deleted once remuxed.
 	TempDir string
+	// MaxJobs caps how many distinct artifacts are prepared at once
+	// (spec §8). Beyond bounding disk and CPU, this is the second half
+	// of the anti-blocking story: singleflight collapses duplicate
+	// requests for one video, and this stops a burst of *different*
+	// videos turning into a burst of yt-dlp calls from one IP.
+	MaxJobs int
 
 	// Two layers of de-duplication (spec §4.7.3). This is not merely an
 	// optimisation: YouTube rate-limits repeated resolution of one
@@ -36,7 +43,48 @@ type UseCase struct {
 	// (docs/implementation.md §8.2).
 	prepareGroup singleflight.Group
 	resolveGroup singleflight.Group
+
+	semOnce sync.Once
+	sem     chan struct{}
 }
+
+// acquire takes a job slot, reporting false when the service is already
+// at its limit. It never waits: a player left staring at a spinner
+// learns nothing, whereas an immediate "N jobs running" message tells
+// the user to come back (spec §10).
+func (u *UseCase) acquire() bool {
+	sem := u.semaphore()
+	if sem == nil {
+		return true
+	}
+	select {
+	case sem <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (u *UseCase) release() {
+	if sem := u.semaphore(); sem != nil {
+		<-sem
+	}
+}
+
+// semaphore builds the slot channel on first use. Every reader goes
+// through here: /s can ask for the job count while a request is still
+// building it, and reading the field directly would race.
+func (u *UseCase) semaphore() chan struct{} {
+	u.semOnce.Do(func() {
+		if u.MaxJobs > 0 {
+			u.sem = make(chan struct{}, u.MaxJobs)
+		}
+	})
+	return u.sem
+}
+
+// ActiveJobs reports how many preparations are running, for /s.
+func (u *UseCase) ActiveJobs() int { return len(u.semaphore()) }
 
 // Prepare returns a ready artifact for id, packaging it if the cache
 // misses. Concurrent callers for the same artifact share one job.
@@ -88,6 +136,11 @@ func (u *UseCase) prepare(ctx context.Context, id video.ID, spec video.OutputSpe
 	if !ok {
 		return nil, fmt.Errorf("no packager for container %q", spec.Container)
 	}
+
+	if !u.acquire() {
+		return nil, fmt.Errorf("%w: %d already running", video.ErrTooBusy, u.MaxJobs)
+	}
+	defer u.release()
 
 	start := time.Now()
 	res, err := u.resolve(ctx, id, spec)

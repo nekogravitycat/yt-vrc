@@ -4,6 +4,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -43,6 +44,36 @@ type Config struct {
 	PrepareTimeout time.Duration
 	MaxDuration    time.Duration
 
+	// MaxConcurrentJobs bounds simultaneous preparations (spec §8).
+	MaxConcurrentJobs int
+
+	// Cache eviction (spec §4.7.2).
+	CacheMaxBytes     int64
+	CacheTargetRatio  float64
+	EventLogEntries   int
+	MessageSlotsLimit int
+
+	// Availability gate (spec §4.4). GateEnabled false removes the
+	// check entirely; with it on and no source configured the gate is
+	// closed and only /on opens it.
+	GateEnabled      bool
+	GateGracePeriod  time.Duration
+	GateOverrideTTL  time.Duration
+	GatePollInterval time.Duration
+
+	DiscordBotToken     string
+	DiscordUserID       string
+	DiscordActivityName string
+
+	// FakeSignalOnline configures the development stand-in for a real
+	// source; FakeSignalSet reports whether it was requested at all.
+	FakeSignalOnline bool
+	FakeSignalSet    bool
+
+	// YtdlpClients is the ordered fallback chain of YouTube player
+	// clients (spec §3.2). Empty means yt-dlp's own default only.
+	YtdlpClients []string
+
 	LogLevel string
 }
 
@@ -64,6 +95,27 @@ func Load() (*Config, error) {
 		PrepareTimeout:      envDur("PREPARE_TIMEOUT", 10*time.Minute),
 		MaxDuration:         envDur("MAX_DURATION", 4*time.Hour),
 		LogLevel:            env("LOG_LEVEL", "info"),
+
+		MaxConcurrentJobs: envInt("MAX_CONCURRENT_JOBS", 3),
+		CacheMaxBytes:     envBytes("CACHE_MAX_BYTES", 50<<30),
+		CacheTargetRatio:  envFloat("CACHE_TARGET_RATIO", 0.8),
+		EventLogEntries:   envInt("EVENT_LOG_ENTRIES", 500),
+		MessageSlotsLimit: envInt("MESSAGE_SLOTS", 200),
+
+		GateEnabled:      envBool("GATE_ENABLED", true),
+		GateGracePeriod:  envDur("GATE_GRACE_PERIOD", 10*time.Minute),
+		GateOverrideTTL:  envDur("GATE_OVERRIDE_TTL", 4*time.Hour),
+		GatePollInterval: envDur("GATE_POLL_INTERVAL", 30*time.Second),
+
+		DiscordBotToken:     os.Getenv("DISCORD_BOT_TOKEN"),
+		DiscordUserID:       os.Getenv("DISCORD_USER_ID"),
+		DiscordActivityName: env("DISCORD_ACTIVITY_NAME", "VRChat"),
+
+		YtdlpClients: envList("YTDLP_CLIENTS", nil),
+	}
+	if v, ok := os.LookupEnv("FAKE_SIGNAL_ONLINE"); ok {
+		c.FakeSignalSet = true
+		c.FakeSignalOnline = v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
 	}
 
 	dq, err := video.ParseQuality(env("DEFAULT_QUALITY", "1080"))
@@ -88,8 +140,17 @@ func Load() (*Config, error) {
 	if c.FetchWorkers < 1 {
 		return nil, fmt.Errorf("FETCH_WORKERS must be >= 1")
 	}
+	if c.MaxConcurrentJobs < 1 {
+		return nil, fmt.Errorf("MAX_CONCURRENT_JOBS must be >= 1")
+	}
+	if c.CacheTargetRatio <= 0 || c.CacheTargetRatio > 1 {
+		return nil, fmt.Errorf("CACHE_TARGET_RATIO must be within (0,1]")
+	}
 	return c, nil
 }
+
+// StateDir is where state that must survive a restart lives (spec §7.1).
+func (c *Config) StateDir() string { return filepath.Join(c.DataDir, "state") }
 
 func env(k, def string) string {
 	if v := os.Getenv(k); v != "" {
@@ -105,6 +166,64 @@ func envInt(k string, def int) int {
 		}
 	}
 	return def
+}
+
+func envBool(k string, def bool) bool {
+	v, ok := os.LookupEnv(k)
+	if !ok || v == "" {
+		return def
+	}
+	return v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
+}
+
+func envFloat(k string, def float64) float64 {
+	if v := os.Getenv(k); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
+	}
+	return def
+}
+
+func envList(k string, def []string) []string {
+	v := os.Getenv(k)
+	if v == "" {
+		return def
+	}
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// envBytes accepts a plain byte count or a suffixed size such as 50GB,
+// because writing out 53687091200 by hand invites typos.
+func envBytes(k string, def int64) int64 {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return def
+	}
+	mult := int64(1)
+	upper := strings.ToUpper(v)
+	for _, s := range []struct {
+		suffix string
+		mult   int64
+	}{{"TB", 1 << 40}, {"GB", 1 << 30}, {"MB", 1 << 20}, {"KB", 1 << 10}, {"T", 1 << 40}, {"G", 1 << 30}, {"M", 1 << 20}, {"K", 1 << 10}} {
+		if strings.HasSuffix(upper, s.suffix) {
+			mult = s.mult
+			v = strings.TrimSpace(upper[:len(upper)-len(s.suffix)])
+			break
+		}
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return def
+	}
+	return n * mult
 }
 
 func envDur(k string, def time.Duration) time.Duration {

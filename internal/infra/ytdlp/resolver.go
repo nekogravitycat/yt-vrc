@@ -5,7 +5,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"os/exec"
 	"strings"
 	"time"
@@ -17,6 +19,35 @@ type Resolver struct {
 	BinPath string
 	Proxy   string // optional egress proxy for metadata only (spec §3.1)
 	Timeout time.Duration
+	// Clients is the ordered list of YouTube player clients to try.
+	// "" or "default" means yt-dlp's own choice, which Phase 0 measured
+	// at 15/15; the rest exist because SABR-only is switched on per
+	// session rather than per client, so the working path can vanish
+	// overnight for everyone at once (spec §3.2).
+	//
+	// The chain is short and only retried on failures a different
+	// client could plausibly fix. Repeated resolution of one video is
+	// itself what triggers YouTube's per-video rate limit
+	// (implementation.md §8.2), so retrying an unavailable or
+	// age-restricted video would trade a clear error for a block.
+	Clients []string
+	Log     *slog.Logger
+}
+
+// DefaultClients is the fallback chain used when none is configured.
+var DefaultClients = []string{"default", "mweb", "tv_embedded"}
+
+func (r *Resolver) clients() []string {
+	if len(r.Clients) == 0 {
+		return DefaultClients
+	}
+	return r.Clients
+}
+
+// worthRetrying reports whether another player client could plausibly
+// succeed where this attempt failed.
+func worthRetrying(err error) bool {
+	return errors.Is(err, video.ErrResolveFailed) || errors.Is(err, video.ErrBotDetected)
 }
 
 // dumpJSON mirrors the subset of yt-dlp's --dump-single-json output we use.
@@ -53,8 +84,32 @@ func (f fmtJSON) size() int64 {
 	return f.FilesizeAp
 }
 
-// Resolve extracts track URLs and metadata for id.
+// Resolve extracts track URLs and metadata for id, walking the client
+// fallback chain until one succeeds.
 func (r *Resolver) Resolve(ctx context.Context, id video.ID, spec video.OutputSpec) (*video.Resolution, error) {
+	clients := r.clients()
+	var lastErr error
+	for i, client := range clients {
+		res, err := r.resolveWith(ctx, id, spec, client)
+		if err == nil {
+			if i > 0 && r.Log != nil {
+				r.Log.Warn("resolved via fallback client", "id", id, "client", client, "attempts", i+1)
+			}
+			return res, nil
+		}
+		lastErr = err
+		if !worthRetrying(err) || i == len(clients)-1 {
+			break
+		}
+		if r.Log != nil {
+			r.Log.Warn("resolve failed, trying next client",
+				"id", id, "client", client, "next", clients[i+1], "err", err)
+		}
+	}
+	return nil, lastErr
+}
+
+func (r *Resolver) resolveWith(ctx context.Context, id video.ID, spec video.OutputSpec, client string) (*video.Resolution, error) {
 	if r.Timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, r.Timeout)
@@ -69,6 +124,9 @@ func (r *Resolver) Resolve(ctx context.Context, id video.ID, spec video.OutputSp
 	}
 	if r.Proxy != "" {
 		args = append(args, "--proxy", r.Proxy)
+	}
+	if client != "" && client != "default" {
+		args = append(args, "--extractor-args", "youtube:player_client="+client)
 	}
 	args = append(args, "https://www.youtube.com/watch?v="+id.String())
 
@@ -101,6 +159,8 @@ func (r *Resolver) Resolve(ctx context.Context, id video.ID, spec video.OutputSp
 	case 0:
 		// Progressive: one URL carries both tracks.
 		if d.URL == "" {
+			// Retryable: this is what SABR-only looks like from here --
+			// metadata resolves but no format carries a download URL.
 			return nil, fmt.Errorf("%w: no playable format found", video.ErrResolveFailed)
 		}
 		t := video.Track{URL: d.URL, Codec: d.VCodec, Height: d.Height, SizeBytes: d.Filesize}

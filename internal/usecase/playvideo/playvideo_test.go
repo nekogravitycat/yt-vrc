@@ -305,3 +305,43 @@ func TestRetryAfterFailure(t *testing.T) {
 		t.Errorf("resolver called %d times, want 2", got)
 	}
 }
+
+// MAX_CONCURRENT_JOBS is the other half of the anti-blocking story:
+// singleflight collapses duplicate requests for one video, this stops a
+// burst of different videos becoming a burst of yt-dlp calls (spec §8).
+func TestConcurrentJobLimitRefusesRatherThanQueueing(t *testing.T) {
+	u, res, _ := newUseCase(t)
+	u.MaxJobs = 1
+	res.release = make(chan struct{})
+
+	first := make(chan error, 1)
+	go func() {
+		_, err := u.Prepare(context.Background(), testID, testSpec)
+		first <- err
+	}()
+
+	// Wait for the first job to be holding the only slot.
+	deadline := time.Now().Add(2 * time.Second)
+	for u.ActiveJobs() == 0 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	const otherID video.ID = "BGXOYfZMR0w"
+	_, err := u.Prepare(context.Background(), otherID, testSpec)
+	if !errors.Is(err, video.ErrTooBusy) {
+		t.Fatalf("second video: err = %v, want ErrTooBusy", err)
+	}
+
+	close(res.release)
+	if err := <-first; err != nil {
+		t.Fatalf("first video: %v", err)
+	}
+	if u.ActiveJobs() != 0 {
+		t.Fatalf("slot not released: %d still held", u.ActiveJobs())
+	}
+
+	// The refusal must not poison the key.
+	if _, err := u.Prepare(context.Background(), otherID, testSpec); err != nil {
+		t.Fatalf("retry after a busy refusal: %v", err)
+	}
+}

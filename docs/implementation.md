@@ -467,3 +467,119 @@ playlist 直接於影片網址回傳後，ffmpeg 寫入的相對 segment 名稱
 若沿用 spec §4.2.1 由 duration 推算的預先生成 playlist，此處就會偏移。
 
 **至此 M1 與 M2 的驗收條件（spec §12）全部達成。**
+
+---
+
+## 12. M3 完成紀錄：上線閘門（2026-08-22）
+
+### 12.1 已實作
+
+| 元件 | 路徑 | 備註 |
+|---|---|---|
+| `Signal` 介面、`Status`、`Confidence` | `internal/domain/availability/signal.go` | 依 spec §6.3.1 |
+| `Gate` 聚合（OR、去抖動、覆寫） | `internal/domain/availability/gate.go` | 含背景輪詢 |
+| Discord Presence 訊號 | `internal/infra/signal/discord.go` | **未實測**，見 §12.4 |
+| Fake 訊號（開發用） | `internal/infra/signal/fake.go` | `FAKE_SIGNAL_ONLINE` |
+| 覆寫持久化、事件記錄 | `internal/infra/state/state.go` | `/data/state/` |
+| `/on`、`/off`、`/e` 端點 | `internal/adapter/httpapi/command.go` | |
+
+### 12.2 決策：無訊號來源時 fail-closed
+
+`GATE_ENABLED` 預設 `true`。**啟用且沒有任何訊號來源時，閘門為關閉**，只有 `/on` 能打開。
+
+理由：一個沒設定的偵測器不構成「有人正在玩」的證據。逃生門是 spec §4.4.1 已經要求的——命令端點完全不受閘門限制，所以 `/s` 永遠能診斷、`/on` 永遠能打開。
+
+**這對現行部署有直接影響**：`v.gravity.tw` 在取得 Discord 憑證前，每次重啟後都需要在 VRChat 內輸入一次 `/on`（預設有效 4 小時，`GATE_OVERRIDE_TTL`）。這是刻意保留的行為，不設過渡用的假訊號。
+
+### 12.3 手動覆寫必須持久化
+
+覆寫寫入 `/data/state/override.json`，重啟後仍然生效。
+
+這在 fail-closed 之下不是選配：若重啟遺忘了一個有效的 `/on`，服務會**靜默地**整個停擺，而唯一能察覺的方式是戴上頭盔發現影片播不出來。
+
+### 12.4 Discord 實作的狀態
+
+依 discordgo 的文件行為寫成，**尚未以真實 Bot 驗證**（憑證未取得）。已處理的兩個要點：
+
+- 訂閱 `GUILD_CREATE` 取得**初始 presence 快照**。只處理 `PRESENCE_UPDATE` 會讓閘門一直關到使用者下次切換活動為止
+- Gateway 未連線時 `Status` 回傳 **error 而非 stale offline**。Gate 把 errored 來源視為「沒有證據」，由 `GATE_GRACE_PERIOD` 的去抖動吸收短暫斷線
+
+需要在 Developer Portal 啟用 **Presence Intent**（privileged），且 Bot 必須與被監測的使用者同在一個 guild——presence 只會逐 guild 傳遞。
+
+### 12.5 `/off` 的語意
+
+依 spec §4.1.3，`/off` 是「解除手動覆寫、回歸自動偵測」，**不是**「強制關閉」。這一對是「接手」與「交還」，不是開與關。強制關閉仍可經由 `Gate.SetOverride(false, …)` 表達，但沒有端點暴露它。
+
+---
+
+## 13. §11.3 訊息影片網址問題的修正（2026-08-22）
+
+### 13.1 做法：穩定 slot 路徑
+
+命令端點的媒體改由**穩定的具名 slot** 交付，內容雜湊退回為純粹的磁碟去重鍵：
+
+```
+GET /s  → 200 master.m3u8（no-store）
+             /m/status_hls/media.m3u8
+GET /m/status_hls/media.m3u8  → 查 slot 表 → 目前的雜湊目錄
+```
+
+- slot 名稱描述**訊息關於什麼**（`status`、`help`、`v-{videoID}`、`gate`），從不描述它**當下說什麼**
+- slot 表持久化於 `/data/state/slots.json`——VRChat 記住的是它解析到的媒體網址，重啟後忘記對應就會回 404
+- slot 路徑一律 `no-store`；未登記於 slot 表的路徑段視為內容雜湊，仍為 `immutable`
+- **被 slot 指到的產物不可被 `MESSAGE_CACHE_ENTRIES` 淘汰**（`MessageRenderer.Pinned`）。一個已經交給播放器的 slot 網址，壽命長於當時的那份算繪
+
+### 13.2 驗證
+
+`scripts/verify.ps1` 新增 5 項：`/s` 的媒體網址在快取統計改變前後**相同**、是具名 slot、先前取得的網址仍然 200、slot 為 `no-store`、影片產物仍為 `immutable`。
+
+---
+
+## 14. M5 進度（2026-08-22）
+
+### 14.1 已完成
+
+| 項目 | 實作 |
+|---|---|
+| 雙層 singleflight | §9（先前完成） |
+| `MAX_CONCURRENT_JOBS` | `playvideo` 的 semaphore，**額滿立即拒絕不排隊** |
+| LRU 淘汰 | `FSStore.evict()`，`CACHE_MAX_BYTES` / `CACHE_TARGET_RATIO` |
+| client fallback 鏈 | `ytdlp.Resolver.Clients` |
+| `/l`、`/e`、`/p`、`/d`、`/i` | 全部完成 |
+
+**`MAX_CONCURRENT_JOBS` 額滿時立即回「Server Busy」訊息影片，不排隊。**排隊會讓使用者面對無回應的播放器；而且不受限的併發解析正是 YouTube 封鎖的流量形狀（§8.2）。
+
+**client fallback 只在「換一個 client 有機會成功」的錯誤上重試**——`ErrResolveFailed` 與 `ErrBotDetected`。影片不存在、年齡限制、直播都是影片本身的事實，重試只會多送請求、逼近每支影片的速率限制。預設鏈為 `default,mweb,tv_embedded`；第一順位是 yt-dlp 自己的選擇（Phase 0 實測 15/15），所以正常情況下 fallback 不花任何成本。
+
+### 14.2 決策：**廢除**長影片 segment 滑動視窗（取代 spec §4.7.2 的該段）
+
+spec 要求超過 30 分鐘的影片以滑動視窗保留 segment，其餘可淘汰並於需要時重新產生。**此項不實作。**
+
+理由：§3 的架構修訂後，segment 由**單一 ffmpeg pass** 產出。淘汰其中幾個之後，要重生任何一個都必須重新下載兩條軌並重新 remux 整支影片——等於用一次必然的昂貴重跑，去換取少量空間。而 1080p 實測約 3.5 MB/分鐘，50 GB 可容納約 240 小時影片；以本專案 5 人以內的規模，整支影片粒度的 LRU 已經足夠。
+
+若日後真的撞到容量上限，成本更低的方向是限制單支影片的大小（超過門檻改用較低畫質），而不是部分淘汰。
+
+### 14.3 尚未實作
+
+- `/w`（預熱）、`/r`（強制重解析）——屬 M6
+- `/u`（yt-dlp 熱更新）、健康度指標與主動探測——屬 M4
+- MP4 packager（影片本體；訊息影片的 MP4 已可用）——屬 M6
+
+---
+
+## 15. 新增的設定（補充 spec §8）
+
+| 變數 | 預設 | 說明 |
+|---|---|---|
+| `GATE_ENABLED` | `true` | `false` 完全移除閘門檢查 |
+| `GATE_GRACE_PERIOD` | `10m` | 離線去抖動延遲 |
+| `GATE_OVERRIDE_TTL` | `4h` | `/on` 的有效期 |
+| `GATE_POLL_INTERVAL` | `30s` | 背景重新評估週期。**必要**：去抖動由「最後一次觀測到上線」起算，沒有請求時無人觀測 |
+| `FAKE_SIGNAL_ONLINE` | 未設定 | 設定即啟用開發用假訊號（`true`／`false`） |
+| `DISCORD_BOT_TOKEN` / `DISCORD_USER_ID` / `DISCORD_ACTIVITY_NAME` | — / — / `VRChat` | 兩者皆設定才會啟用 Discord 訊號 |
+| `MAX_CONCURRENT_JOBS` | `3` | 同時準備的產物上限 |
+| `CACHE_MAX_BYTES` | `50GB` | 接受 `50GB`、`500MB` 等字尾寫法 |
+| `CACHE_TARGET_RATIO` | `0.8` | 淘汰目標水位 |
+| `EVENT_LOG_ENTRIES` | `500` | `events.jsonl` 保留筆數 |
+| `MESSAGE_SLOTS` | `200` | slot 表上限 |
+| `YTDLP_CLIENTS` | `default,mweb,tv_embedded` | client fallback 鏈 |

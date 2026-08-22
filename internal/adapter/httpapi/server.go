@@ -7,10 +7,14 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nekogravitycat/yt-vrc/internal/adapter/presenter"
+	"github.com/nekogravitycat/yt-vrc/internal/domain/availability"
+	"github.com/nekogravitycat/yt-vrc/internal/domain/event"
 	"github.com/nekogravitycat/yt-vrc/internal/domain/message"
 	"github.com/nekogravitycat/yt-vrc/internal/domain/video"
 	"github.com/nekogravitycat/yt-vrc/internal/infra/ffmpeg"
@@ -29,11 +33,76 @@ type Server struct {
 	Defaults Defaults
 	Log      *slog.Logger
 	Version  string
+	// StateDir is where the slot table is persisted so message URLs
+	// keep resolving across a restart ({DATA_DIR}/state).
+	StateDir string
+	// MaxSlots bounds the slot table; one slot exists per command and
+	// per video that has produced a message.
+	MaxSlots int
+	// Gate decides whether video endpoints serve. Nil disables the
+	// check entirely, which is how the tests and a gate-less
+	// deployment run.
+	Gate Gate
+	// Events is the small rolling record /e reads.
+	Events event.Log
+	// OverrideTTL is how long /on holds for.
+	OverrideTTL time.Duration
+	// CacheLimitBytes is reported by /s; enforcement lives in the store.
+	CacheLimitBytes int64
+
+	slotsOnce sync.Once
+	slots     *slotTable
+
+	mu          sync.Mutex
+	purgeToken  string
+	purgeExpiry time.Time
 }
+
+// Gate is the availability decision the video endpoints consult. It is
+// declared here rather than imported wholesale so the HTTP layer depends
+// only on what it actually calls.
+type Gate interface {
+	IsOpen(ctx context.Context) (bool, availability.Reason)
+	Reason() availability.Reason
+	Sources() []availability.SourceStatus
+	SetOverride(open bool, until time.Time)
+	ClearOverride()
+}
+
+// slotTable returns the message slot table, building it on first use.
+func (s *Server) slotTable() *slotTable {
+	s.slotsOnce.Do(func() {
+		max := s.MaxSlots
+		if max <= 0 {
+			max = 200
+		}
+		var path string
+		if s.StateDir != "" {
+			path = filepath.Join(s.StateDir, "slots.json")
+		}
+		s.slots = newSlotTable(path, max)
+	})
+	return s.slots
+}
+
+// PinnedMessages lists the renders that message URLs currently point at,
+// for the renderer to exclude from pruning.
+func (s *Server) PinnedMessages() []string { return s.slotTable().pinned() }
 
 // messagePrefix namespaces rendered messages so they cannot collide with
 // video cache keys.
 const messagePrefix = "m"
+
+const (
+	// cacheImmutable suits artifacts published only once complete and
+	// addressed by a key encoding id, quality and container: their bytes
+	// never change. Saying so keeps repeat viewers off the origin
+	// entirely -- the common case when several people watch together.
+	cacheImmutable = "public, max-age=31536000, immutable"
+	// cacheNever suits every message URL, whose contents move with the
+	// service state.
+	cacheNever = "no-store"
+)
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -50,14 +119,22 @@ func isAssetFile(name string) bool {
 func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 	segs := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 
-	// Rendered message media: /m/{hash}_{container}/{file}
+	// Rendered message media: /m/{slot}/{file}, falling back to a bare
+	// {hash}_{container} for anything not currently held by a slot.
 	if len(segs) == 3 && segs[0] == messagePrefix && isAssetFile(segs[2]) {
-		s.serveFrom(w, r, s.Messages.Open, video.CacheKey(segs[1]), segs[2])
+		key, stable := s.slotTable().resolve(segs[1])
+		cache := cacheImmutable
+		if stable {
+			// What a slot points at changes with the service state, so
+			// nothing along the path may hold a copy.
+			cache = cacheNever
+		}
+		s.serveFrom(w, r, s.Messages.Open, key, segs[2], cache)
 		return
 	}
 	// Video artifact files: /{cachekey}/{file}
 	if len(segs) == 2 && isAssetFile(segs[1]) && strings.Count(segs[0], "_") == 2 {
-		s.serveFrom(w, r, s.Play.Open, video.CacheKey(segs[0]), segs[1])
+		s.serveFrom(w, r, s.Play.Open, video.CacheKey(segs[0]), segs[1], cacheImmutable)
 		return
 	}
 
@@ -70,7 +147,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 
 	route, err := ParsePath(raw, s.Defaults)
 	if err != nil {
-		s.deliver(w, r, presenter.Unrecognised(), s.Defaults.spec(), http.StatusNotFound)
+		s.deliver(w, r, pathSlot(raw), presenter.Unrecognised(), s.Defaults.spec(), http.StatusNotFound)
 		return
 	}
 
@@ -83,10 +160,23 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) serveVideo(w http.ResponseWriter, r *http.Request, route Route) {
+	// The gate covers video only. Management endpoints stay reachable
+	// so the service can be diagnosed and reopened from inside VRChat
+	// (spec §4.4.1).
+	if s.Gate != nil {
+		if open, reason := s.Gate.IsOpen(r.Context()); !open {
+			s.Log.Info("gate closed", "id", route.VideoID, "source", reason.Source)
+			s.deliver(w, r, "gate", presenter.GateClosed(reason), route.Spec, http.StatusServiceUnavailable)
+			return
+		}
+	}
+
 	asset, err := s.Play.Prepare(r.Context(), route.VideoID, route.Spec)
 	if err != nil {
 		s.Log.Error("prepare failed", "id", route.VideoID, "err", err)
-		s.deliver(w, r, presenter.PrepareError(route.VideoID, err), route.Spec, statusFor(err))
+		s.record(event.Event{Kind: event.KindError, VideoID: route.VideoID.String(),
+			Summary: presenter.ErrorSummary(err), Detail: err.Error()})
+		s.deliver(w, r, "v-"+route.VideoID.String(), presenter.PrepareError(route.VideoID, err), route.Spec, statusFor(err))
 		return
 	}
 	w.Header().Set("Cache-Control", "public, max-age=60")
@@ -101,7 +191,7 @@ func (s *Server) serveVideo(w http.ResponseWriter, r *http.Request, route Route)
 		s.servePlaylist(w, r, s.Play.Open, asset.Key, "/"+string(asset.Key)+"/")
 		return
 	}
-	s.serveFrom(w, r, s.Play.Open, asset.Key, "video.mp4")
+	s.serveFrom(w, r, s.Play.Open, asset.Key, "video.mp4", cacheImmutable)
 }
 
 // deliver renders a view and points the player at it.
@@ -109,18 +199,18 @@ func (s *Server) serveVideo(w http.ResponseWriter, r *http.Request, route Route)
 // The player is the only display this user has, so the response body is
 // always media (spec §10). The classification still reaches the logs,
 // and ?debug=1 returns it as text for terminal debugging.
-func (s *Server) deliver(w http.ResponseWriter, r *http.Request, v message.View, spec video.OutputSpec, code int) {
+//
+// name identifies what the message is about -- a command, a video --
+// never what it currently says. It becomes the slot the media is served
+// under, so the same input always yields the same media URL even as the
+// content behind it changes (see slots.go).
+func (s *Server) deliver(w http.ResponseWriter, r *http.Request, name string, v message.View, spec video.OutputSpec, code int) {
 	if r.URL.Query().Has("debug") {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(code)
 		writeViewText(w, v)
 		return
 	}
-
-	// The target is content-addressed and immutable, but which message
-	// a command maps to changes with the service state, so the redirect
-	// itself must never be cached.
-	w.Header().Set("Cache-Control", "no-store")
 
 	asset, err := s.Messages.Render(r.Context(), v, spec)
 	if err != nil {
@@ -131,6 +221,14 @@ func (s *Server) deliver(w http.ResponseWriter, r *http.Request, v message.View,
 		writeViewText(w, v)
 		return
 	}
+
+	slot := slotFor(name, spec.Container)
+	s.slotTable().set(slot, asset.Key)
+
+	// Which render a slot resolves to moves with the service state, so
+	// neither this response nor anything under the slot may be cached.
+	w.Header().Set("Cache-Control", cacheNever)
+
 	// Deliberately 200, whatever the classification. The body is the
 	// only thing the user can perceive, and a player refuses to render
 	// the body of a 4xx -- an error message video that will not play
@@ -138,15 +236,15 @@ func (s *Server) deliver(w http.ResponseWriter, r *http.Request, v message.View,
 	// and ?debug=1 instead (spec §10, docs/implementation.md §7.3).
 	if spec.Container == video.ContainerHLS {
 		s.servePlaylist(w, r, s.Messages.Open, asset.Key,
-			"/"+messagePrefix+"/"+string(asset.Key)+"/")
+			"/"+messagePrefix+"/"+slot+"/")
 		return
 	}
-	s.serveFrom(w, r, s.Messages.Open, asset.Key, ffmpeg.MessageEntrypoint(spec.Container))
+	s.serveFrom(w, r, s.Messages.Open, asset.Key, ffmpeg.MessageEntrypoint(spec.Container), cacheNever)
 }
 
 type opener func(key video.CacheKey, name string) (io.ReadSeekCloser, time.Time, error)
 
-func (s *Server) serveFrom(w http.ResponseWriter, r *http.Request, open opener, key video.CacheKey, name string) {
+func (s *Server) serveFrom(w http.ResponseWriter, r *http.Request, open opener, key video.CacheKey, name, cacheControl string) {
 	f, modTime, err := open(key, name)
 	if err != nil {
 		http.Error(w, "not found", http.StatusNotFound)
@@ -154,11 +252,7 @@ func (s *Server) serveFrom(w http.ResponseWriter, r *http.Request, open opener, 
 	}
 	defer f.Close()
 
-	// Artifacts are published only once complete and are addressed by a
-	// key encoding id, quality and container, so their bytes never
-	// change. Telling a CDN that keeps repeat viewers off the origin
-	// entirely -- the common case when several people watch together.
-	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	w.Header().Set("Cache-Control", cacheControl)
 
 	switch {
 	case strings.HasSuffix(name, ".m3u8"):
@@ -182,6 +276,8 @@ func statusFor(err error) int {
 		return http.StatusUnprocessableEntity
 	case errorIs(err, video.ErrInvalidVideoID):
 		return http.StatusBadRequest
+	case errorIs(err, video.ErrTooBusy):
+		return http.StatusServiceUnavailable
 	case errorIs(err, context.DeadlineExceeded):
 		return http.StatusGatewayTimeout
 	default:
