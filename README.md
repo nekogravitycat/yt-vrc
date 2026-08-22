@@ -2,8 +2,10 @@
 
 把 YouTube 影片即時重新封裝成 VRChat 播放器能直接播放的串流。
 
+- **現況與交接：[`docs/handoff.md`](docs/handoff.md)** ← 從這裡開始
 - 需求與設計：[`docs/spec.md`](docs/spec.md)
-- 實作決策與實測紀錄：[`docs/implementation.md`](docs/implementation.md)
+- 實作決策與實測紀錄：[`docs/implementation.md`](docs/implementation.md)（與 spec 衝突時以此為準）
+- 部署與 VRChat 實測：[`docs/deployment.md`](docs/deployment.md)
 
 ## 開發
 
