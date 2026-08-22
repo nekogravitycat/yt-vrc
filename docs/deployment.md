@@ -135,8 +135,15 @@ Caddy 會自動申請並續期 Let's Encrypt 憑證。
 **快取行為**：本服務已設定適當的 `Cache-Control`——媒體檔案為
 `immutable, max-age=31536000`（產物只在封裝完成後才發布，位址包含
 影片 ID、畫質與容器，內容永不改變），命令端點的導向為 `no-store`
-（哪一支訊息影片會隨服務狀態改變）。因此多人同時觀看時，Cloudflare
-會直接由邊緣節點提供 segment，來源機器不會重複承載。
+（哪一支訊息影片會隨服務狀態改變）。
+
+**但實測顯示 Cloudflare 目前並未快取 segment**（`cf-cache-status: DYNAMIC`）。
+原因是 `.ts` 與 `.m3u8` 不在 Cloudflare 預設的可快取副檔名清單中，服務端
+送出的 `Cache-Control` 不足以改變此行為，需另外建立 **Cache Rule
+（Cache Everything）**。
+
+因此目前**所有流量均由來源機器承載**。以 5 人規模無妨；若要啟用邊緣快取，
+請一併考量 §2.1 的服務條款問題——啟用影片快取正是該條款針對的行為。
 
 ---
 
