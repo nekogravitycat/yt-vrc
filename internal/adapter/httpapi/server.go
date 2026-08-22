@@ -93,6 +93,9 @@ func (s *Server) serveVideo(w http.ResponseWriter, r *http.Request, route Route)
 	if asset.Spec.Container == video.ContainerMP4 {
 		entry = "video.mp4"
 	}
+	// Deterministic, but kept short so a dropped artifact is re-prepared
+	// rather than redirected to for a year.
+	w.Header().Set("Cache-Control", "public, max-age=60")
 	// Redirect so the player resolves segment URLs against the
 	// artifact directory rather than the request path.
 	http.Redirect(w, r, "/"+string(asset.Key)+"/"+entry, http.StatusFound)
@@ -110,6 +113,11 @@ func (s *Server) deliver(w http.ResponseWriter, r *http.Request, v message.View,
 		writeViewText(w, v)
 		return
 	}
+
+	// The target is content-addressed and immutable, but which message
+	// a command maps to changes with the service state, so the redirect
+	// itself must never be cached.
+	w.Header().Set("Cache-Control", "no-store")
 
 	asset, err := s.Messages.Render(r.Context(), v, spec)
 	if err != nil {
@@ -134,6 +142,12 @@ func (s *Server) serveFrom(w http.ResponseWriter, r *http.Request, open opener, 
 		return
 	}
 	defer f.Close()
+
+	// Artifacts are published only once complete and are addressed by a
+	// key encoding id, quality and container, so their bytes never
+	// change. Telling a CDN that keeps repeat viewers off the origin
+	// entirely -- the common case when several people watch together.
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 
 	switch {
 	case strings.HasSuffix(name, ".m3u8"):

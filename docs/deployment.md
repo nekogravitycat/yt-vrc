@@ -1,0 +1,204 @@
+# 部署與 VRChat 實測
+
+本文件說明如何把 yt-vrc 暴露到 `v.gravity.tw` 並在 VRChat 中完成 M1 驗收。
+
+---
+
+## 1. 為什麼需要對外暴露
+
+AVPro（VRChat 的播放器核心）**對 TLS 憑證驗證嚴格，自簽憑證必定失敗**
+（spec §9.2）。因此無法以 `localhost` 或自簽憑證完成實測，必須有一個
+受信任憑證的公開網址。
+
+---
+
+## 2. 兩種路徑
+
+| 方案 | Cloudflare Tunnel | DNS-only + Caddy |
+|---|---|---|
+| 連接埠轉發 | **不需要** | 需要（80/443） |
+| TLS 憑證 | Cloudflare 自動提供 | Let's Encrypt，Caddy 自動處理 |
+| 來源 IP | 隱藏 | 暴露 |
+| 媒體流量路徑 | 經 Cloudflare 網路 | 直連 |
+| 適合 | 實驗室網路、快速測試 | 長期自主運行 |
+
+### 2.1 需要知道的取捨
+
+**Cloudflare 服務條款 §2.8** 限制在非 Enterprise 方案上以 CDN 大量提供影片
+等非 HTML 內容（Cloudflare Stream 除外）。本專案的性質正是影片傳遞。以本專案
+的規模（5 人以內、間歇使用）實際被稽核的可能性低，但這是條款的字面規定，
+**採用與否是你的決定**。若要完全避開，用 §4 的 DNS-only 方案，Cloudflare 僅
+負責 DNS，媒體流量不經過其網路。
+
+**Cloudflare 免費方案有 100 秒的來源逾時（錯誤 524）**。實測冷啟動：75 分鐘
+影片 8.1 秒，3 小時影片推估約 20 秒，都在範圍內。但超長影片仍可能觸及上限，
+建議設定 `MAX_DURATION` 明確拒絕。
+
+---
+
+## 3. Cloudflare Tunnel（建議先用這個做實測）
+
+`cloudflared` 已安裝於開發機（2025.11.1）。
+
+### 3.1 登入（互動式，需你自己執行）
+
+在 Claude Code 中可用 `!` 前綴執行，輸出會留在對話裡：
+
+```
+! cloudflared tunnel login
+```
+
+會開啟瀏覽器要你選擇 `gravity.tw` 這個 zone。完成後會產生
+`~/.cloudflared/cert.pem`。
+
+### 3.2 建立通道並綁定網域
+
+```powershell
+cloudflared tunnel create yt-vrc
+cloudflared tunnel route dns yt-vrc v.gravity.tw
+```
+
+第一行會輸出一個 tunnel UUID 並產生 `~/.cloudflared/<UUID>.json`（憑證，
+**勿提交至版本控制**）。第二行自動在 Cloudflare 建立 CNAME 並設為 Proxied。
+
+### 3.3 設定檔
+
+建立 `~/.cloudflared/config.yml`：
+
+```yaml
+tunnel: yt-vrc
+credentials-file: C:\Users\gravity\.cloudflared\<UUID>.json
+
+ingress:
+  - hostname: v.gravity.tw
+    service: http://localhost:8080
+    originRequest:
+      # 冷啟動時請求會阻塞至封裝完成；放寬以容納長影片
+      connectTimeout: 30s
+      # 不緩衝回應，維持 HLS 的即時性（spec §9.2）
+      disableChunkedEncoding: false
+  - service: http_status:404
+```
+
+### 3.4 啟動
+
+兩個終端機：
+
+```powershell
+# 終端機 1：服務本體
+cd C:\Users\gravity\Documents\Repositories\gravity\yt-vrc
+$env:DATA_DIR = ".\data"
+$env:LOG_LEVEL = "info"
+go run .\cmd\yt-vrc
+```
+
+```powershell
+# 終端機 2：通道
+cloudflared tunnel run yt-vrc
+```
+
+### 3.5 上線前確認
+
+```powershell
+curl.exe -sI https://v.gravity.tw/h            # 應為 302
+curl.exe -sL -o NUL -w "%{http_code}`n" https://v.gravity.tw/h   # 應為 200
+```
+
+---
+
+## 4. 替代方案：DNS-only + Caddy
+
+若不想讓媒體流量經過 Cloudflare：
+
+1. Cloudflare DNS 中將 `v.gravity.tw` 的 A 記錄指向你的固定 IP，
+   **代理狀態設為 DNS only（灰雲）**
+2. 路由器將 80/443 轉發至該機器
+3. `Caddyfile`：
+
+```
+v.gravity.tw {
+	reverse_proxy localhost:8080 {
+		# 不緩衝，維持 HLS 即時性；放寬逾時以容納冷啟動
+		flush_interval -1
+		transport http {
+			read_timeout 300s
+		}
+	}
+}
+```
+
+Caddy 會自動申請並續期 Let's Encrypt 憑證。
+
+---
+
+## 5. Cloudflare 設定注意事項
+
+若採用 Tunnel（流量經 Cloudflare 代理）：
+
+| 項目 | 建議 | 理由 |
+|---|---|---|
+| SSL/TLS 模式 | Full | Tunnel 已加密至來源 |
+| Caching Level | Standard | 產物不可變，快取有益 |
+| Always Online | 關閉 | 可能提供過期的播放清單 |
+| Rocket Loader / Minify | 無所謂 | 本服務不提供 HTML/JS |
+
+**快取行為**：本服務已設定適當的 `Cache-Control`——媒體檔案為
+`immutable, max-age=31536000`（產物只在封裝完成後才發布，位址包含
+影片 ID、畫質與容器，內容永不改變），命令端點的導向為 `no-store`
+（哪一支訊息影片會隨服務狀態改變）。因此多人同時觀看時，Cloudflare
+會直接由邊緣節點提供 segment，來源機器不會重複承載。
+
+---
+
+## 6. VRChat 實測檢查表
+
+在有影片播放器的世界中依序輸入，並記錄結果：
+
+### 6.1 M1 驗收（spec §12）
+
+| # | 輸入 | 預期 | 結果 |
+|---|---|---|---|
+| 1 | `v.gravity.tw/dQw4w9WgXcQ` | 1080p 正常播放 | |
+| 2 | 同上，拖動進度條至中段 | seek 正確、畫面對應 | |
+| 3 | 同上，拖動至末段 | 可跳轉、無異常 | |
+| 4 | `v.gravity.tw/dQw4w9WgXcQ/720` | 播放且畫質較低 | |
+| 5 | 一支 60 分鐘以上的影片 | 冷啟動 10 秒內開始播放 | |
+
+### 6.2 M2 驗收
+
+| # | 輸入 | 預期 | 結果 |
+|---|---|---|---|
+| 6 | `v.gravity.tw/s` | 藍色狀態畫面，文字清晰可讀 | |
+| 7 | `v.gravity.tw/h` | 說明畫面 | |
+| 8 | `v.gravity.tw/aaaaaaaaaaa` | 紅色「Video Unavailable」 | |
+| 9 | `v.gravity.tw/notacommand` | 紅色「Unrecognised Command」 | |
+
+### 6.3 併發去重（spec §12 M5 驗收）
+
+| # | 操作 | 預期 | 結果 |
+|---|---|---|---|
+| 10 | 找朋友同時在同一 instance 貼同一個新影片網址 | 都能播放；伺服器記錄中 `"msg":"resolved"` 只出現一次 | |
+
+檢查方式：於服務端終端機觀察輸出，或
+`Select-String -Path <log> -Pattern '"msg":"resolved"'`。
+
+### 6.4 需要一併記錄的觀察（spec §13.1 待驗證項目）
+
+- **訊息影片的文字在 VR 中夠不夠大？** 目前字級為畫面高度的 1/19
+  （spec §4.3.3 要求不小於 1/20）。若不易閱讀，調整
+  `internal/infra/render/png.go` 的 `bodySize`
+- **VRChat 的影片載入逾時上限為何？** 找一支長到冷啟動超過 10 秒的影片，
+  觀察播放器在放棄前等待多久。此數值決定 `MAX_DURATION` 的合理設定
+- **AVPro 是否接受 15 秒的訊息影片？** spec §13.1 第 3 項推測 15 秒為保守值
+
+---
+
+## 7. 疑難排解
+
+| 症狀 | 可能原因 |
+|---|---|
+| 播放器完全無反應 | 憑證問題。以瀏覽器開啟同一網址確認憑證受信任 |
+| 錯誤 524 | 冷啟動超過 Cloudflare 的 100 秒上限。改用較短的影片，或採 §4 方案 |
+| 播放到一半停止 | 檢查服務端記錄是否有 ffmpeg 或下載錯誤 |
+| 顯示「Blocked by YouTube」 | 該影片被速率限制，換一支或稍後再試（implementation.md §8.2） |
+| seek 後畫面錯亂 | 記錄下來——這會推翻 implementation.md §3 的設計假設 |

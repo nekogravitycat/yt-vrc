@@ -2,3 +2,6 @@
 /bin/
 *.exe
 .env
+
+.cloudflared/
+*.pem
