@@ -1,0 +1,17 @@
+# gofmt, golangci-lint and .githooks/pre-commit all assume LF. With
+# core.autocrlf=true -- the usual Windows default, and what this repo is
+# developed under -- a plain `git checkout` hands the file back as CRLF,
+# and gofmt then rejects the whole file on its line endings alone. That
+# reads as "your code is unformatted" when nothing is wrong with it, and
+# it fires on whichever file someone happened to check out last.
+#
+# The hook itself is the sharper edge: it is a POSIX shell script, and a
+# CRLF copy breaks the shebang outright on Linux.
+#
+# Pin the working tree here so none of this depends on how any one clone
+# has autocrlf set. Blobs are already stored LF, so this changes nothing
+# in history -- only what lands on disk.
+* text=auto eol=lf
+
+# Embedded verbatim by internal/infra/render; keep every text filter off.
+*.otf binary
