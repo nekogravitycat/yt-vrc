@@ -45,8 +45,11 @@ func page(n int) message.View {
 
 // CRITICAL: the concat demuxer ignores the last entry's duration unless
 // the file is listed again, which would make the final page flash past
-// in a single frame. Assert the list itself, so a regression here fails
-// loudly rather than showing up as a page nobody can read.
+// in a single frame -- and the repeat must come out of the final page's
+// own slot, since a list running past encode's -t loses the tail hold
+// and cuts the clip short at the second-to-last page. Assert the list
+// itself, so a regression here fails loudly rather than showing up as a
+// page nobody can read.
 func TestVideoInputRepeatsFinalPage(t *testing.T) {
 	dir := t.TempDir()
 	m := &MessageRenderer{Dir: dir, Seconds: 15}
@@ -71,9 +74,24 @@ func TestVideoInputRepeatsFinalPage(t *testing.T) {
 	if n := strings.Count(got, "page_02.png"); n != 2 {
 		t.Errorf("final page listed %d times, want 2:\n%s", n, got)
 	}
-	// 15s across three pages.
-	if n := strings.Count(got, "duration 5.000"); n != 3 {
-		t.Errorf("want three 5s pages, got:\n%s", got)
+	// 15s across three pages: 5s, 5s, then the last split 2.5s + 2.5s.
+	var total float64
+	for line := range strings.SplitSeq(got, "\n") {
+		d, ok := strings.CutPrefix(line, "duration ")
+		if !ok {
+			continue
+		}
+		secs, err := strconv.ParseFloat(strings.TrimSpace(d), 64)
+		if err != nil {
+			t.Fatalf("unparsable duration %q in:\n%s", line, got)
+		}
+		total += secs
+	}
+	if total != 15 {
+		t.Errorf("list runs %.3fs, want exactly the clip's 15s:\n%s", total, got)
+	}
+	if n := strings.Count(got, "duration 5.000"); n != 2 {
+		t.Errorf("want two whole 5s pages before the split final one, got:\n%s", got)
 	}
 }
 
@@ -140,6 +158,37 @@ func TestRenderPagedDeckHoldsEachPage(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(asset.Dir, name)); !os.IsNotExist(err) {
 			t.Errorf("%s was left behind in the rendered dir", name)
 		}
+	}
+}
+
+// CRITICAL: a two-page deck is its own case, not a smaller version of
+// the three-page one above. It is the only page count where a list that
+// overruns encode's -t actually cut the clip short -- three pages and up
+// happened to survive it -- so the deck that /l builds for ten cached
+// items regressed while the test above stayed green.
+func TestRenderTwoPageDeckRunsFullLength(t *testing.T) {
+	hasFFmpeg(t)
+
+	m := &MessageRenderer{
+		FFmpegPath: "ffmpeg", FFprobePath: "ffprobe",
+		PNG: flatPNG{}, Dir: t.TempDir(), Seconds: 15,
+	}
+	deck := message.Deck{page(20), page(240)}
+
+	asset, err := m.Render(context.Background(), deck, video.OutputSpec{Container: video.ContainerMP4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(asset.Dir, "message.mp4")
+
+	if d := probeDuration(t, out); d < 14 || d > 15.5 {
+		t.Errorf("clip runs %.2fs, want about 15s", d)
+	}
+	// The second page has to still be on screen near the end, not gone
+	// the moment it arrives at the halfway mark.
+	first, second := sampleGrey(t, out, "3"), sampleGrey(t, out, "13")
+	if absDiff(first, second) < 40 {
+		t.Errorf("pages read %d then %d; want the second page held to the end", first, second)
 	}
 }
 

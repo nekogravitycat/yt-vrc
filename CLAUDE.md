@@ -196,8 +196,17 @@ additions worth knowing while developing:
   truncating: eight rows per frame, each page holding an equal share of
   `MESSAGE_SECONDS`, with the deck capped so no page holds for under 5s
   (`minPageSeconds`) and the footer saying what was left out. Paging is
-  the ffmpeg concat demuxer over one PNG per page — note it ignores the
-  last entry's duration unless that file is listed twice.
+  the ffmpeg concat demuxer over one PNG per page, and its two rules
+  pull against each other: it ignores the last entry's duration unless
+  that file is listed twice, but the list must still total exactly
+  `MESSAGE_SECONDS`, because the encode's `-t` trims on the input side —
+  a trailing entry starting at exactly `-t` is dropped, and it takes the
+  hold on the frame before it with it, ending the clip the instant the
+  final page appears. So the repeat splits the last page's own slot
+  rather than adding one on top. **Test paging at two pages**: it is the
+  only page count where overrunning `-t` actually truncated the clip
+  (three and up happened to survive), so a three-page test stays green
+  through the exact regression `/l` hits on ten cached items.
 - `ADMIN_IPS` gates `/on /off /p /d /u /mode /l /e /i` independent of
   whatever `/mode` currently has video playback under — a friend allowed
   to watch in whitelist mode must not thereby gain purge/upgrade/mode-

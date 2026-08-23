@@ -163,13 +163,18 @@ func (m *MessageRenderer) videoInput(frames []string, dir string) ([]string, err
 	}
 	per := float64(m.Seconds) / float64(len(frames))
 	var b strings.Builder
-	for _, f := range frames {
+	for _, f := range frames[:len(frames)-1] {
 		fmt.Fprintf(&b, "file '%s'\nduration %.3f\n", filepath.Base(f), per)
 	}
-	// CRITICAL: the concat demuxer ignores the last entry's duration
-	// unless that file is listed once more; without this the final page
-	// flashes past in a single frame.
-	fmt.Fprintf(&b, "file '%s'\n", filepath.Base(frames[len(frames)-1]))
+	// CRITICAL: the concat demuxer ignores the last entry's duration, so
+	// the final page must be listed twice or it flashes past in a single
+	// frame -- and the two entries have to *split* that page's own slot,
+	// never add one on top. The list must total exactly m.Seconds:
+	// encode's -t trims on the input side, so an entry starting at
+	// exactly -t is dropped along with the hold on the frame before it,
+	// ending the clip the instant the last page turns up.
+	last := filepath.Base(frames[len(frames)-1])
+	fmt.Fprintf(&b, "file '%s'\nduration %.3f\nfile '%s'\nduration %.3f\n", last, per/2, last, per/2)
 
 	list := filepath.Join(dir, pagesList)
 	if err := os.WriteFile(list, []byte(b.String()), 0o644); err != nil {
