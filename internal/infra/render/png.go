@@ -28,7 +28,11 @@ const (
 	bodySize   = 38 // >= Height/20, the legibility floor of spec §4.3.3
 	footerSize = 28
 	lineH      = 56
-	valueX     = 460
+	// valueX: the label column has to hold a cache row's
+	// "133.5 MB · 1080p HLS" without truncating, which is the widest
+	// label any view produces; the value column keeps ample room for a
+	// video title even so.
+	valueX = 520
 )
 
 // A dark ground with bright text: VR displays render high-contrast

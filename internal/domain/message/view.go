@@ -46,6 +46,30 @@ type View struct {
 	Footer   string   `json:"footer,omitempty"`
 }
 
+// Deck is a message shown as a sequence of frames inside one clip.
+//
+// Almost every message is a single frame. A deck exists for output that
+// genuinely does not fit one -- the cache listing -- which is paged
+// across the clip's running time instead of truncated. There are no
+// transitions: each page simply holds for its share of the duration and
+// cuts to the next.
+type Deck []View
+
+// One wraps a single view as a deck, which is what all but one caller
+// wants.
+func One(v View) Deck { return Deck{v} }
+
+// Hash identifies a whole deck by content, so an unchanged message is
+// rendered once and reused, exactly as a single view is.
+func (d Deck) Hash() string {
+	b, err := json.Marshal(d)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])[:16]
+}
+
 // Hash identifies a view by content, so identical messages are rendered
 // once and reused (spec §4.3.3).
 func (v View) Hash() string {

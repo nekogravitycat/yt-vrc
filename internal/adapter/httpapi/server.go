@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -25,9 +26,10 @@ import (
 	"github.com/nekogravitycat/yt-vrc/internal/usecase/upgrade"
 )
 
-// MessageService renders views to playable media and serves them back.
+// MessageService renders a message to playable media and serves it back.
+// A deck is usually one frame; see message.Deck.
 type MessageService interface {
-	Render(ctx context.Context, v message.View, spec video.OutputSpec) (*video.MediaAsset, error)
+	Render(ctx context.Context, deck message.Deck, spec video.OutputSpec) (*video.MediaAsset, error)
 	Open(key video.CacheKey, name string) (io.ReadSeekCloser, time.Time, error)
 }
 
@@ -75,9 +77,22 @@ type Server struct {
 	Thresholds health.Thresholds
 	// DataDir is the volume whose free space /s watches.
 	DataDir string
+	// PrepareGrace bounds how long playback blocks on a cache miss
+	// before answering with a progress frame instead. Zero uses
+	// defaultPrepareGrace.
+	PrepareGrace time.Duration
+	// MessageSeconds is how long a rendered message runs, which is the
+	// budget a paged message divides between its frames. Zero assumes 15.
+	MessageSeconds int
 
 	slotsOnce sync.Once
 	slots     *slotTable
+
+	// verMu guards the /s yt-dlp version cache; see toolVersion.
+	verMu  sync.Mutex
+	verVal string
+	verErr error
+	verAt  time.Time
 
 	mu          sync.Mutex
 	purgeToken  string
@@ -124,6 +139,33 @@ func (s *Server) PinnedMessages() []string { return s.slotTable().pinned() }
 // messagePrefix namespaces rendered messages so they cannot collide with
 // video cache keys.
 const messagePrefix = "m"
+
+// toolVersionTTL bounds how stale the yt-dlp version reported by /s may be.
+//
+// NOTE: port.ToolchainManager deliberately does NOT cache CurrentVersion
+// -- the binary can change underneath us and the upgrade path must see
+// that. This cache belongs to /s alone. Asking the binary costs a process
+// spawn, ~0.9s for the managed standalone build (which unpacks itself on
+// every invocation), and /s is polled orders of magnitude more often than
+// yt-dlp is replaced; measured against a live deployment that one
+// subprocess was the single largest cost of the endpoint.
+const toolVersionTTL = 60 * time.Second
+
+// toolVersion is CurrentVersion for display purposes only. Concurrent
+// callers share one lookup rather than each spawning a process: a player
+// commonly fetches the same URL twice in a row.
+func (s *Server) toolVersion(ctx context.Context) (string, error) {
+	s.verMu.Lock()
+	defer s.verMu.Unlock()
+	if !s.verAt.IsZero() && time.Since(s.verAt) < toolVersionTTL {
+		return s.verVal, s.verErr
+	}
+	v, err := s.Toolchain.CurrentVersion(ctx)
+	// Failures are cached alongside successes: a binary that cannot run
+	// would otherwise spawn a failing process on every single poll.
+	s.verVal, s.verErr, s.verAt = v, err, time.Now()
+	return v, err
+}
 
 const (
 	// cacheImmutable: video artifacts are content-addressed and never
@@ -174,7 +216,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 
 	route, err := ParsePath(raw, s.Defaults)
 	if err != nil {
-		s.deliver(w, r, pathSlot(raw), presenter.Unrecognised(), s.Defaults.spec(), http.StatusNotFound)
+		s.deliver(w, r, pathSlot(raw), presenter.Unrecognised(), s.Defaults.messageSpec(), http.StatusNotFound)
 		return
 	}
 
@@ -186,14 +228,24 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// defaultPrepareGrace is the fallback when PrepareGrace is unset.
+const defaultPrepareGrace = 8 * time.Second
+
+// errStillPreparing is not a failure: it reports that the grace period
+// ran out with the job still running, which calls for a progress frame
+// rather than an error one.
+var errStillPreparing = errors.New("still preparing")
+
 func (s *Server) serveVideo(w http.ResponseWriter, r *http.Request, route Route) {
+	msgSpec := route.messageSpec(s.Defaults)
+
 	// Checked before the gate: a version swap is a wait-it-out state, and
 	// reporting "offline" instead would send the user to /on to fix
 	// something that isn't broken.
 	if s.Upgrade != nil {
 		if active, stage := s.Upgrade.Maintenance(); active {
 			st := s.Upgrade.State()
-			s.deliver(w, r, "maintenance", presenter.Maintenance(stage, st.StartedAt), route.Spec, http.StatusServiceUnavailable)
+			s.deliver(w, r, "maintenance", presenter.Maintenance(stage, st.StartedAt), msgSpec, http.StatusServiceUnavailable)
 			return
 		}
 	}
@@ -204,17 +256,24 @@ func (s *Server) serveVideo(w http.ResponseWriter, r *http.Request, route Route)
 	if s.Gate != nil {
 		if open, reason := s.Gate.Allow(r.Context(), clientIP(r)); !open {
 			s.Log.Info("gate closed", "id", route.VideoID, "source", reason.Source)
-			s.deliver(w, r, "gate", presenter.GateClosed(reason), route.Spec, http.StatusServiceUnavailable)
+			s.deliver(w, r, "gate", presenter.GateClosed(reason), msgSpec, http.StatusServiceUnavailable)
 			return
 		}
 	}
 
-	asset, err := s.Play.Prepare(r.Context(), route.VideoID, route.Spec)
+	asset, err := s.prepareWithinGrace(r, route)
 	if err != nil {
+		if errors.Is(err, errStillPreparing) {
+			title, p, _ := s.Play.Progress(route.Spec.CacheKey(route.VideoID))
+			s.Log.Info("still preparing", "id", route.VideoID, "stage", p.Stage)
+			s.deliver(w, r, "v-"+route.VideoID.String(),
+				presenter.Preparing(title, route.Spec, p), msgSpec, http.StatusAccepted)
+			return
+		}
 		s.Log.Error("prepare failed", "id", route.VideoID, "err", err)
 		s.record(event.Event{Kind: event.KindError, VideoID: route.VideoID.String(),
 			Summary: presenter.ErrorSummary(err), Detail: err.Error()})
-		s.deliver(w, r, "v-"+route.VideoID.String(), presenter.PrepareError(route.VideoID, err), route.Spec, statusFor(err))
+		s.deliver(w, r, "v-"+route.VideoID.String(), presenter.PrepareError(route.VideoID, err), msgSpec, statusFor(err))
 		return
 	}
 	w.Header().Set("Cache-Control", "public, max-age=60")
@@ -228,6 +287,36 @@ func (s *Server) serveVideo(w http.ResponseWriter, r *http.Request, route Route)
 	s.serveFrom(w, r, s.Play.Open, asset.Key, "video.mp4", cacheImmutable)
 }
 
+// prepareWithinGrace waits out at most PrepareGrace for a ready artifact.
+//
+// CRITICAL: the deadline bounds the *wait*, not the job. Prepare runs its
+// work under context.WithoutCancel, so letting this context expire leaves
+// preparation going for whoever asks next -- which is the entire point. A
+// long video takes minutes to fetch and remux, and a player left without
+// a response for that whole time reports the URL as broken (on the
+// Cloudflare deployment the tunnel gives up at 100s regardless). A
+// progress frame turns that dead wait into something the viewer can see
+// and act on.
+func (s *Server) prepareWithinGrace(r *http.Request, route Route) (*video.MediaAsset, error) {
+	grace := s.PrepareGrace
+	if grace <= 0 {
+		grace = defaultPrepareGrace
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), grace)
+	defer cancel()
+
+	asset, err := s.Play.Prepare(ctx, route.VideoID, route.Spec)
+	if err == nil {
+		return asset, nil
+	}
+	// Only our own deadline means "come back later": the caller hanging
+	// up, and the job failing on its own, are both real errors to report.
+	if errors.Is(err, context.DeadlineExceeded) && ctx.Err() != nil && r.Context().Err() == nil {
+		return nil, errStillPreparing
+	}
+	return nil, err
+}
+
 // deliver renders a view under a stable slot URL (name identifies the
 // message, e.g. a command or video ID; see slotFor) and serves it.
 //
@@ -235,20 +324,45 @@ func (s *Server) serveVideo(w http.ResponseWriter, r *http.Request, route Route)
 // code only affects the ?debug=1 text branch. A player won't render a
 // 4xx body, so classification goes to the log and ?debug=1 instead.
 func (s *Server) deliver(w http.ResponseWriter, r *http.Request, name string, v message.View, spec video.OutputSpec, code int) {
+	s.deliverDeck(w, r, name, message.One(v), spec, code)
+}
+
+// minPageSeconds is the shortest a page of a paged message may hold for.
+// Below this the frames turn over faster than they can be read, so the
+// deck is capped at what fits instead (see presenter.CacheList).
+const minPageSeconds = 5
+
+// messagePages is how many frames a paged message may use, derived from
+// how long the clip runs.
+func (s *Server) messagePages() int {
+	secs := s.MessageSeconds
+	if secs <= 0 {
+		secs = 15
+	}
+	return max(1, secs/minPageSeconds)
+}
+
+// deliverDeck is deliver for a message that may span several frames.
+func (s *Server) deliverDeck(w http.ResponseWriter, r *http.Request, name string, deck message.Deck, spec video.OutputSpec, code int) {
 	if r.URL.Query().Has("debug") {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(code)
-		writeViewText(w, v)
+		for i, v := range deck {
+			if i > 0 {
+				_, _ = io.WriteString(w, "\n--- page "+strconv.Itoa(i+1)+" ---\n")
+			}
+			writeViewText(w, v)
+		}
 		return
 	}
 
-	asset, err := s.Messages.Render(r.Context(), v, spec)
+	asset, err := s.Messages.Render(r.Context(), deck, spec)
 	if err != nil {
 		// Falling back to text is strictly better than a blank player.
 		s.Log.Error("message render failed", "err", err)
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusInternalServerError)
-		writeViewText(w, v)
+		writeViewText(w, deck[0])
 		return
 	}
 
@@ -358,6 +472,16 @@ func (s *Server) logRequest(next http.Handler) http.Handler {
 
 func (d Defaults) spec() video.OutputSpec {
 	return video.OutputSpec{Container: d.Container, Quality: d.Quality}
+}
+
+// messageSpec is spec for paths that never resolved to a route at all,
+// so there is no explicit container on the URL to honour.
+func (d Defaults) messageSpec() video.OutputSpec {
+	spec := d.spec()
+	if d.MessageContainer != "" {
+		spec.Container = d.MessageContainer
+	}
+	return spec
 }
 
 func errorIs(err, target error) bool { return errors.Is(err, target) }

@@ -68,6 +68,41 @@ source (local process detection, a heartbeat endpoint) means a new
   playlist generated up front from `duration` alone produces the wrong
   timeline (segment lengths measured 2.0–11.5s against a nominal 6s).
   `EXTINF` values in the served playlist are always ffmpeg's real output.
+- **A cache miss answers within `PREPARE_GRACE` (8s), not when the video
+  is ready.** Preparation of a long video takes minutes; a player left
+  without a response that whole time reports the URL as broken, and the
+  Cloudflare tunnel gives up at 100s regardless. Past the grace,
+  `serveVideo` returns `presenter.Preparing` instead. CRITICAL: the
+  deadline bounds the *wait*, not the job — `Prepare` runs under
+  `context.WithoutCancel`, so the work continues and re-entering the same
+  URL joins it (one resolve, not two) or finds it finished. This is why
+  the progress frame says to try the URL again.
+- **Anything shown while a job runs must round its numbers.** A view
+  carrying a live byte count hashes differently on every poll, so it
+  re-encodes (~0.5s) each time it is asked for — exactly when the viewer
+  can least afford it. `presenter.Preparing` buckets progress to 10% and
+  puts remaining time on a coarse ladder (`progressBucket`, `coarseWait`)
+  so a whole job costs ~10 renders instead of one per request.
+- **Messages default to MP4, video to HLS, and the two tradeoffs are
+  opposite.** A message is a 15s still frame: HLS spends five extra
+  sequential round trips (master → media → 5 segments) to deliver what
+  one MP4 request does, and measured through Cloudflare that is most of
+  the endpoint's latency. It also makes the URL stable — yt-dlp resolves
+  an MP4 message to the request URL itself, where an HLS one resolves to
+  a `/m/{slot}/media.m3u8` underneath it. An explicit `.m3u8`/`.mp4` on
+  the URL still wins (`Route.ContainerExplicit`).
+- **`/s` caches the yt-dlp version for 60s (`toolVersionTTL`), even
+  though `port.ToolchainManager` says `CurrentVersion` is deliberately
+  uncached.** Both are right: the upgrade path must see the live binary,
+  but `/s` only displays it. The managed standalone build unpacks itself
+  on every invocation, so `yt-dlp --version` costs ~0.9s — measured
+  against production that one subprocess was the single largest cost of
+  the endpoint, and a player fetches the URL twice per playback.
+- **The message render cache is keyed on content alone**, so a change to
+  the *drawing* (`internal/infra/render/png.go` geometry, colours, font)
+  does not invalidate it — the old frames keep being served until they
+  age out. After a layout change, clear `DATA_DIR/messages` or the new
+  layout only shows up on messages whose text also changed.
 - **Singleflight is an anti-throttle mechanism, not a perf optimization.**
   YouTube rate-limits repeated resolution of the *same video* (~a dozen
   resolves/day triggers `Sign in to confirm you're not a bot`, scoped to
@@ -95,12 +130,24 @@ source (local process detection, a heartbeat endpoint) means a new
   compatible choice. "Media cannot be played, maybe due to invalid
   format" is AVPro's generic load-failure message — check whether the
   artifact actually exists (404) before suspecting encoding.
+- **VRChat re-resolves on every play.** Confirmed by experiment: with a
+  video's first play answered by the gate-closed frame, calling `/on`
+  from elsewhere and pressing play again on the *unchanged* URL plays the
+  video — the player does not reuse the URL it resolved last time. This
+  is what makes the whole `PREPARE_GRACE` flow work, and it retires an
+  earlier note here claiming the opposite. Anything that resolves a path
+  to a different target than it did a minute ago is therefore safe.
+  (Tested in one world; a world shipping its own player could still cache
+  on top of VRChat, so re-check if a specific world misbehaves.)
 - **Command endpoint media is served through stable named slots**
-  (`/m/status_hls/...`), not content-hash URLs. VRChat caches whatever URL
-  it resolved a path to; if a status message's hash changes every poll (it
-  has live stats in it), the player would keep resolving to whichever
-  hash it saw first. Slot-table state lives in `DATA_DIR/state/slots.json`;
-  assets pinned by a slot are excluded from cache eviction.
+  (`/m/status_hls/...`), not content-hash URLs. NOTE: the original reason
+  given for this — that VRChat pins the first URL it resolved — turned
+  out to be false (see above). What the slot table still buys is
+  eviction safety: assets pinned by a slot are excluded from cache
+  eviction, so a URL already handed to AVPro cannot be pruned out from
+  under it mid-fetch. It costs nothing and stays. Slot-table state lives
+  in `DATA_DIR/state/slots.json`. Since messages default to MP4 and MP4
+  is served inline at the request URL, slots now only carry HLS messages.
 - **MP4 needs `-movflags +faststart` and must NOT get
   `-bsf:a aac_adtstoasc`** (that bitstream filter adds ADTS headers for
   MPEG-TS; applying it to an MP4-to-MP4 path produces a silent audio
@@ -145,6 +192,12 @@ See `README.md` for the full end-user command reference (all commands
 double as their long form, e.g. `/s` = `/status`). The two admin-only
 additions worth knowing while developing:
 
+- `/l` is sorted largest-first and pages across the clip rather than
+  truncating: eight rows per frame, each page holding an equal share of
+  `MESSAGE_SECONDS`, with the deck capped so no page holds for under 5s
+  (`minPageSeconds`) and the footer saying what was left out. Paging is
+  the ffmpeg concat demuxer over one PNG per page — note it ignores the
+  last entry's duration unless that file is listed twice.
 - `ADMIN_IPS` gates `/on /off /p /d /u /mode /l /e /i` independent of
   whatever `/mode` currently has video playback under — a friend allowed
   to watch in whitelist mode must not thereby gain purge/upgrade/mode-
@@ -209,8 +262,10 @@ of which machine this runs on (versioned; keys are `snake_case`, e.g.
 | `HLS_SEGMENT_SECONDS` | `6` | nominal only — real lengths vary |
 | `YTDLP_CLIENTS` | `default,mweb,tv_embedded` | fallback chain, only retried on retryable errors |
 | `FETCH_WORKERS` / `FETCH_CHUNK_BYTES` | `8` / `4MB` | parallel chunked downloader; worker count matters a lot for cold-start |
-| `MESSAGE_SECONDS` / `MESSAGE_CACHE_ENTRIES` | `15` / `200` | message-video length / render cache size |
+| `MESSAGE_SECONDS` / `MESSAGE_CACHE_ENTRIES` | `15` / `200` | message-video length / render cache size; the length also budgets a paged message |
+| `MESSAGE_CONTAINER` | `mp4` | container for command responses when the URL doesn't say — separate from `DEFAULT_CONTAINER`, see Facts |
 | `RESOLVE_TIMEOUT` / `PREPARE_TIMEOUT` / `MAX_DURATION` | `30s` / `10m` / `4h` | |
+| `PREPARE_GRACE` | `8s` | how long playback blocks on a cache miss before answering with a progress frame |
 | `MAX_CONCURRENT_JOBS` | `3` | full at limit = immediate refusal, no queueing |
 | `CACHE_MAX_BYTES` / `CACHE_TARGET_RATIO` | `5GB` / `0.8` | LRU eviction; accepts `50GB`/`500MB` suffixes |
 | `EVENT_LOG_ENTRIES` / `MESSAGE_SLOTS` | `500` / `200` | |
@@ -277,8 +332,10 @@ source IP by default; `CF-Connecting-IP` is what `clientIP()` trusts (see
 Facts above). Note Cloudflare's ToS §2.8 restricts bulk non-HTML content
 delivery on non-Enterprise plans — low audit risk at this project's scale
 (≤5 users), but a known tradeoff, not an oversight. Free-plan Cloudflare
-has a 100s origin timeout (error 524); set `MAX_DURATION` to reject videos
-that would blow past it.
+has a 100s origin timeout (error 524). `PREPARE_GRACE` is what keeps a
+cache miss clear of that now — the request returns a progress frame in
+8s and preparation continues behind it — so `MAX_DURATION` no longer has
+to be tuned down to whatever finishes inside 100s.
 
 **DNS-only + Caddy** (alternative, avoids the ToS question and hides
 nothing): point the DNS record's proxy status to "DNS only," forward
@@ -311,7 +368,11 @@ install).
 
 Not yet confirmed inside an actual VRChat headset (validated via
 browser/curl only): message-video text legibility at current font size
-(`internal/infra/render/png.go`, `bodySize`), VRChat's video load timeout
-(bounds a sane `MAX_DURATION`), and offline debounce behavior end-to-end.
-Core playback, seeking, and the Discord presence signal have all been
-confirmed working in VRChat.
+(`internal/infra/render/png.go`, `bodySize`), and offline debounce
+behavior end-to-end. Core playback, seeking, the Discord presence signal,
+and re-resolution on replay have all been confirmed working in VRChat.
+
+`PREPARE_GRACE` is set to 8s from an eyeballed estimate of how long the
+player waits before calling a URL broken; the exact timeout is still
+unmeasured, so if a slow cache miss ever reads as a load failure rather
+than showing the progress frame, that value is the first thing to lower.

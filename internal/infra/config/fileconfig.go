@@ -33,11 +33,13 @@ type fileConfig struct {
 	FetchWorkers    *int    `yaml:"fetch_workers"`
 	FetchChunkBytes *string `yaml:"fetch_chunk_bytes"`
 
-	MessageSeconds      *int `yaml:"message_seconds"`
-	MessageCacheEntries *int `yaml:"message_cache_entries"`
+	MessageSeconds      *int    `yaml:"message_seconds"`
+	MessageCacheEntries *int    `yaml:"message_cache_entries"`
+	MessageContainer    *string `yaml:"message_container"`
 
 	ResolveTimeout *string `yaml:"resolve_timeout"`
 	PrepareTimeout *string `yaml:"prepare_timeout"`
+	PrepareGrace   *string `yaml:"prepare_grace"`
 	MaxDuration    *string `yaml:"max_duration"`
 
 	MaxConcurrentJobs *int `yaml:"max_concurrent_jobs"`

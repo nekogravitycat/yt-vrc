@@ -38,6 +38,15 @@ video endpoint refuses until you call `/on` once (see below), or set
 
 Quality caps accept `360` / `480` / `720` / `1080` / `1440` / `2160`.
 
+A video that isn't cached yet has to be fetched and remuxed first, which
+for a long video takes longer than a player will wait. Rather than hold
+the connection open until it's done — which the player reports as a
+broken link — the service answers within `PREPARE_GRACE` (8s by default)
+with a short "Preparing Video" clip showing the title and progress.
+Preparation carries on in the background, so entering the same URL again
+a moment later either joins the job already running or plays the finished
+video.
+
 ## Usage: commands
 
 Every command is reachable by a short and a long form. Command responses
@@ -47,7 +56,7 @@ are themselves playable videos — there is no other interface.
 |---|---|---|
 | `/s` | `/status` | Service overview: yt-dlp version/age, health, gate status, cache usage, resolve success rate |
 | `/h` | `/help` | Endpoint cheat sheet |
-| `/l` | `/list` | Recent cache contents |
+| `/l` | `/list` | Cache contents, largest first (pages across the clip if they don't fit one screen) |
 | `/e` | `/errors` | Recent error log |
 | `/w/{id}` | `/warm/{id}` | Start preparing a video without waiting for it — subject to the availability gate, same as playback |
 | `/r/{id}` | `/refresh/{id}` | Drop every cached variant of a video and re-prepare it — subject to the availability gate, same as playback |

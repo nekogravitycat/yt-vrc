@@ -39,10 +39,21 @@ type Config struct {
 	// enough to loop unobtrusively (spec §4.3.3).
 	MessageSeconds      int
 	MessageCacheEntries int
+	// MessageContainer is what a command response is delivered as when
+	// the URL didn't say. Separate from DefaultContainer because the
+	// tradeoff is the opposite one: a message is a 15s still frame, so
+	// HLS's playlist indirection costs five extra round trips (master ->
+	// media -> segments) to deliver what one MP4 request does.
+	MessageContainer video.Container
 
 	ResolveTimeout time.Duration
 	PrepareTimeout time.Duration
 	MaxDuration    time.Duration
+	// PrepareGrace is how long a video request blocks on a cache miss
+	// before answering with a progress message instead. It bounds the
+	// wait a player sees, not the job: preparation keeps running, so the
+	// next request for the same URL finds it finished or further along.
+	PrepareGrace time.Duration
 
 	// MaxConcurrentJobs bounds simultaneous preparations (spec §8).
 	MaxConcurrentJobs int
@@ -149,8 +160,11 @@ func Load() (*Config, error) {
 		MessageCacheEntries: envInt("MESSAGE_CACHE_ENTRIES", intDefault(fc.MessageCacheEntries, 200)),
 		ResolveTimeout:      envDur("RESOLVE_TIMEOUT", durDefault(fc.ResolveTimeout, 30*time.Second)),
 		PrepareTimeout:      envDur("PREPARE_TIMEOUT", durDefault(fc.PrepareTimeout, 10*time.Minute)),
-		MaxDuration:         envDur("MAX_DURATION", durDefault(fc.MaxDuration, 4*time.Hour)),
-		LogLevel:            env("LOG_LEVEL", strDefault(fc.LogLevel, "info")),
+		// NOTE: must stay under whatever the player gives up after --
+		// answering late is indistinguishable from a broken URL.
+		PrepareGrace: envDur("PREPARE_GRACE", durDefault(fc.PrepareGrace, 8*time.Second)),
+		MaxDuration:  envDur("MAX_DURATION", durDefault(fc.MaxDuration, 4*time.Hour)),
+		LogLevel:     env("LOG_LEVEL", strDefault(fc.LogLevel, "info")),
 
 		MaxConcurrentJobs: envInt("MAX_CONCURRENT_JOBS", intDefault(fc.MaxConcurrentJobs, 3)),
 		CacheMaxBytes:     envBytes("CACHE_MAX_BYTES", bytesDefault(fc.CacheMaxBytes, 5<<30)),
@@ -210,6 +224,15 @@ func Load() (*Config, error) {
 	}
 	c.DefaultContainer = dc
 
+	mc, ok := video.ParseContainer(env("MESSAGE_CONTAINER", strDefault(fc.MessageContainer, "mp4")))
+	if !ok {
+		return nil, fmt.Errorf("MESSAGE_CONTAINER must be hls or mp4")
+	}
+	c.MessageContainer = mc
+
+	if c.PrepareGrace <= 0 {
+		return nil, fmt.Errorf("PREPARE_GRACE must be > 0")
+	}
 	if c.FetchWorkers < 1 {
 		return nil, fmt.Errorf("FETCH_WORKERS must be >= 1")
 	}

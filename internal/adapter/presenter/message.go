@@ -9,6 +9,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
+	"sort"
 	"strings"
 	"time"
 
@@ -205,7 +207,11 @@ func Status(d StatusData) message.View {
 		if src.Status.Detail != "" && src.Err == "" {
 			state += " · " + src.Status.Detail
 		}
-		v.AddRow("  "+src.Name, state)
+		// NOTE: no indent prefix. Labels draw at a fixed x in a
+		// proportional face, so leading spaces read as a row that failed
+		// to line up rather than as nesting; order already tells the
+		// reader these belong to Availability.
+		v.AddRow(src.Name, state)
 	}
 
 	v.AddRow("yt-dlp", ytdlpSummary(d))
@@ -408,53 +414,126 @@ func Info(id video.ID, assets []*video.MediaAsset) message.View {
 	return v
 }
 
-// CacheList renders the cache contents (spec §4.1.3).
-func CacheList(items []*video.MediaAsset) message.View {
-	v := message.View{Kind: message.KindStatus, Title: "Cache"}
+// cacheRowsPerPage is the frame's row budget (render.Height / lineH,
+// measured against the real layout). The page indicator goes in the
+// footer rather than the subtitle on purpose: the footer draws at a
+// fixed baseline and so costs no row, while a subtitle would push the
+// budget down to six.
+const cacheRowsPerPage = 8
+
+// CacheList renders the cache contents (spec §4.1.3), largest first --
+// the listing exists to answer "what is filling the cache up", and size
+// is the order that answers it.
+//
+// Anything past one frame is paged across the clip rather than dropped
+// (see message.Deck). maxPages bounds that: past some point the pages
+// turn over too fast to read, and showing fewer is better than showing
+// all of them illegibly, so the footer says what was left out.
+func CacheList(items []*video.MediaAsset, maxPages int) message.Deck {
 	if len(items) == 0 {
+		v := message.View{Kind: message.KindStatus, Title: "Cache"}
 		v.Lines = []string{"Nothing cached yet."}
 		v.Footer = "/h for help"
-		return v
+		return message.One(v)
 	}
-	// Row budget: show the most recent.
-	const maxRows = 7
-	shown := items
-	if len(shown) > maxRows {
-		shown = shown[:maxRows]
+	if maxPages < 1 {
+		maxPages = 1
 	}
-	for _, a := range shown {
-		v.AddRow(fmt.Sprintf("%dp %s · %s", a.Height, strings.ToUpper(string(a.Spec.Container)),
-			humanBytes(a.SizeBytes)), a.Title)
+
+	// Sorted on a copy: the slice belongs to the store, not to us.
+	sorted := make([]*video.MediaAsset, len(items))
+	copy(sorted, items)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		return sorted[i].SizeBytes > sorted[j].SizeBytes
+	})
+
+	pages := (len(sorted) + cacheRowsPerPage - 1) / cacheRowsPerPage
+	if pages > maxPages {
+		pages = maxPages
 	}
-	if len(items) > maxRows {
-		v.Footer = fmt.Sprintf("showing %d of %d cached items", maxRows, len(items))
-	} else {
-		v.Footer = fmt.Sprintf("%d cached items", len(items))
+	shown := min(pages*cacheRowsPerPage, len(sorted))
+
+	deck := make(message.Deck, 0, pages)
+	for p := range pages {
+		v := message.View{Kind: message.KindStatus, Title: "Cache"}
+		for _, a := range sorted[p*cacheRowsPerPage : min((p+1)*cacheRowsPerPage, shown)] {
+			// Size leads: it is what the listing is sorted by and what the
+			// reader is comparing. The label column is narrow enough that
+			// this row can truncate, so the order also decides what
+			// survives -- container last, being the least informative.
+			v.AddRow(fmt.Sprintf("%s · %dp %s", humanBytes(a.SizeBytes), a.Height,
+				strings.ToUpper(string(a.Spec.Container))), a.Title)
+		}
+		switch {
+		case shown < len(sorted):
+			v.Footer = fmt.Sprintf("page %d/%d · showing %d of %d cached items", p+1, pages, shown, len(sorted))
+		case pages > 1:
+			v.Footer = fmt.Sprintf("page %d/%d · %d cached items", p+1, pages, len(sorted))
+		default:
+			v.Footer = fmt.Sprintf("%d cached items", len(sorted))
+		}
+		deck = append(deck, v)
 	}
-	return v
+	return deck
 }
 
-// Preparing is shown while a video is still being made ready (spec §4.2.3).
+// progressBucket is the granularity Preparing rounds its numbers to.
+//
+// CRITICAL: every distinct rendering costs an ffmpeg encode (~0.5s) and
+// a cache entry, and a view carrying a live byte count hashes
+// differently on every poll -- so an exact figure would re-encode the
+// frame each time the viewer asks, which is precisely when they can
+// least afford the wait. Ten buckets per job keeps the bar visibly
+// moving while everything in between is a cache hit.
+const progressBucket = 0.1
+
+// Preparing is shown while a video is still being made ready (spec
+// §4.2.3) -- both by /w and, once PrepareGrace expires, by playback
+// itself. Every figure on it is deliberately coarse; see progressBucket.
 func Preparing(title string, spec video.OutputSpec, p video.Progress) message.View {
 	v := message.View{Kind: message.KindProgress, Title: "Preparing Video", Subtitle: title}
 	v.AddRow("Output", fmt.Sprintf("%dp %s", spec.Quality, strings.ToUpper(string(spec.Container))))
-	// Shown explicitly: once download completes, a frozen byte count
+	// Shown explicitly: once download completes, a frozen progress bar
 	// reads as a stall rather than the remux stage it actually is.
 	if p.Stage != "" {
 		v.AddRow("Stage", p.Stage)
 	}
+	// Total, not "done / total": the total is fixed once resolved, so it
+	// informs without changing between polls.
 	if p.BytesTotal > 0 {
-		v.AddRow("Downloaded", fmt.Sprintf("%s / %s", humanBytes(p.BytesDone), humanBytes(p.BytesTotal)))
+		v.AddRow("Size", humanBytes(p.BytesTotal))
 	}
 	if p.EstimatedRemain > 0 {
-		v.AddRow("Remaining", "about "+p.EstimatedRemain.Round(time.Second).String())
+		v.AddRow("Remaining", coarseWait(p.EstimatedRemain))
 	}
 	if p.Fraction >= 0 {
-		f := p.Fraction
+		f := math.Floor(p.Fraction/progressBucket) * progressBucket
+		v.AddRow("Progress", fmt.Sprintf("%.0f%%", f*100))
 		v.Progress = &f
 	}
-	v.Footer = "Re-enter the same URL in a few seconds"
+	v.Footer = "Re-enter the same URL in a moment to play it"
 	return v
+}
+
+// coarseWait buckets a remaining-time estimate onto a ladder that moves
+// slowly, for the same caching reason as progressBucket -- a figure that
+// ticks every second defeats the render cache and tells the viewer
+// nothing they can act on beyond "wait, or come back later".
+func coarseWait(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return "under a minute"
+	case d < 3*time.Minute:
+		return "a couple of minutes"
+	case d < 7*time.Minute:
+		return "about 5 minutes"
+	case d < 12*time.Minute:
+		return "about 10 minutes"
+	case d < 25*time.Minute:
+		return "about 20 minutes"
+	default:
+		return "over half an hour"
+	}
 }
 
 func detail(err error) string {

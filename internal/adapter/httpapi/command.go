@@ -31,61 +31,68 @@ var adminCommands = map[string]bool{
 // reachable to fix a wrongly closed gate; warm/refresh are the exception
 // — see Server.warm.
 func (s *Server) serveCommand(w http.ResponseWriter, r *http.Request, route Route) {
+	// CRITICAL: two specs, and they are not interchangeable. spec is what
+	// /w and /r actually prepare -- swapping in the message container
+	// there would warm a variant nobody is going to play. msgSpec is only
+	// ever the container the response frame is delivered as.
 	spec := route.Spec
+	msgSpec := route.messageSpec(s.Defaults)
 
 	if adminCommands[route.Command] && !adminAllowed(r, s.AdminIPs, s.AdminToken) {
 		s.Log.Info("admin command refused", "command", route.Command, "ip", clientIP(r))
-		s.deliver(w, r, route.Command, presenter.Forbidden(), spec, http.StatusForbidden)
+		s.deliver(w, r, route.Command, presenter.Forbidden(), msgSpec, http.StatusForbidden)
 		return
 	}
 
 	switch route.Command {
 	case "help":
-		s.deliver(w, r, "help", presenter.Help(s.Version), spec, http.StatusOK)
+		s.deliver(w, r, "help", presenter.Help(s.Version), msgSpec, http.StatusOK)
 
 	case "status":
-		s.deliver(w, r, "status", presenter.Status(s.statusView(r)), spec, http.StatusOK)
+		s.deliver(w, r, "status", presenter.Status(s.statusView(r)), msgSpec, http.StatusOK)
 
 	case "list":
-		s.deliver(w, r, "list", presenter.CacheList(s.Play.Store.List(50)), spec, http.StatusOK)
+		// Listed unbounded, then paged: the cap belongs to how many frames
+		// fit in the clip, not to how many the store will hand over.
+		s.deliverDeck(w, r, "list", presenter.CacheList(s.Play.Store.List(0), s.messagePages()), msgSpec, http.StatusOK)
 
 	case "errors":
 		var events []event.Event
 		if s.Events != nil {
 			events = s.Events.Recent(20)
 		}
-		s.deliver(w, r, "errors", presenter.Errors(events), spec, http.StatusOK)
+		s.deliver(w, r, "errors", presenter.Errors(events), msgSpec, http.StatusOK)
 
 	case "enable":
-		s.enableGate(w, r, spec)
+		s.enableGate(w, r, msgSpec)
 
 	case "disable":
-		s.disableGate(w, r, spec)
+		s.disableGate(w, r, msgSpec)
 
 	case "purge":
-		s.purge(w, r, route, spec)
+		s.purge(w, r, route, msgSpec)
 
 	case "drop":
-		s.drop(w, r, route, spec)
+		s.drop(w, r, route, msgSpec)
 
 	case "info":
-		s.info(w, r, route, spec)
+		s.info(w, r, route, msgSpec)
 
 	case "upgrade":
-		s.upgrade(w, r, route, spec)
+		s.upgrade(w, r, route, msgSpec)
 
 	case "mode":
-		s.setMode(w, r, route, spec)
+		s.setMode(w, r, route, msgSpec)
 
 	case "warm":
-		s.warm(w, r, route, spec, false)
+		s.warm(w, r, route, spec, msgSpec, false)
 
 	case "refresh":
-		s.warm(w, r, route, spec, true)
+		s.warm(w, r, route, spec, msgSpec, true)
 
 	default:
 		// Defined in spec §4.1.3 but scheduled for a later milestone.
-		s.deliver(w, r, route.Command, presenter.NotImplemented(route.Command), spec, http.StatusNotImplemented)
+		s.deliver(w, r, route.Command, presenter.NotImplemented(route.Command), msgSpec, http.StatusNotImplemented)
 	}
 }
 
@@ -97,14 +104,14 @@ const warmGrace = 4 * time.Second
 // warm serves /w (prepare ahead of playback) and /r (do it again from
 // scratch). They are one handler because they differ in exactly one
 // step: whether what is already cached is thrown away first.
-func (s *Server) warm(w http.ResponseWriter, r *http.Request, route Route, spec video.OutputSpec, refresh bool) {
+func (s *Server) warm(w http.ResponseWriter, r *http.Request, route Route, spec, msgSpec video.OutputSpec, refresh bool) {
 	cmd := "warm"
 	if refresh {
 		cmd = "refresh"
 	}
 	id, err := videoIDArg(route.Args)
 	if err != nil {
-		s.deliver(w, r, cmd, presenter.Unrecognised(), spec, http.StatusBadRequest)
+		s.deliver(w, r, cmd, presenter.Unrecognised(), msgSpec, http.StatusBadRequest)
 		return
 	}
 
@@ -115,7 +122,7 @@ func (s *Server) warm(w http.ResponseWriter, r *http.Request, route Route, spec 
 	if s.Gate != nil {
 		if open, reason := s.Gate.Allow(r.Context(), clientIP(r)); !open {
 			s.Log.Info("gate closed", "id", id, "cmd", cmd, "source", reason.Source)
-			s.deliver(w, r, "gate", presenter.GateClosed(reason), spec, http.StatusServiceUnavailable)
+			s.deliver(w, r, "gate", presenter.GateClosed(reason), msgSpec, http.StatusServiceUnavailable)
 			return
 		}
 	}
@@ -140,14 +147,14 @@ func (s *Server) warm(w http.ResponseWriter, r *http.Request, route Route, spec 
 				Summary: fmt.Sprintf("refresh dropped %d cached variant(s)", dropped)})
 		}
 	} else if asset, ok := s.Play.Store.Get(key); ok {
-		s.deliver(w, r, slot, presenter.AlreadyWarm(asset), spec, http.StatusOK)
+		s.deliver(w, r, slot, presenter.AlreadyWarm(asset), msgSpec, http.StatusOK)
 		return
 	}
 
 	// Already running: report the live job instead of waiting out the
 	// grace period to say nothing.
 	if title, p, ok := s.Play.Progress(key); ok {
-		s.deliver(w, r, slot, presenter.Preparing(title, spec, p), spec, http.StatusAccepted)
+		s.deliver(w, r, slot, presenter.Preparing(title, spec, p), msgSpec, http.StatusAccepted)
 		return
 	}
 
@@ -165,16 +172,16 @@ func (s *Server) warm(w http.ResponseWriter, r *http.Request, route Route, spec 
 	if err != nil {
 		s.record(event.Event{Kind: event.KindError, VideoID: id.String(),
 			Summary: presenter.ErrorSummary(err), Detail: err.Error()})
-		s.deliver(w, r, slot, presenter.PrepareError(id, err), spec, statusFor(err))
+		s.deliver(w, r, slot, presenter.PrepareError(id, err), msgSpec, statusFor(err))
 		return
 	}
 
 	if asset, ok := s.Play.Store.Get(key); ok {
-		s.deliver(w, r, slot, presenter.AlreadyWarm(asset), spec, http.StatusOK)
+		s.deliver(w, r, slot, presenter.AlreadyWarm(asset), msgSpec, http.StatusOK)
 		return
 	}
 	title, p, _ := s.Play.Progress(key)
-	s.deliver(w, r, slot, presenter.Preparing(title, spec, p), spec, http.StatusAccepted)
+	s.deliver(w, r, slot, presenter.Preparing(title, spec, p), msgSpec, http.StatusAccepted)
 }
 
 func (s *Server) statusView(r *http.Request) presenter.StatusData {
@@ -208,7 +215,7 @@ func (s *Server) statusView(r *http.Request) presenter.StatusData {
 
 	if s.Toolchain != nil {
 		d.Managed = s.Toolchain.Managed()
-		v, err := s.Toolchain.CurrentVersion(r.Context())
+		v, err := s.toolVersion(r.Context())
 		if err != nil {
 			// Every video request depends on this binary; surface the failure.
 			d.YtdlpErr = err.Error()
@@ -249,9 +256,9 @@ func (s *Server) thresholds() health.Thresholds {
 // upgrade handles /u and /u/back (spec §4.5). It answers immediately and
 // lets the work run behind it; re-entering the URL reports progress and
 // then the outcome (see upgrade.State).
-func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, route Route, spec video.OutputSpec) {
+func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, route Route, msgSpec video.OutputSpec) {
 	if s.Upgrade == nil {
-		s.deliver(w, r, "upgrade", presenter.NotImplemented("u"), spec, http.StatusNotImplemented)
+		s.deliver(w, r, "upgrade", presenter.NotImplemented("u"), msgSpec, http.StatusNotImplemented)
 		return
 	}
 
@@ -263,74 +270,74 @@ func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, route Route, sp
 	}
 
 	if s.Toolchain != nil && !s.Toolchain.Managed() {
-		s.deliver(w, r, "upgrade", presenter.UpgradeUnmanaged(s.Toolchain.BinaryPath()), spec, http.StatusNotImplemented)
+		s.deliver(w, r, "upgrade", presenter.UpgradeUnmanaged(s.Toolchain.BinaryPath()), msgSpec, http.StatusNotImplemented)
 		return
 	}
 	if kind == upgrade.KindRollback && s.Toolchain != nil && s.Toolchain.PreviousVersion() == "" {
-		s.deliver(w, r, "upgrade", presenter.RollbackUnavailable(), spec, http.StatusConflict)
+		s.deliver(w, r, "upgrade", presenter.RollbackUnavailable(), msgSpec, http.StatusConflict)
 		return
 	}
 
 	state, started := s.Upgrade.Trigger(r.Context(), kind)
 	if state.Running {
-		s.deliver(w, r, "upgrade", presenter.UpgradeProgress(state, started), spec, http.StatusAccepted)
+		s.deliver(w, r, "upgrade", presenter.UpgradeProgress(state, started), msgSpec, http.StatusAccepted)
 		return
 	}
 	// Not running and not started: a recent run's result is still the
 	// most useful thing to show.
-	s.deliver(w, r, "upgrade", presenter.UpgradeOutcome(state), spec, http.StatusOK)
+	s.deliver(w, r, "upgrade", presenter.UpgradeOutcome(state), msgSpec, http.StatusOK)
 }
 
-func (s *Server) enableGate(w http.ResponseWriter, r *http.Request, spec video.OutputSpec) {
+func (s *Server) enableGate(w http.ResponseWriter, r *http.Request, msgSpec video.OutputSpec) {
 	if s.Gate == nil {
-		s.deliver(w, r, "enable", presenter.NotImplemented("on"), spec, http.StatusNotImplemented)
+		s.deliver(w, r, "enable", presenter.NotImplemented("on"), msgSpec, http.StatusNotImplemented)
 		return
 	}
 	until := time.Now().Add(s.OverrideTTL)
 	s.Gate.SetOverride(true, until)
 	s.record(event.Event{Kind: event.KindGate, Summary: "forced online via /on",
 		Detail: "until " + until.Format(time.RFC3339)})
-	s.deliver(w, r, "enable", presenter.GateOverridden(until), spec, http.StatusOK)
+	s.deliver(w, r, "enable", presenter.GateOverridden(until), msgSpec, http.StatusOK)
 }
 
-func (s *Server) disableGate(w http.ResponseWriter, r *http.Request, spec video.OutputSpec) {
+func (s *Server) disableGate(w http.ResponseWriter, r *http.Request, msgSpec video.OutputSpec) {
 	if s.Gate == nil {
-		s.deliver(w, r, "disable", presenter.NotImplemented("off"), spec, http.StatusNotImplemented)
+		s.deliver(w, r, "disable", presenter.NotImplemented("off"), msgSpec, http.StatusNotImplemented)
 		return
 	}
 	s.Gate.ClearOverride()
 	reason := s.Gate.Reason()
 	s.record(event.Event{Kind: event.KindGate, Summary: "override cleared via /off"})
-	s.deliver(w, r, "disable", presenter.GateReleased(reason), spec, http.StatusOK)
+	s.deliver(w, r, "disable", presenter.GateReleased(reason), msgSpec, http.StatusOK)
 }
 
 // setMode serves /mode (report the current access mode) and
 // /mode/{default|open|whitelist} (switch it). It is one handler because
 // it differs in exactly one step, the same shape as /w and /r.
-func (s *Server) setMode(w http.ResponseWriter, r *http.Request, route Route, spec video.OutputSpec) {
+func (s *Server) setMode(w http.ResponseWriter, r *http.Request, route Route, msgSpec video.OutputSpec) {
 	if s.Gate == nil {
-		s.deliver(w, r, "mode", presenter.NotImplemented("mode"), spec, http.StatusNotImplemented)
+		s.deliver(w, r, "mode", presenter.NotImplemented("mode"), msgSpec, http.StatusNotImplemented)
 		return
 	}
 	if len(route.Args) == 0 || route.Args[0] == "" {
-		s.deliver(w, r, "mode", presenter.ModeStatus(s.Gate.CurrentMode()), spec, http.StatusOK)
+		s.deliver(w, r, "mode", presenter.ModeStatus(s.Gate.CurrentMode()), msgSpec, http.StatusOK)
 		return
 	}
 	m, ok := availability.ParseAccessMode(route.Args[0])
 	if !ok {
-		s.deliver(w, r, "mode", presenter.Unrecognised(), spec, http.StatusBadRequest)
+		s.deliver(w, r, "mode", presenter.Unrecognised(), msgSpec, http.StatusBadRequest)
 		return
 	}
 	s.Gate.SetMode(m)
 	s.record(event.Event{Kind: event.KindGate, Summary: "access mode set to " + string(m) + " via /mode"})
-	s.deliver(w, r, "mode", presenter.ModeChanged(m), spec, http.StatusOK)
+	s.deliver(w, r, "mode", presenter.ModeChanged(m), msgSpec, http.StatusOK)
 }
 
 // purgeTokenTTL is short on purpose: the token exists to prove the
 // second request came from the same person moments after the first.
 const purgeTokenTTL = 60 * time.Second
 
-func (s *Server) purge(w http.ResponseWriter, r *http.Request, route Route, spec video.OutputSpec) {
+func (s *Server) purge(w http.ResponseWriter, r *http.Request, route Route, msgSpec video.OutputSpec) {
 	items := s.Play.Store.List(0)
 	var total int64
 	for _, a := range items {
@@ -339,28 +346,28 @@ func (s *Server) purge(w http.ResponseWriter, r *http.Request, route Route, spec
 
 	if len(route.Args) == 0 || route.Args[0] == "" {
 		token := s.issuePurgeToken()
-		s.deliver(w, r, "purge", presenter.PurgeConfirm(token, purgeTokenTTL, len(items), total), spec, http.StatusOK)
+		s.deliver(w, r, "purge", presenter.PurgeConfirm(token, purgeTokenTTL, len(items), total), msgSpec, http.StatusOK)
 		return
 	}
 
 	if !s.consumePurgeToken(route.Args[0]) {
-		s.deliver(w, r, "purge", presenter.PurgeRejected(), spec, http.StatusForbidden)
+		s.deliver(w, r, "purge", presenter.PurgeRejected(), msgSpec, http.StatusForbidden)
 		return
 	}
 	if err := s.Play.Store.Purge(); err != nil {
 		s.Log.Error("purge failed", "err", err)
-		s.deliver(w, r, "purge", presenter.PrepareError("", err), spec, http.StatusInternalServerError)
+		s.deliver(w, r, "purge", presenter.PrepareError("", err), msgSpec, http.StatusInternalServerError)
 		return
 	}
 	s.record(event.Event{Kind: event.KindCache, Summary: "cache purged",
 		Detail: fmt.Sprintf("%d items removed", len(items))})
-	s.deliver(w, r, "purge", presenter.PurgeDone(len(items), total), spec, http.StatusOK)
+	s.deliver(w, r, "purge", presenter.PurgeDone(len(items), total), msgSpec, http.StatusOK)
 }
 
-func (s *Server) drop(w http.ResponseWriter, r *http.Request, route Route, spec video.OutputSpec) {
+func (s *Server) drop(w http.ResponseWriter, r *http.Request, route Route, msgSpec video.OutputSpec) {
 	id, err := videoIDArg(route.Args)
 	if err != nil {
-		s.deliver(w, r, "drop", presenter.Unrecognised(), spec, http.StatusBadRequest)
+		s.deliver(w, r, "drop", presenter.Unrecognised(), msgSpec, http.StatusBadRequest)
 		return
 	}
 	var removed int
@@ -376,13 +383,13 @@ func (s *Server) drop(w http.ResponseWriter, r *http.Request, route Route, spec 
 		s.record(event.Event{Kind: event.KindCache, VideoID: id.String(),
 			Summary: "dropped from cache"})
 	}
-	s.deliver(w, r, "drop-"+id.String(), presenter.Dropped(id, removed), spec, http.StatusOK)
+	s.deliver(w, r, "drop-"+id.String(), presenter.Dropped(id, removed), msgSpec, http.StatusOK)
 }
 
-func (s *Server) info(w http.ResponseWriter, r *http.Request, route Route, spec video.OutputSpec) {
+func (s *Server) info(w http.ResponseWriter, r *http.Request, route Route, msgSpec video.OutputSpec) {
 	id, err := videoIDArg(route.Args)
 	if err != nil {
-		s.deliver(w, r, "info", presenter.Unrecognised(), spec, http.StatusBadRequest)
+		s.deliver(w, r, "info", presenter.Unrecognised(), msgSpec, http.StatusBadRequest)
 		return
 	}
 	var found []*video.MediaAsset
@@ -391,7 +398,7 @@ func (s *Server) info(w http.ResponseWriter, r *http.Request, route Route, spec 
 			found = append(found, a)
 		}
 	}
-	s.deliver(w, r, "info-"+id.String(), presenter.Info(id, found), spec, http.StatusOK)
+	s.deliver(w, r, "info-"+id.String(), presenter.Info(id, found), msgSpec, http.StatusOK)
 }
 
 // videoIDArg reads the video ID a command such as /d/{id} carries.

@@ -22,6 +22,24 @@ type Route struct {
 	Spec    video.OutputSpec
 	Command string   // for RouteCommand, the canonical long name
 	Args    []string // remaining path segments after the command
+	// ContainerExplicit reports whether the URL named a container
+	// (a .mp4/.m3u8 extension) rather than falling back to a default.
+	// Message delivery has its own default, so it has to tell the two
+	// apart -- see messageSpec.
+	ContainerExplicit bool
+}
+
+// messageSpec is the output spec a message video answering this route
+// should be delivered as. A message is a still frame, so its container
+// tradeoff is the opposite of a real video's (see
+// Defaults.MessageContainer) -- but an explicit extension on the URL
+// still wins, exactly as it does for playback.
+func (r Route) messageSpec(d Defaults) video.OutputSpec {
+	spec := r.Spec
+	if !r.ContainerExplicit && d.MessageContainer != "" {
+		spec.Container = d.MessageContainer
+	}
+	return spec
 }
 
 // commandAliases maps every accepted spelling onto a canonical name.
@@ -47,6 +65,9 @@ type Defaults struct {
 	Container  video.Container
 	Quality    video.QualityCap
 	MaxQuality video.QualityCap
+	// MessageContainer is the container for command responses and error
+	// frames when the URL didn't name one. Empty falls back to Container.
+	MessageContainer video.Container
 }
 
 // ParsePath resolves a request path in the strict order of spec §4.1.4.
@@ -87,20 +108,20 @@ func ParsePath(p string, d Defaults) (Route, error) {
 
 	// 2. An 11-character segment is a video ID.
 	if id, err := video.ParseID(head); err == nil {
-		s, err := specFromSegments(segs[1:], ext, d)
+		s, explicit, err := specFromSegments(segs[1:], ext, d)
 		if err != nil {
 			return Route{}, err
 		}
-		return Route{Kind: RouteVideo, VideoID: id, Spec: s}, nil
+		return Route{Kind: RouteVideo, VideoID: id, Spec: s, ContainerExplicit: explicit}, nil
 	}
 
 	// 3. A registered command keyword.
 	if canon, ok := commandAliases[strings.ToLower(head)]; ok {
-		s, err := specFromSegments(nil, ext, d)
+		s, explicit, err := specFromSegments(nil, ext, d)
 		if err != nil {
 			return Route{}, err
 		}
-		return Route{Kind: RouteCommand, Command: canon, Args: segs[1:], Spec: s}, nil
+		return Route{Kind: RouteCommand, Command: canon, Args: segs[1:], Spec: s, ContainerExplicit: explicit}, nil
 	}
 
 	// 5. Nothing matched.
@@ -108,15 +129,20 @@ func ParsePath(p string, d Defaults) (Route, error) {
 }
 
 // specFromSegments applies an optional trailing quality segment and an
-// optional extension, e.g. /{id}/720.mp4 (spec §4.1.2).
-func specFromSegments(rest []string, ext string, d Defaults) (video.OutputSpec, error) {
+// optional extension, e.g. /{id}/720.mp4 (spec §4.1.2). The second
+// result reports whether a container was named anywhere in the path,
+// which is what lets message delivery apply its own default without
+// overriding a URL that asked for one (see Route.messageSpec).
+func specFromSegments(rest []string, ext string, d Defaults) (video.OutputSpec, bool, error) {
 	spec := video.OutputSpec{Container: d.Container, Quality: d.Quality}
+	explicit := false
 	if ext != "" {
 		c, ok := video.ParseContainer(strings.ToLower(ext))
 		if !ok {
-			return spec, video.ErrInvalidVideoID
+			return spec, false, video.ErrInvalidVideoID
 		}
 		spec.Container = c
+		explicit = true
 	}
 	for _, seg := range rest {
 		if seg == "" {
@@ -126,18 +152,19 @@ func specFromSegments(rest []string, ext string, d Defaults) (video.OutputSpec, 
 		if e != "" {
 			c, ok := video.ParseContainer(strings.ToLower(e))
 			if !ok {
-				return spec, video.ErrInvalidVideoID
+				return spec, false, video.ErrInvalidVideoID
 			}
 			spec.Container = c
+			explicit = true
 		}
 		cap, err := video.ParseQuality(q)
 		if err != nil {
-			return spec, err
+			return spec, false, err
 		}
 		spec.Quality = cap
 	}
 	spec.Quality = spec.Quality.Clamp(d.MaxQuality)
-	return spec, nil
+	return spec, explicit, nil
 }
 
 // restoreSchemeSlash undoes net/http's path cleaning, which collapses

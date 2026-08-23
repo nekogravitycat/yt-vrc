@@ -25,11 +25,25 @@ fetch_workers: 8
 fetch_chunk_bytes: 4MB
 
 # Message-video length and how many rendered frames to keep cached.
+# message_seconds also budgets a paged message (/l): pages divide it
+# evenly, and the deck is capped so no page holds for under 5s.
 message_seconds: 15
 message_cache_entries: 200
+# Container for command responses when the URL doesn't say ("hls" or
+# "mp4"). A message is a 15s still frame, so the tradeoff is the reverse
+# of default_container's: HLS costs five extra round trips (master ->
+# media -> segments) to deliver what one MP4 request does. An explicit
+# .m3u8/.mp4 on the URL still wins.
+message_container: mp4
 
 resolve_timeout: 30s
 prepare_timeout: 10m
+# How long playback blocks on a cache miss before answering with a
+# progress frame instead. Bounds the wait, not the job -- preparation
+# keeps running, so re-entering the same URL finds it done or further
+# along. Must stay under whatever the player gives up after: answering
+# late is indistinguishable from a broken URL.
+prepare_grace: 8s
 max_duration: 4h
 
 # Full at this limit = immediate refusal, no queueing.

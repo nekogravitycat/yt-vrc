@@ -186,9 +186,10 @@ func run() error {
 		Play:     play,
 		Messages: messages,
 		Defaults: httpapi.Defaults{
-			Container:  cfg.DefaultContainer,
-			Quality:    cfg.DefaultQuality,
-			MaxQuality: cfg.MaxQuality,
+			Container:        cfg.DefaultContainer,
+			Quality:          cfg.DefaultQuality,
+			MaxQuality:       cfg.MaxQuality,
+			MessageContainer: cfg.MessageContainer,
 		},
 		Log:             log,
 		Version:         version,
@@ -205,6 +206,8 @@ func run() error {
 		Health:          recorder,
 		Thresholds:      thresholds(cfg),
 		DataDir:         cfg.DataDir,
+		PrepareGrace:    cfg.PrepareGrace,
+		MessageSeconds:  cfg.MessageSeconds,
 	}
 	// NOTE: nil, not a typed nil — httpapi checks the interface against nil.
 	if gate != nil {
@@ -213,12 +216,13 @@ func run() error {
 	messages.Pinned = srv.PinnedMessages
 
 	httpSrv := &http.Server{
-		Addr:    cfg.ListenAddr,
-		Handler: srv.Handler(),
-		// NOTE: keep >= PrepareTimeout — a cache miss on a long video blocks
-		// the request for the whole prepare.
+		Addr:              cfg.ListenAddr,
+		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
-		WriteTimeout:      cfg.PrepareTimeout + time.Minute,
+		// Generous, but no longer because a request waits out a prepare —
+		// PrepareGrace bounds that now. It covers serving a multi-GB
+		// artifact to a slow client, which is the long write that remains.
+		WriteTimeout: cfg.PrepareTimeout + time.Minute,
 	}
 
 	if gate != nil {

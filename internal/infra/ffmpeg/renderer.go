@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -41,8 +42,11 @@ type MessageRenderer struct {
 	inflight map[string]*sync.Mutex
 }
 
-func (m *MessageRenderer) Render(ctx context.Context, v message.View, spec video.OutputSpec) (*video.MediaAsset, error) {
-	key := fmt.Sprintf("%s_%s", v.Hash(), spec.Container)
+func (m *MessageRenderer) Render(ctx context.Context, deck message.Deck, spec video.OutputSpec) (*video.MediaAsset, error) {
+	if len(deck) == 0 {
+		return nil, fmt.Errorf("rendering message: no pages")
+	}
+	key := fmt.Sprintf("%s_%s", deck.Hash(), spec.Container)
 	dir := filepath.Join(m.Dir, key)
 
 	// Serialise concurrent renders of the same message.
@@ -57,29 +61,39 @@ func (m *MessageRenderer) Render(ctx context.Context, v message.View, spec video
 		return nil, err
 	}
 
-	frame := filepath.Join(dir, "frame.png")
-	f, err := os.Create(frame)
-	if err != nil {
-		return nil, err
-	}
-	if err := m.PNG.RenderPNG(v, f); err != nil {
-		_ = f.Close()
-		return nil, err
-	}
-	if err := f.Close(); err != nil {
-		return nil, err
+	frames := make([]string, len(deck))
+	for i, v := range deck {
+		frames[i] = filepath.Join(dir, fmt.Sprintf("page_%02d.png", i))
+		f, err := os.Create(frames[i])
+		if err != nil {
+			_ = os.RemoveAll(dir)
+			return nil, err
+		}
+		if err := m.PNG.RenderPNG(v, f); err != nil {
+			_ = f.Close()
+			_ = os.RemoveAll(dir)
+			return nil, err
+		}
+		if err := f.Close(); err != nil {
+			_ = os.RemoveAll(dir)
+			return nil, err
+		}
 	}
 
-	if err := m.encode(ctx, frame, dir, spec); err != nil {
+	if err := m.encode(ctx, frames, dir, spec); err != nil {
 		_ = os.RemoveAll(dir)
 		return nil, err
 	}
-	_ = os.Remove(frame) // scratch input to encode; the rendered dir is what's kept
+	// Scratch inputs to encode; the rendered dir is what's kept.
+	for _, f := range frames {
+		_ = os.Remove(f)
+	}
+	_ = os.Remove(filepath.Join(dir, pagesList))
 
 	size, _ := dirSize(dir)
 	asset := &video.MediaAsset{
 		Key:          video.CacheKey(key),
-		Title:        v.Title,
+		Title:        deck[0].Title,
 		Duration:     time.Duration(m.Seconds) * time.Second,
 		Spec:         spec,
 		SizeBytes:    size,
@@ -135,10 +149,45 @@ func MessageEntrypoint(c video.Container) string {
 	return MasterName
 }
 
-func (m *MessageRenderer) encode(ctx context.Context, frame, dir string, spec video.OutputSpec) error {
-	args := []string{
-		"-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-		"-loop", "1", "-i", frame,
+// pagesList is the concat demuxer's script, written beside the frames
+// and removed once the encode is done.
+const pagesList = "pages.txt"
+
+// videoInput builds the video input for the clip. One page loops a
+// single still for the whole duration; several are held in turn by the
+// concat demuxer, which is all paging costs -- no transitions, just a
+// cut when each page's share of the running time is up.
+func (m *MessageRenderer) videoInput(frames []string, dir string) ([]string, error) {
+	if len(frames) == 1 {
+		return []string{"-loop", "1", "-i", frames[0]}, nil
+	}
+	per := float64(m.Seconds) / float64(len(frames))
+	var b strings.Builder
+	for _, f := range frames {
+		fmt.Fprintf(&b, "file '%s'\nduration %.3f\n", filepath.Base(f), per)
+	}
+	// CRITICAL: the concat demuxer ignores the last entry's duration
+	// unless that file is listed once more; without this the final page
+	// flashes past in a single frame.
+	fmt.Fprintf(&b, "file '%s'\n", filepath.Base(frames[len(frames)-1]))
+
+	list := filepath.Join(dir, pagesList)
+	if err := os.WriteFile(list, []byte(b.String()), 0o644); err != nil {
+		return nil, err
+	}
+	// Entries are bare filenames, resolved against the list's own
+	// directory -- which sidesteps quoting a Windows path inside it.
+	return []string{"-f", "concat", "-i", list}, nil
+}
+
+func (m *MessageRenderer) encode(ctx context.Context, frames []string, dir string, spec video.OutputSpec) error {
+	input, err := m.videoInput(frames, dir)
+	if err != nil {
+		return err
+	}
+	args := []string{"-hide_banner", "-loglevel", "error", "-nostdin", "-y"}
+	args = append(args, input...)
+	args = append(args,
 		// A silent track avoids players that misbehave on video with none.
 		"-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
 		"-t", fmt.Sprint(m.Seconds),
@@ -152,7 +201,7 @@ func (m *MessageRenderer) encode(ctx context.Context, frame, dir string, spec vi
 		"-force_key_frames", "expr:gte(t,n_forced*3)",
 		"-c:a", "aac", "-b:a", "64k",
 		"-shortest",
-	}
+	)
 	if spec.Container == video.ContainerMP4 {
 		args = append(args, "-movflags", "+faststart", filepath.Join(dir, "message.mp4"))
 	} else {
