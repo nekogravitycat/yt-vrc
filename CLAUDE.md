@@ -77,6 +77,20 @@ source (local process detection, a heartbeat endpoint) means a new
   `context.WithoutCancel`, so the work continues and re-entering the same
   URL joins it (one resolve, not two) or finds it finished. This is why
   the progress frame says to try the URL again.
+- **The grace bounds the wait, so the frame that ends it has to be
+  encoded before the deadline, not after.** A message render costs a PNG
+  draw plus an ffmpeg encode — ~0.6s idle, several times that while the
+  very job being waited on saturates the CPU — and billing that on top of
+  the grace is what made a cold 1h video answer in 11.1s against an 8s
+  grace (measured through the tunnel). `prepareWithinGrace` therefore
+  snapshots progress `prewarmReserve` (2s) before the deadline and
+  encodes that frame alongside the remaining wait, so the deadline finds
+  it already in the message cache. The frame served is deliberately that
+  2s-old snapshot: re-reading progress at the deadline would hash to a
+  frame nobody has drawn yet and put the encode back on the viewer's
+  clock. The wait itself is not shortened — an artifact landing in the
+  last two seconds still plays, and the spent encode is what the next
+  poll would have needed anyway.
 - **Anything shown while a job runs must round its numbers.** A view
   carrying a live byte count hashes differently on every poll, so it
   re-encodes (~0.5s) each time it is asked for — exactly when the viewer

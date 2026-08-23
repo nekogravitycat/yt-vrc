@@ -261,13 +261,22 @@ func (s *Server) serveVideo(w http.ResponseWriter, r *http.Request, route Route)
 		}
 	}
 
-	asset, err := s.prepareWithinGrace(r, route)
+	started := time.Now()
+	asset, warm, err := s.prepareWithinGrace(r, route, msgSpec)
 	if err != nil {
 		if errors.Is(err, errStillPreparing) {
 			title, p, _ := s.Play.Progress(route.Spec.CacheKey(route.VideoID))
-			s.Log.Info("still preparing", "id", route.VideoID, "stage", p.Stage)
-			s.deliver(w, r, "v-"+route.VideoID.String(),
-				presenter.Preparing(title, route.Spec, p), msgSpec, http.StatusAccepted)
+			s.Log.Info("still preparing", "id", route.VideoID, "stage", p.Stage, "waited", time.Since(started))
+			// The prewarmed deck is a snapshot from a reserve ago, and is
+			// preferred over this fresher reading precisely because it is
+			// already encoded: re-reading progress here would hash to a
+			// frame nobody has drawn yet and put the encode back on the
+			// viewer's clock.
+			deck := warm
+			if deck == nil {
+				deck = message.One(presenter.Preparing(title, route.Spec, p))
+			}
+			s.deliverDeck(w, r, "v-"+route.VideoID.String(), deck, msgSpec, http.StatusAccepted)
 			return
 		}
 		s.Log.Error("prepare failed", "id", route.VideoID, "err", err)
@@ -287,7 +296,9 @@ func (s *Server) serveVideo(w http.ResponseWriter, r *http.Request, route Route)
 	s.serveFrom(w, r, s.Play.Open, asset.Key, "video.mp4", cacheImmutable)
 }
 
-// prepareWithinGrace waits out at most PrepareGrace for a ready artifact.
+// prepareWithinGrace waits out at most PrepareGrace for a ready artifact,
+// returning it if it landed in time or -- alongside errStillPreparing --
+// the progress frame prewarmed during the wait (see prewarmReserve).
 //
 // CRITICAL: the deadline bounds the *wait*, not the job. Prepare runs its
 // work under context.WithoutCancel, so letting this context expire leaves
@@ -297,7 +308,7 @@ func (s *Server) serveVideo(w http.ResponseWriter, r *http.Request, route Route)
 // Cloudflare deployment the tunnel gives up at 100s regardless). A
 // progress frame turns that dead wait into something the viewer can see
 // and act on.
-func (s *Server) prepareWithinGrace(r *http.Request, route Route) (*video.MediaAsset, error) {
+func (s *Server) prepareWithinGrace(r *http.Request, route Route, msgSpec video.OutputSpec) (*video.MediaAsset, message.Deck, error) {
 	grace := s.PrepareGrace
 	if grace <= 0 {
 		grace = defaultPrepareGrace
@@ -305,16 +316,65 @@ func (s *Server) prepareWithinGrace(r *http.Request, route Route) (*video.MediaA
 	ctx, cancel := context.WithTimeout(r.Context(), grace)
 	defer cancel()
 
+	var (
+		warmMu sync.Mutex
+		warm   message.Deck
+	)
+	prewarm := time.AfterFunc(grace-prewarmReserve(grace), func() {
+		title, p, _ := s.Play.Progress(route.Spec.CacheKey(route.VideoID))
+		deck := message.One(presenter.Preparing(title, route.Spec, p))
+		warmMu.Lock()
+		warm = deck
+		warmMu.Unlock()
+		// Detached from the wait it runs beside: this render IS the
+		// response the wait is heading for, so the deadline that ends the
+		// wait must not kill it half-encoded.
+		rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), prewarmRenderTimeout)
+		defer rcancel()
+		if _, err := s.Messages.Render(rctx, deck, msgSpec); err != nil {
+			s.Log.Debug("prewarm render failed", "id", route.VideoID, "err", err)
+		}
+	})
+	defer prewarm.Stop()
+
 	asset, err := s.Play.Prepare(ctx, route.VideoID, route.Spec)
 	if err == nil {
-		return asset, nil
+		return asset, nil, nil
 	}
 	// Only our own deadline means "come back later": the caller hanging
 	// up, and the job failing on its own, are both real errors to report.
 	if errors.Is(err, context.DeadlineExceeded) && ctx.Err() != nil && r.Context().Err() == nil {
-		return nil, errStillPreparing
+		warmMu.Lock()
+		defer warmMu.Unlock()
+		return nil, warm, errStillPreparing
 	}
-	return nil, err
+	return nil, nil, err
+}
+
+// prewarmRenderTimeout bounds a prewarm encode that has gone wrong; a
+// 15s still frame is a second of work, so anything near this is stuck.
+const prewarmRenderTimeout = 30 * time.Second
+
+// prewarmReserve is how much of the grace goes on having the progress
+// frame ready instead of on waiting for the artifact.
+//
+// CRITICAL: PrepareGrace bounds the *wait*, but the reply that wait ends
+// in costs a message render on top of it -- a PNG draw plus an ffmpeg
+// encode, ~0.6s on an idle box and several times that while the very job
+// being waited on is saturating the CPU, which is exactly when this frame
+// gets asked for. Measured through the tunnel, an 8s grace answered a
+// cold 1h video in 11.1s, past the point a player gives up on a URL. So
+// the frame is snapshotted and encoded a reserve early, in parallel with
+// the rest of the wait, and the deadline finds it already in the message
+// cache. The wait itself is not shortened -- an artifact that lands in
+// the last two seconds still plays, and the spent encode is cached for
+// the next poll either way.
+func prewarmReserve(grace time.Duration) time.Duration {
+	const reserve = 2 * time.Second
+	if grace/2 < reserve {
+		return grace / 2
+	}
+	return reserve
 }
 
 // deliver renders a view under a stable slot URL (name identifies the

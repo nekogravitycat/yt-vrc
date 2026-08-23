@@ -23,15 +23,47 @@ import (
 // recordingMessages stands in for the renderer, keeping what it was
 // asked to draw instead of encoding it.
 type recordingMessages struct {
-	mu   sync.Mutex
-	deck message.Deck
-	spec video.OutputSpec
+	// encode is what one cold render costs, standing in for the PNG draw
+	// and ffmpeg encode the real renderer pays.
+	encode time.Duration
+
+	mu    sync.Mutex
+	deck  message.Deck
+	spec  video.OutputSpec
+	seen  map[string]bool
+	locks map[string]*sync.Mutex
 }
 
 func (m *recordingMessages) Render(_ context.Context, deck message.Deck, spec video.OutputSpec) (*video.MediaAsset, error) {
+	key := deck.Hash() + string(spec.Container)
+
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	if m.seen == nil {
+		m.seen = map[string]bool{}
+	}
+	if m.locks == nil {
+		m.locks = map[string]*sync.Mutex{}
+	}
+	lock, ok := m.locks[key]
+	if !ok {
+		lock = &sync.Mutex{}
+		m.locks[key] = lock
+	}
 	m.deck, m.spec = deck, spec
+	m.mu.Unlock()
+
+	// Content-keyed and serialised per key like the real renderer: the
+	// same frame encodes once, and a second ask arriving mid-encode waits
+	// for it rather than sailing past.
+	lock.Lock()
+	defer lock.Unlock()
+	m.mu.Lock()
+	cold := !m.seen[key]
+	m.seen[key] = true
+	m.mu.Unlock()
+	if cold {
+		time.Sleep(m.encode)
+	}
 	return &video.MediaAsset{Key: video.CacheKey("rendered_" + string(spec.Container)), Spec: spec}, nil
 }
 
@@ -197,4 +229,33 @@ type failingResolver struct{}
 
 func (failingResolver) Resolve(context.Context, video.ID, video.OutputSpec) (*video.Resolution, error) {
 	return nil, video.ErrNotFound
+}
+
+// CRITICAL: PrepareGrace bounds the wait, but the progress frame that
+// ends it has to be encoded before it can be served -- billed to the
+// viewer on top of the grace unless it is drawn while the wait is still
+// running. A cold 1h video measured 11.1s against an 8s grace before the
+// frame was prewarmed.
+func TestProgressFrameIsEncodedDuringTheWait(t *testing.T) {
+	const (
+		grace  = 400 * time.Millisecond
+		encode = 150 * time.Millisecond
+	)
+	msgs := &recordingMessages{encode: encode}
+	s := testServer(t, msgs, &blockingResolver{})
+	s.PrepareGrace = grace
+
+	start := time.Now()
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/dQw4w9WgXcQ", nil))
+	took := time.Since(start)
+
+	if deck, _ := msgs.last(); len(deck) != 1 || deck[0].Kind != message.KindProgress {
+		t.Fatalf("want one progress frame, got %+v", deck)
+	}
+	// Serialised, this would be grace+encode; prewarmed, the encode is
+	// already done when the deadline lands.
+	if limit := grace + encode/2; took > limit {
+		t.Errorf("answered in %s, want under %s -- the encode was billed to the viewer", took, limit)
+	}
 }
