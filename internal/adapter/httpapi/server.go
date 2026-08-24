@@ -187,6 +187,33 @@ func isAssetFile(name string) bool {
 		strings.HasSuffix(name, ".m3u8")
 }
 
+// isCacheKeySegment reports whether seg has the shape OutputSpec.CacheKey
+// produces: "{id}_{quality}_{container}". A video ID may itself contain
+// underscores (the id pattern allows them, spec §4.1.1), so this parses
+// from the tail -- quality and container never do -- rather than counting
+// underscores in the whole segment, which undercounts for such an ID and
+// sends its HLS sub-resources (media.m3u8, every .ts segment) through
+// ParsePath instead, where they don't match anything.
+func isCacheKeySegment(seg string) bool {
+	i := strings.LastIndex(seg, "_")
+	if i < 0 {
+		return false
+	}
+	container, rest := seg[i+1:], seg[:i]
+	if _, ok := video.ParseContainer(container); !ok {
+		return false
+	}
+	j := strings.LastIndex(rest, "_")
+	if j < 0 {
+		return false
+	}
+	quality, id := rest[j+1:], rest[:j]
+	if _, err := video.ParseQuality(quality); err != nil {
+		return false
+	}
+	return id != ""
+}
+
 func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 	segs := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 
@@ -202,7 +229,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Video artifact files: /{cachekey}/{file}
-	if len(segs) == 2 && isAssetFile(segs[1]) && strings.Count(segs[0], "_") == 2 {
+	if len(segs) == 2 && isAssetFile(segs[1]) && isCacheKeySegment(segs[0]) {
 		s.serveFrom(w, r, s.Play.Open, video.CacheKey(segs[0]), segs[1], cacheImmutable)
 		return
 	}
