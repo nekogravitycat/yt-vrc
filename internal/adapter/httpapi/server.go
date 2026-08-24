@@ -312,14 +312,13 @@ func (s *Server) serveVideo(w http.ResponseWriter, r *http.Request, route Route)
 		s.deliver(w, r, "v-"+route.VideoID.String(), presenter.PrepareError(route.VideoID, err), msgSpec, statusFor(err))
 		return
 	}
-	w.Header().Set("Cache-Control", "public, max-age=60")
-
 	// CRITICAL: served inline, never via 302 — AVPro doesn't follow
 	// redirects or sniff Content-Type, so a redirect reads as unplayable.
 	if asset.Spec.Container == video.ContainerHLS {
-		s.servePlaylist(w, r, s.Play.Open, asset.Key, "/"+string(asset.Key)+"/")
+		s.servePlaylist(w, r, s.Play.Open, asset.Key, "/"+string(asset.Key)+"/", "public, max-age=60")
 		return
 	}
+	w.Header().Set("Cache-Control", "public, max-age=60")
 	s.serveFrom(w, r, s.Play.Open, asset.Key, "video.mp4", cacheImmutable)
 }
 
@@ -455,11 +454,10 @@ func (s *Server) deliverDeck(w http.ResponseWriter, r *http.Request, name string
 
 	slot := slotFor(name, spec.Container)
 	s.slotTable().set(slot, asset.Key)
-	w.Header().Set("Cache-Control", cacheNever)
 
 	if spec.Container == video.ContainerHLS {
 		s.servePlaylist(w, r, s.Messages.Open, asset.Key,
-			"/"+messagePrefix+"/"+slot+"/")
+			"/"+messagePrefix+"/"+slot+"/", cacheNever)
 		return
 	}
 	s.serveFrom(w, r, s.Messages.Open, asset.Key, ffmpeg.MessageEntrypoint(spec.Container), cacheNever)
@@ -475,16 +473,22 @@ func (s *Server) serveFrom(w http.ResponseWriter, r *http.Request, open opener, 
 	}
 	defer func() { _ = f.Close() }()
 
-	w.Header().Set("Cache-Control", cacheControl)
-
 	switch {
 	case strings.HasSuffix(name, ".m3u8"):
 		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		// A playlist is a few hundred bytes of text -- the one asset type
+		// here Cloudflare's edge will recompress on the fly. On a cache
+		// miss that has produced a corrupted stream for the first viewer
+		// (net::ERR_CONTENT_DECODING_FAILED, gone on reload once the
+		// object is cached and served as-is). no-transform opts the whole
+		// class of bug out; compression buys nothing at this size anyway.
+		cacheControl += ", no-transform"
 	case strings.HasSuffix(name, ".ts"):
 		w.Header().Set("Content-Type", "video/mp2t")
 	case strings.HasSuffix(name, ".mp4"):
 		w.Header().Set("Content-Type", "video/mp4")
 	}
+	w.Header().Set("Cache-Control", cacheControl)
 	// ServeContent handles Range, 206 and Content-Length correctly;
 	// hand-rolling those semantics is a known source of player bugs
 	// (spec §4.2.4).
@@ -577,7 +581,7 @@ func errorIs(err, target error) bool { return errors.Is(err, target) }
 // absolute paths: ffmpeg writes them relative to the playlist file,
 // which is wrong once served from a different URL than the artifact
 // directory (the video URL, or a message slot).
-func (s *Server) servePlaylist(w http.ResponseWriter, r *http.Request, open opener, key video.CacheKey, prefix string) {
+func (s *Server) servePlaylist(w http.ResponseWriter, r *http.Request, open opener, key video.CacheKey, prefix, cacheControl string) {
 	f, modTime, err := open(key, ffmpeg.MasterName)
 	if err != nil {
 		http.Error(w, "not found", http.StatusNotFound)
@@ -601,5 +605,9 @@ func (s *Server) servePlaylist(w http.ResponseWriter, r *http.Request, open open
 	body := strings.Join(lines, "\n")
 
 	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+	// See the matching comment in serveFrom: a playlist is small text,
+	// the type Cloudflare recompresses on a cache miss, and that has
+	// corrupted the stream for a first-time viewer.
+	w.Header().Set("Cache-Control", cacheControl+", no-transform")
 	http.ServeContent(w, r, ffmpeg.MasterName, modTime, strings.NewReader(body))
 }
