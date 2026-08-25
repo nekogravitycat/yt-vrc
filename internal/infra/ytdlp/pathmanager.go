@@ -32,7 +32,7 @@ func (p *PathManager) CheckLatest(ctx context.Context) (string, error) {
 	return m.CheckLatest(ctx)
 }
 
-func (p *PathManager) Install(ctx context.Context, version string, verify port.ToolchainVerifier, progress func(string)) (*port.UpgradeResult, error) {
+func (p *PathManager) Install(ctx context.Context, version string, verify port.ToolchainVerifier, progress func(string), prune bool) (*port.UpgradeResult, error) {
 	return &port.UpgradeResult{Stage: StageChecking, Err: errUnmanaged.Error()}, errUnmanaged
 }
 

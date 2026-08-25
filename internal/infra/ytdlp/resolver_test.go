@@ -116,7 +116,7 @@ func TestPathManagerRefusesToInstallOrRollBack(t *testing.T) {
 	}
 
 	var verifier port.ToolchainVerifier
-	res, err := p.Install(context.Background(), "2026.09.02", verifier, nil)
+	res, err := p.Install(context.Background(), "2026.09.02", verifier, nil, true)
 	if !ErrUnmanaged(err) {
 		t.Errorf("Install err = %v, want the unmanaged refusal", err)
 	}

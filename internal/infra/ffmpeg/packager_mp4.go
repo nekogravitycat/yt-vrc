@@ -27,17 +27,25 @@ type MP4Packager struct {
 
 func (p *MP4Packager) Container() video.Container { return video.ContainerMP4 }
 
-func (p *MP4Packager) Package(ctx context.Context, res *video.Resolution, srcVideo, srcAudio, destDir string) (*video.MediaAsset, error) {
-	if err := os.MkdirAll(destDir, 0o755); err != nil {
-		return nil, err
+func (p *MP4Packager) Package(ctx context.Context, res *video.Resolution, srcVideo, srcAudio, destDir string) (_ *video.MediaAsset, err error) {
+	if mkErr := os.MkdirAll(destDir, 0o755); mkErr != nil {
+		return nil, mkErr
 	}
+	// A failure past this point must not leave a partial mp4 behind for
+	// a caller to remember to sweep — the packager owns everything
+	// under destDir.
+	defer func() {
+		if err != nil {
+			_ = os.RemoveAll(destDir)
+		}
+	}()
 	out := filepath.Join(destDir, MP4Name)
 
 	args := []string{"-hide_banner", "-loglevel", "error", "-nostdin", "-y"}
 	if res.Combined() {
-		args = append(args, "-i", srcVideo, "-map", "0:v:0", "-map", "0:a:0")
+		args = append(args, "-i", ffmpegInput(srcVideo), "-map", "0:v:0", "-map", "0:a:0")
 	} else {
-		args = append(args, "-i", srcVideo, "-i", srcAudio, "-map", "0:v:0", "-map", "1:a:0")
+		args = append(args, "-i", ffmpegInput(srcVideo), "-i", ffmpegInput(srcAudio), "-map", "0:v:0", "-map", "1:a:0")
 	}
 	args = append(args,
 		"-c", "copy",

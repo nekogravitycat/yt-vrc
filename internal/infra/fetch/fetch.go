@@ -28,6 +28,16 @@ type Fetcher struct {
 }
 
 func New(workers int, chunkBytes int64) *Fetcher {
+	// A misconfigured 0/negative worker or chunk count would otherwise
+	// divide by zero or leave the whole file unwritten while still
+	// reporting success — guard rather than propagate the typo into a
+	// cached, zero-filled "successful" download.
+	if workers <= 0 {
+		workers = 8
+	}
+	if chunkBytes <= 0 {
+		chunkBytes = 4 << 20
+	}
 	return &Fetcher{
 		client: &http.Client{
 			Timeout: 5 * time.Minute,
@@ -44,9 +54,9 @@ func New(workers int, chunkBytes int64) *Fetcher {
 
 // Fetch downloads t into dest. onProgress may be nil.
 func (f *Fetcher) Fetch(ctx context.Context, t video.Track, dest string, onProgress func(done, total int64)) error {
-	total := t.SizeBytes
-	if total <= 0 {
-		total = clenFromURL(t.URL)
+	declared := t.SizeBytes
+	if declared <= 0 {
+		declared = clenFromURL(t.URL)
 	}
 
 	// NOTE: resolve the redirect once and reuse it — re-following a 302
@@ -55,6 +65,15 @@ func (f *Fetcher) Fetch(ctx context.Context, t video.Track, dest string, onProgr
 	if err != nil {
 		return err
 	}
+	// A server serving a body shorter (or longer) than what the track
+	// metadata promised means truncation or a wrong redirect target;
+	// the chunks we'd schedule from a wrong total would leave part of
+	// the file zero-padded and still report success.
+	if declared > 0 && probed > 0 && declared != probed {
+		return fmt.Errorf("size mismatch for %s: track declares %d bytes, server reports %d", dest, declared, probed)
+	}
+
+	total := declared
 	if total <= 0 {
 		total = probed
 	}

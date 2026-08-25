@@ -146,7 +146,7 @@ func TestInstallMakesTheVerifiedVersionCurrent(t *testing.T) {
 	g := newFakeGitHub(t, "2026.09.02", "2026.09.02")
 	m := g.manager(t)
 
-	res, err := m.Install(context.Background(), "2026.09.02", &verifier{}, nil)
+	res, err := m.Install(context.Background(), "2026.09.02", &verifier{}, nil, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,11 +166,11 @@ func TestInstallMakesTheVerifiedVersionCurrent(t *testing.T) {
 func TestFailedSmokeTestLeavesCurrentAlone(t *testing.T) {
 	g := newFakeGitHub(t, "2026.09.02", "2026.08.19", "2026.09.02")
 	m := g.manager(t)
-	if _, err := m.Install(context.Background(), "2026.08.19", nil, nil); err != nil {
+	if _, err := m.Install(context.Background(), "2026.08.19", nil, nil, true); err != nil {
 		t.Fatal(err)
 	}
 
-	res, err := m.Install(context.Background(), "2026.09.02", &verifier{fail: true}, nil)
+	res, err := m.Install(context.Background(), "2026.09.02", &verifier{fail: true}, nil, true)
 	if err == nil {
 		t.Fatal("a failing smoke test must fail the install")
 	}
@@ -193,7 +193,7 @@ func TestChecksumMismatchAbortsBeforeTheSmokeTest(t *testing.T) {
 	m := g.manager(t)
 	v := &verifier{}
 
-	res, err := m.Install(context.Background(), "2026.09.02", v, nil)
+	res, err := m.Install(context.Background(), "2026.09.02", v, nil, true)
 	if err == nil || !strings.Contains(err.Error(), "checksum mismatch") {
 		t.Fatalf("err = %v, want a checksum mismatch", err)
 	}
@@ -210,7 +210,7 @@ func TestUnpublishedChecksumIsRefused(t *testing.T) {
 	g.releases["2026.09.02"].omitSums = true
 	m := g.manager(t)
 
-	if _, err := m.Install(context.Background(), "2026.09.02", &verifier{}, nil); err == nil {
+	if _, err := m.Install(context.Background(), "2026.09.02", &verifier{}, nil, true); err == nil {
 		t.Fatal("an install with no published checksum must not proceed")
 	}
 }
@@ -222,7 +222,7 @@ func TestVersionMismatchAborts(t *testing.T) {
 	g.releases["2026.09.02"].body = payload("2020.01.01")
 	m := g.manager(t)
 
-	res, err := m.Install(context.Background(), "2026.09.02", &verifier{}, nil)
+	res, err := m.Install(context.Background(), "2026.09.02", &verifier{}, nil, true)
 	if err == nil || !strings.Contains(err.Error(), "reports version") {
 		t.Fatalf("err = %v, want a version mismatch", err)
 	}
@@ -237,7 +237,7 @@ func TestNightlyVersionSuffixIsAccepted(t *testing.T) {
 	g.releases["2026.09.02"].body = payload("2026.09.02.232349")
 	m := g.manager(t)
 
-	if _, err := m.Install(context.Background(), "2026.09.02", &verifier{}, nil); err != nil {
+	if _, err := m.Install(context.Background(), "2026.09.02", &verifier{}, nil, true); err != nil {
 		t.Fatalf("a nightly suffix should be accepted: %v", err)
 	}
 }
@@ -245,12 +245,12 @@ func TestNightlyVersionSuffixIsAccepted(t *testing.T) {
 func TestReinstallingTheCurrentVersionIsANoChange(t *testing.T) {
 	g := newFakeGitHub(t, "2026.09.02", "2026.09.02")
 	m := g.manager(t)
-	if _, err := m.Install(context.Background(), "2026.09.02", nil, nil); err != nil {
+	if _, err := m.Install(context.Background(), "2026.09.02", nil, nil, true); err != nil {
 		t.Fatal(err)
 	}
 
 	v := &verifier{}
-	res, err := m.Install(context.Background(), "2026.09.02", v, nil)
+	res, err := m.Install(context.Background(), "2026.09.02", v, nil, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -267,14 +267,14 @@ func TestReinstallingTheCurrentVersionIsANoChange(t *testing.T) {
 func TestAMissingBinaryUnderTheMarkerIsReinstalled(t *testing.T) {
 	g := newFakeGitHub(t, "2026.09.02", "2026.09.02")
 	m := g.manager(t)
-	if _, err := m.Install(context.Background(), "2026.09.02", nil, nil); err != nil {
+	if _, err := m.Install(context.Background(), "2026.09.02", nil, nil, true); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Remove(m.binaryFor("2026.09.02")); err != nil {
 		t.Fatal(err)
 	}
 
-	res, err := m.Install(context.Background(), "2026.09.02", &verifier{}, nil)
+	res, err := m.Install(context.Background(), "2026.09.02", &verifier{}, nil, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,7 +293,7 @@ func TestProgressReportsEveryStage(t *testing.T) {
 	var stages []string
 	if _, err := m.Install(context.Background(), "2026.09.02", &verifier{}, func(s string) {
 		stages = append(stages, s)
-	}); err != nil {
+	}, true); err != nil {
 		t.Fatal(err)
 	}
 	want := []string{StageDownloading, StageVerifying, StageSmokeTest, StageSwitching}
@@ -306,10 +306,10 @@ func TestRollbackReturnsToThePreviousVersion(t *testing.T) {
 	g := newFakeGitHub(t, "2026.09.02", "2026.08.19", "2026.09.02")
 	m := g.manager(t)
 	ctx := context.Background()
-	if _, err := m.Install(ctx, "2026.08.19", nil, nil); err != nil {
+	if _, err := m.Install(ctx, "2026.08.19", nil, nil, true); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.Install(ctx, "2026.09.02", nil, nil); err != nil {
+	if _, err := m.Install(ctx, "2026.09.02", nil, nil, true); err != nil {
 		t.Fatal(err)
 	}
 	if m.PreviousVersion() != "2026.08.19" {
@@ -341,10 +341,10 @@ func TestRollbackProceedsDespiteAFailingSmokeTest(t *testing.T) {
 	g := newFakeGitHub(t, "2026.09.02", "2026.08.19", "2026.09.02")
 	m := g.manager(t)
 	ctx := context.Background()
-	if _, err := m.Install(ctx, "2026.08.19", nil, nil); err != nil {
+	if _, err := m.Install(ctx, "2026.08.19", nil, nil, true); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.Install(ctx, "2026.09.02", nil, nil); err != nil {
+	if _, err := m.Install(ctx, "2026.09.02", nil, nil, true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -363,7 +363,7 @@ func TestRollbackProceedsDespiteAFailingSmokeTest(t *testing.T) {
 func TestRollbackWithNothingToReturnToFails(t *testing.T) {
 	g := newFakeGitHub(t, "2026.09.02", "2026.09.02")
 	m := g.manager(t)
-	if _, err := m.Install(context.Background(), "2026.09.02", nil, nil); err != nil {
+	if _, err := m.Install(context.Background(), "2026.09.02", nil, nil, true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -379,10 +379,10 @@ func TestRollbackToAPrunedVersionFails(t *testing.T) {
 	g := newFakeGitHub(t, "2026.09.02", "2026.08.19", "2026.09.02")
 	m := g.manager(t)
 	ctx := context.Background()
-	if _, err := m.Install(ctx, "2026.08.19", nil, nil); err != nil {
+	if _, err := m.Install(ctx, "2026.08.19", nil, nil, true); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.Install(ctx, "2026.09.02", nil, nil); err != nil {
+	if _, err := m.Install(ctx, "2026.09.02", nil, nil, true); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.RemoveAll(m.versionDir("2026.08.19")); err != nil {
@@ -403,11 +403,11 @@ func TestBinaryPathRereadsTheMarker(t *testing.T) {
 	g := newFakeGitHub(t, "2026.09.02", "2026.08.19", "2026.09.02")
 	m := g.manager(t)
 	ctx := context.Background()
-	if _, err := m.Install(ctx, "2026.08.19", nil, nil); err != nil {
+	if _, err := m.Install(ctx, "2026.08.19", nil, nil, true); err != nil {
 		t.Fatal(err)
 	}
 	before := m.BinaryPath()
-	if _, err := m.Install(ctx, "2026.09.02", nil, nil); err != nil {
+	if _, err := m.Install(ctx, "2026.09.02", nil, nil, true); err != nil {
 		t.Fatal(err)
 	}
 	if after := m.BinaryPath(); after == before {
@@ -433,7 +433,7 @@ func TestPruneKeepsOnlyCurrentAndPrevious(t *testing.T) {
 	m := g.manager(t)
 	ctx := context.Background()
 	for _, v := range []string{"2026.08.19", "2026.09.02", "2026.09.10"} {
-		if _, err := m.Install(ctx, v, nil, nil); err != nil {
+		if _, err := m.Install(ctx, v, nil, nil, true); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -470,7 +470,7 @@ func TestEnsureInstallsOnAnEmptyVolume(t *testing.T) {
 func TestEnsureLeavesAnExistingInstallAlone(t *testing.T) {
 	g := newFakeGitHub(t, "2026.09.02", "2026.08.19", "2026.09.02")
 	m := g.manager(t)
-	if _, err := m.Install(context.Background(), "2026.08.19", nil, nil); err != nil {
+	if _, err := m.Install(context.Background(), "2026.08.19", nil, nil, true); err != nil {
 		t.Fatal(err)
 	}
 

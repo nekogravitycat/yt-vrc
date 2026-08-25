@@ -85,7 +85,9 @@ func (d *Discord) Start(ctx context.Context) error {
 	if err := s.Open(); err != nil {
 		return fmt.Errorf("discord gateway: %w", err)
 	}
+	d.mu.Lock()
 	d.session = s
+	d.mu.Unlock()
 	if d.Log != nil {
 		d.Log.Info("discord signal started", "user", d.UserID, "activity", d.activityName())
 	}
@@ -151,8 +153,11 @@ func (d *Discord) Status(context.Context) (availability.Status, error) {
 }
 
 func (d *Discord) Close() error {
-	if d.session == nil {
+	d.mu.Lock()
+	s := d.session
+	d.mu.Unlock()
+	if s == nil {
 		return nil
 	}
-	return d.session.Close()
+	return s.Close()
 }

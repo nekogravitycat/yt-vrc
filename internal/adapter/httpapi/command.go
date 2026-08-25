@@ -343,7 +343,12 @@ func (s *Server) purge(w http.ResponseWriter, r *http.Request, route Route, msgS
 	}
 
 	if len(route.Args) == 0 || route.Args[0] == "" {
-		token := s.issuePurgeToken()
+		token, err := s.issuePurgeToken()
+		if err != nil {
+			s.Log.Error("issue purge token", "err", err)
+			s.deliver(w, r, "purge", presenter.PrepareError("", err), msgSpec, http.StatusInternalServerError)
+			return
+		}
 		s.deliver(w, r, "purge", presenter.PurgeConfirm(token, purgeTokenTTL, len(items), total), msgSpec, http.StatusOK)
 		return
 	}
@@ -416,9 +421,14 @@ func videoIDArg(args []string) (video.ID, error) {
 // panel, since the token has to be transcribed by hand in VR.
 const purgeAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
-func (s *Server) issuePurgeToken() string {
+func (s *Server) issuePurgeToken() (string, error) {
 	b := make([]byte, 4)
-	rand.Read(b)
+	// Fail closed: a read error would otherwise leave b all-zero and the
+	// token deterministic, silently defeating the confirmation gate on
+	// the single most destructive command.
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
 	tok := make([]byte, 4)
 	for i, c := range b {
 		tok[i] = purgeAlphabet[int(c)%len(purgeAlphabet)]
@@ -427,7 +437,7 @@ func (s *Server) issuePurgeToken() string {
 	s.purgeToken = string(tok)
 	s.purgeExpiry = time.Now().Add(purgeTokenTTL)
 	s.mu.Unlock()
-	return string(tok)
+	return string(tok), nil
 }
 
 func (s *Server) consumePurgeToken(got string) bool {

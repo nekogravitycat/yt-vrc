@@ -112,6 +112,11 @@ func (u *UseCase) Trigger(ctx context.Context, kind Kind) (State, bool) {
 	}
 	u.state = State{Running: true, Kind: kind, Stage: "starting", StartedAt: now}
 	s := u.state
+	// Set under the same lock that flips Running, before the goroutine
+	// even starts: otherwise a video request between Trigger returning
+	// and the goroutine reaching run() would see Maintenance() as false
+	// and slip a resolve past a committed, about-to-drain upgrade.
+	u.maintenance.Store(true)
 	u.mu.Unlock()
 
 	// NOTE: detached via WithoutCancel — cancelling a swap mid-flight is worse
@@ -128,7 +133,8 @@ func (u *UseCase) run(ctx context.Context, kind Kind) {
 		defer cancel()
 	}
 
-	u.maintenance.Store(true)
+	// maintenance is already set by Trigger; clear it once this run
+	// (successful or not) is done.
 	defer u.maintenance.Store(false)
 
 	// NOTE: read the outgoing version here, not in Trigger — it shells out
@@ -163,6 +169,7 @@ func (u *UseCase) run(ctx context.Context, kind Kind) {
 
 func (u *UseCase) execute(ctx context.Context, kind Kind) (*port.UpgradeResult, error) {
 	u.setStage("draining")
+	drainOK := true
 	if u.Drain != nil {
 		drainCtx := ctx
 		if u.DrainTimeout > 0 {
@@ -170,10 +177,17 @@ func (u *UseCase) execute(ctx context.Context, kind Kind) (*port.UpgradeResult, 
 			drainCtx, cancel = context.WithTimeout(ctx, u.DrainTimeout)
 			defer cancel()
 		}
-		if err := u.Drain(drainCtx); err != nil && u.Log != nil {
+		if err := u.Drain(drainCtx); err != nil {
 			// Survivable: a job outliving the drain keeps its already-launched
-			// binary; the swap only affects the next resolve.
-			u.Log.Warn("upgrade drain did not complete", "err", err)
+			// binary; the swap only affects the next resolve. But pruning old
+			// version directories is NOT survivable here — that in-flight job's
+			// binary could be one of the versions pruneOldVersions would delete
+			// out from under it, so skip this run's prune entirely rather than
+			// risk removing a binary a running process still holds open.
+			drainOK = false
+			if u.Log != nil {
+				u.Log.Warn("upgrade drain did not complete; skipping this run's version prune", "err", err)
+			}
 		}
 	}
 
@@ -191,7 +205,7 @@ func (u *UseCase) execute(ctx context.Context, kind Kind) (*port.UpgradeResult, 
 	u.latest, u.latestAt = latest, time.Now()
 	u.mu.Unlock()
 
-	return u.Tool.Install(ctx, latest, u.Verifier, u.setStage)
+	return u.Tool.Install(ctx, latest, u.Verifier, u.setStage, drainOK)
 }
 
 func (u *UseCase) setStage(stage string) {

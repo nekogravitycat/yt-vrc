@@ -172,7 +172,7 @@ func (m *Manager) Ensure(ctx context.Context) error {
 	// No smoke test here: bootstrap runs before the service is
 	// listening, and there's no alternative version to fall back to
 	// anyway if it failed.
-	if _, err := m.Install(ctx, latest, nil, nil); err != nil {
+	if _, err := m.Install(ctx, latest, nil, nil, true); err != nil {
 		return fmt.Errorf("bootstrapping yt-dlp %s: %w", latest, err)
 	}
 	if m.Log != nil {

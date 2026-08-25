@@ -32,6 +32,10 @@ type FSStore struct {
 
 	mu    sync.RWMutex
 	index map[video.CacheKey]*video.MediaAsset
+	// totalBytes is the running sum of index[*].SizeBytes, maintained
+	// incrementally so evict()'s early-out doesn't rescan the whole
+	// index on every Put.
+	totalBytes int64
 }
 
 func NewFSStore(dataDir string) (*FSStore, error) {
@@ -71,6 +75,7 @@ func (s *FSStore) load() error {
 		}
 		a.Dir = dir
 		s.index[a.Key] = &a
+		s.totalBytes += a.SizeBytes
 	}
 	return nil
 }
@@ -110,7 +115,11 @@ func (s *FSStore) Put(a *video.MediaAsset) error {
 		return err
 	}
 	s.mu.Lock()
+	if prev, ok := s.index[a.Key]; ok {
+		s.totalBytes -= prev.SizeBytes
+	}
 	s.index[a.Key] = a
+	s.totalBytes += a.SizeBytes
 	s.mu.Unlock()
 	s.evict()
 	return nil
@@ -134,11 +143,7 @@ func (s *FSStore) evict() {
 	target := int64(float64(s.MaxBytes) * ratio)
 
 	s.mu.Lock()
-	var total int64
-	for _, a := range s.index {
-		total += a.SizeBytes
-	}
-	if total <= s.MaxBytes {
+	if s.totalBytes <= s.MaxBytes {
 		s.mu.Unlock()
 		return
 	}
@@ -151,11 +156,11 @@ func (s *FSStore) evict() {
 
 	var dropped []*video.MediaAsset
 	for _, a := range victims {
-		if total <= target {
+		if s.totalBytes <= target {
 			break
 		}
 		delete(s.index, a.Key)
-		total -= a.SizeBytes
+		s.totalBytes -= a.SizeBytes
 		dropped = append(dropped, a)
 	}
 	s.mu.Unlock()
@@ -170,6 +175,9 @@ func (s *FSStore) evict() {
 
 func (s *FSStore) Drop(key video.CacheKey) error {
 	s.mu.Lock()
+	if a, ok := s.index[key]; ok {
+		s.totalBytes -= a.SizeBytes
+	}
 	delete(s.index, key)
 	s.mu.Unlock()
 	return os.RemoveAll(filepath.Join(s.root, string(key)))
@@ -178,6 +186,7 @@ func (s *FSStore) Drop(key video.CacheKey) error {
 func (s *FSStore) Purge() error {
 	s.mu.Lock()
 	s.index = map[video.CacheKey]*video.MediaAsset{}
+	s.totalBytes = 0
 	s.mu.Unlock()
 	if err := os.RemoveAll(s.root); err != nil {
 		return err

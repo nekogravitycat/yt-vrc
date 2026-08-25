@@ -63,10 +63,11 @@ func probeCodecs(ctx context.Context, ffprobePath, dir string) (string, int, int
 	}
 	cmd := exec.CommandContext(ctx, ffprobePath,
 		"-v", "error", "-show_streams", "-print_format", "json", segs[0])
-	var out bytes.Buffer
+	var out, stderr bytes.Buffer
 	cmd.Stdout = &out
+	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return "", 0, 0, err
+		return "", 0, 0, fmt.Errorf("%w: %s", err, tail(stderr.String(), 20))
 	}
 	var p probeOut
 	if err := json.Unmarshal(out.Bytes(), &p); err != nil {

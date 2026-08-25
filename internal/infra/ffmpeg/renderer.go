@@ -47,6 +47,13 @@ func (m *MessageRenderer) Render(ctx context.Context, deck message.Deck, spec vi
 		return nil, fmt.Errorf("rendering message: no pages")
 	}
 	key := fmt.Sprintf("%s_%s", deck.Hash(), spec.Container)
+	// The read path (Open) validates this key through safeName; correct
+	// today since it's hash-derived, but validating on write too makes
+	// the invariant self-enforcing rather than relying on key always
+	// staying hash-derived.
+	if err := safeName(key); err != nil {
+		return nil, err
+	}
 	dir := filepath.Join(m.Dir, key)
 
 	// Serialise concurrent renders of the same message.

@@ -31,7 +31,7 @@ const (
 // CRITICAL: order is the invariant — a version that fails to resolve
 // video must never go live, so a bad release costs a failed /u instead
 // of an outage discovered from inside VRChat.
-func (m *Manager) Install(ctx context.Context, version string, verify port.ToolchainVerifier, progress func(stage string)) (*port.UpgradeResult, error) {
+func (m *Manager) Install(ctx context.Context, version string, verify port.ToolchainVerifier, progress func(stage string), prune bool) (*port.UpgradeResult, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -102,9 +102,29 @@ func (m *Manager) Install(ctx context.Context, version string, verify port.Toolc
 
 	step(StageSwitching)
 	res.Stage = StageSwitching
-	_ = os.RemoveAll(dir) // a failure surfaces below: Rename onto a non-empty dir fails too
+	// CRITICAL: dir can be the version the current marker already points
+	// at (the reinstall-repair case, where the binary is missing but the
+	// marker still names this version) -- deleting it before staging is
+	// safely in place would leave no current binary if the process died
+	// in between. Move it aside instead of removing it, so there is
+	// always something at dir until the replacement has landed.
+	backup := dir + ".old"
+	_ = os.RemoveAll(backup) // clear a stale backup from a previous failed attempt, if any
+	hadExisting := false
+	if _, statErr := os.Stat(dir); statErr == nil {
+		if err := os.Rename(dir, backup); err != nil {
+			return fail(res, StageSwitching, err, start), err
+		}
+		hadExisting = true
+	}
 	if err := os.Rename(staging, dir); err != nil {
+		if hadExisting {
+			_ = os.Rename(backup, dir) // best-effort: restore rather than leave dir empty
+		}
 		return fail(res, StageSwitching, err, start), err
+	}
+	if hadExisting {
+		_ = os.RemoveAll(backup) // best-effort; a leftover backup costs disk, not correctness
 	}
 	m.rememberPrevious(res.From, version)
 	if err := m.setMarker(currentMarker, version); err != nil {
@@ -112,7 +132,9 @@ func (m *Manager) Install(ctx context.Context, version string, verify port.Toolc
 	}
 
 	res.Succeeded, res.Stage, res.Took = true, StageDone, time.Since(start)
-	m.pruneOldVersions(version, res.From)
+	if prune {
+		m.pruneOldVersions(version, res.From)
+	}
 	return res, nil
 }
 

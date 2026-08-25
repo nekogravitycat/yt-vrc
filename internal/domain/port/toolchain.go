@@ -26,7 +26,11 @@ type ToolchainManager interface {
 	CheckLatest(ctx context.Context) (string, error)
 	// Install downloads, verifies, then makes version current.
 	// NOTE: nothing switches unless verify returns nil (spec §4.5.3 step 6).
-	Install(ctx context.Context, version string, verify ToolchainVerifier, progress func(stage string)) (*UpgradeResult, error)
+	// prune controls whether old version directories are swept afterward;
+	// the caller passes false when it could not confirm every in-flight
+	// job had drained, since a running process may still hold an old
+	// version's binary open.
+	Install(ctx context.Context, version string, verify ToolchainVerifier, progress func(stage string), prune bool) (*UpgradeResult, error)
 	// Rollback makes the previous version current again.
 	Rollback(ctx context.Context, verify ToolchainVerifier) (*UpgradeResult, error)
 }

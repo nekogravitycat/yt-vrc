@@ -31,6 +31,9 @@ type fakeTool struct {
 	// installCtx captures the context Install was given, so a test can
 	// assert it outlived the request that triggered the run.
 	installCtx context.Context
+	// lastPrune captures the prune flag Install was given, so a test can
+	// assert a failed drain suppressed it.
+	lastPrune bool
 }
 
 func (f *fakeTool) BinaryPath() string { return "yt-dlp" }
@@ -57,11 +60,12 @@ func (f *fakeTool) CheckLatest(context.Context) (string, error) {
 	return f.latest, nil
 }
 
-func (f *fakeTool) Install(ctx context.Context, version string, _ port.ToolchainVerifier, progress func(string)) (*port.UpgradeResult, error) {
+func (f *fakeTool) Install(ctx context.Context, version string, _ port.ToolchainVerifier, progress func(string), prune bool) (*port.UpgradeResult, error) {
 	f.installs.Add(1)
 	f.note("install")
 	f.mu.Lock()
 	f.installCtx = ctx
+	f.lastPrune = prune
 	f.mu.Unlock()
 	if f.block != nil {
 		<-f.block
@@ -327,6 +331,31 @@ func TestDrainTimeoutDoesNotAbortTheUpgrade(t *testing.T) {
 	if res := u.State().Result; res == nil || !res.Succeeded {
 		t.Errorf("result = %+v, want the upgrade to have gone ahead", res)
 	}
+	// A drain that never confirmed every job finished must not prune old
+	// version directories: one of them could still be the binary an
+	// outlived job is running.
+	if tool.lastPrune {
+		t.Error("prune ran even though the drain did not complete cleanly")
+	}
+}
+
+// Maintenance() must read true the instant Trigger returns, not once the
+// background goroutine gets scheduled -- otherwise a request landing in
+// that gap slips a resolve/fetch past a committed, about-to-drain upgrade.
+func TestMaintenanceIsSetBeforeTriggerReturns(t *testing.T) {
+	tool := &fakeTool{current: "old", latest: "new", managed: true, block: make(chan struct{})}
+	u := newUseCase(tool)
+
+	_, started := u.Trigger(context.Background(), KindUpgrade)
+	if !started {
+		t.Fatal("trigger did not start a run")
+	}
+	if on, _ := u.Maintenance(); !on {
+		t.Error("maintenance was not yet on immediately after Trigger returned")
+	}
+
+	close(tool.block)
+	waitFor(t, "the run to finish", func() bool { return !u.State().Running })
 }
 
 func TestRollbackUsesTheRollbackPath(t *testing.T) {

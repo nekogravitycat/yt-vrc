@@ -17,11 +17,29 @@ import (
 //   - Markers are re-read on every call, never cached (see Resolver.Locate).
 
 // markerVersion returns the version directory name a marker points at.
+//
+// NOTE: when both a symlink and a .txt pointer exist, the more recently
+// written one wins rather than always preferring the symlink. The
+// fallback path in setMarker writes .txt before removing a stale
+// symlink left over from an earlier symlink-capable run; a lock-free
+// reader (markers are re-read on every resolve, see Resolver.Locate)
+// landing in that window must not resolve the about-to-be-deleted
+// symlink target over the pointer file that was just written for it.
 func (m *Manager) markerVersion(name string) (string, bool) {
 	path := filepath.Join(m.Root, name)
+
+	linkInfo, linkErr := os.Lstat(path)
+	txtInfo, txtErr := os.Stat(path + ".txt")
+	if linkErr == nil && txtErr == nil && txtInfo.ModTime().After(linkInfo.ModTime()) {
+		return readTxtMarker(path)
+	}
 	if target, err := os.Readlink(path); err == nil {
 		return filepath.Base(strings.TrimRight(target, string(os.PathSeparator)+"/")), true
 	}
+	return readTxtMarker(path)
+}
+
+func readTxtMarker(path string) (string, bool) {
 	b, err := os.ReadFile(path + ".txt")
 	if err != nil {
 		return "", false

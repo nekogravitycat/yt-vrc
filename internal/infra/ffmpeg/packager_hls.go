@@ -30,16 +30,24 @@ type HLSPackager struct {
 
 func (p *HLSPackager) Container() video.Container { return video.ContainerHLS }
 
-func (p *HLSPackager) Package(ctx context.Context, res *video.Resolution, srcVideo, srcAudio, destDir string) (*video.MediaAsset, error) {
-	if err := os.MkdirAll(destDir, 0o755); err != nil {
-		return nil, err
+func (p *HLSPackager) Package(ctx context.Context, res *video.Resolution, srcVideo, srcAudio, destDir string) (_ *video.MediaAsset, err error) {
+	if mkErr := os.MkdirAll(destDir, 0o755); mkErr != nil {
+		return nil, mkErr
 	}
+	// A failure past this point must not leave partial segments/playlist
+	// behind for a caller to remember to sweep — the packager owns
+	// everything under destDir.
+	defer func() {
+		if err != nil {
+			_ = os.RemoveAll(destDir)
+		}
+	}()
 
 	args := []string{"-hide_banner", "-loglevel", "error", "-nostdin", "-y"}
 	if res.Combined() {
-		args = append(args, "-i", srcVideo, "-map", "0:v:0", "-map", "0:a:0")
+		args = append(args, "-i", ffmpegInput(srcVideo), "-map", "0:v:0", "-map", "0:a:0")
 	} else {
-		args = append(args, "-i", srcVideo, "-i", srcAudio, "-map", "0:v:0", "-map", "1:a:0")
+		args = append(args, "-i", ffmpegInput(srcVideo), "-i", ffmpegInput(srcAudio), "-map", "0:v:0", "-map", "1:a:0")
 	}
 	args = append(args,
 		"-c", "copy",
@@ -114,6 +122,15 @@ func tail(s string, n int) string {
 		lines = lines[len(lines)-n:]
 	}
 	return strings.Join(lines, "; ")
+}
+
+// ffmpegInput guards a local temp-file path against being parsed as an
+// ffmpeg option or protocol prefix (e.g. a leading "-" or "http:"). Not
+// exploitable today — these are always internal filepath.Join results —
+// but cheap insurance against a future refactor letting a caller
+// influence the path.
+func ffmpegInput(path string) string {
+	return "file:" + path
 }
 
 // safeName rejects anything that could escape an artifact directory;
