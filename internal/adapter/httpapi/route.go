@@ -23,17 +23,15 @@ type Route struct {
 	Command string   // for RouteCommand, the canonical long name
 	Args    []string // remaining path segments after the command
 	// ContainerExplicit reports whether the URL named a container
-	// (a .mp4/.m3u8 extension) rather than falling back to a default.
-	// Message delivery has its own default, so it has to tell the two
-	// apart -- see messageSpec.
+	// (.mp4/.m3u8) rather than falling back to a default. Message delivery
+	// has its own default, so it must tell the two apart -- see messageSpec.
 	ContainerExplicit bool
 }
 
-// messageSpec is the output spec a message video answering this route
-// should be delivered as. A message is a still frame, so its container
-// tradeoff is the opposite of a real video's (see
-// Defaults.MessageContainer) -- but an explicit extension on the URL
-// still wins, exactly as it does for playback.
+// messageSpec is the output spec a message video answering this route is
+// delivered as. A message is a still frame, so its container tradeoff is
+// the opposite of a real video's (see Defaults.MessageContainer) -- but an
+// explicit URL extension still wins, as it does for playback.
 func (r Route) messageSpec(d Defaults) video.OutputSpec {
 	spec := r.Spec
 	if !r.ContainerExplicit && d.MessageContainer != "" {
@@ -42,8 +40,8 @@ func (r Route) messageSpec(d Defaults) video.OutputSpec {
 	return spec
 }
 
-// commandAliases maps every accepted spelling onto a canonical name.
-// Every command is reachable by a short and a long form (spec §4.1.3).
+// commandAliases maps every accepted spelling onto a canonical name; each
+// command has a short and long form (spec §4.1.3).
 var commandAliases = map[string]string{
 	"s": "status", "status": "status",
 	"u": "upgrade", "upgrade": "upgrade",
@@ -72,9 +70,9 @@ type Defaults struct {
 
 // ParsePath resolves a request path in the strict order of spec §4.1.4.
 //
-// The order matters: a YouTube ID is always exactly 11 characters, so no
-// command keyword can ever collide with one, which is what allows
-// commands to sit at the URL root alongside bare video IDs.
+// Order matters: a YouTube ID is always exactly 11 characters, so no
+// command keyword can collide with one -- which is what lets commands sit
+// at the URL root alongside bare video IDs.
 func ParsePath(p string, d Defaults) (Route, error) {
 	spec := video.OutputSpec{Container: d.Container, Quality: d.Quality}
 	trimmed := strings.Trim(p, "/")
@@ -84,10 +82,9 @@ func ParsePath(p string, d Defaults) (Route, error) {
 		return Route{Kind: RouteCommand, Command: "help", Spec: spec}, nil
 	}
 
-	// 4. A full YouTube URL, pasted straight after the host. Checked
-	// before segment splitting because such a URL contains slashes;
-	// restoreSchemeSlash undoes net/http's path collapse first (CRITICAL,
-	// see below).
+	// 4. A full YouTube URL pasted after the host. Checked before segment
+	// splitting because it contains slashes; restoreSchemeSlash undoes
+	// net/http's path collapse first (CRITICAL, see below).
 	trimmed = restoreSchemeSlash(trimmed)
 	if lower := strings.ToLower(trimmed); strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
 		id, err := extractIDFromURL(trimmed)
@@ -97,8 +94,7 @@ func ParsePath(p string, d Defaults) (Route, error) {
 		return Route{Kind: RouteVideo, VideoID: id, Spec: spec}, nil
 	}
 
-	// Only the pasted-URL branch above wants a query string; for every
-	// other form it is noise.
+	// Only the pasted-URL branch wants a query string; elsewhere it's noise.
 	if i := strings.IndexByte(trimmed, '?'); i >= 0 {
 		trimmed = trimmed[:i]
 	}
@@ -128,11 +124,11 @@ func ParsePath(p string, d Defaults) (Route, error) {
 	return Route{}, video.ErrInvalidVideoID
 }
 
-// specFromSegments applies an optional trailing quality segment and an
-// optional extension, e.g. /{id}/720.mp4 (spec §4.1.2). The second
-// result reports whether a container was named anywhere in the path,
-// which is what lets message delivery apply its own default without
-// overriding a URL that asked for one (see Route.messageSpec).
+// specFromSegments applies an optional trailing quality segment and
+// extension, e.g. /{id}/720.mp4 (spec §4.1.2). The bool reports whether a
+// container was named anywhere in the path, letting message delivery apply
+// its own default without overriding a URL that asked for one (see
+// Route.messageSpec).
 func specFromSegments(rest []string, ext string, d Defaults) (video.OutputSpec, bool, error) {
 	spec := video.OutputSpec{Container: d.Container, Quality: d.Quality}
 	explicit := false

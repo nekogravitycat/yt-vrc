@@ -15,11 +15,8 @@ import (
 )
 
 // OverrideStore keeps the manual availability override in a file.
-//
-// Persisting it is what makes /on trustworthy: the gate is fail-closed,
-// so a restart that forgot an active override would silently take the
-// service offline, and the only way to notice is to be in VRChat trying
-// to play something.
+// CRITICAL: must persist — the gate is fail-closed, so a restart that
+// forgot an active override silently takes the service offline.
 type OverrideStore struct {
 	path string
 	mu   sync.Mutex
@@ -63,10 +60,9 @@ func (s *OverrideStore) Save(o availability.Override) error {
 	return os.Rename(tmp, s.path)
 }
 
-// ModeStore keeps the /mode selection in a file, the same way
-// OverrideStore keeps the manual override: without it, a restart drops
-// back to ModeDefault, which for whitelist mode would silently put the
-// presence gate back in front of viewers relying on their IP alone.
+// ModeStore keeps the /mode selection in a file.
+// CRITICAL: must persist — without it a restart drops to ModeDefault,
+// which for whitelist mode silently re-gates viewers relying on IP alone.
 type ModeStore struct {
 	path string
 	mu   sync.Mutex
@@ -114,11 +110,8 @@ func (s *ModeStore) Save(mode availability.AccessMode) error {
 	return os.Rename(tmp, s.path)
 }
 
-// EventLog appends to events.jsonl and serves the tail from memory.
-//
-// The in-memory ring is the only thing reads ever touch, so /e costs
-// nothing; the file exists so a restart does not lose the context that
-// explains what just went wrong.
+// EventLog appends to events.jsonl and serves the tail from memory: reads
+// touch only the in-memory ring, the file survives restarts.
 type EventLog struct {
 	path string
 	max  int
@@ -171,10 +164,9 @@ func (l *EventLog) Append(e event.Event) {
 		l.recent = l.recent[len(l.recent)-l.max:]
 	}
 	l.writes++
-	// Rewriting only every so often keeps appends cheap while bounding
-	// the file at roughly twice the retention. NOTE: done while still
-	// holding the lock, so two concurrent rewrites can't land out of
-	// order and silently drop newer events from disk.
+	// Periodic rewrite bounds the file at ~2x retention while keeping
+	// appends cheap. NOTE: done under the lock so two concurrent rewrites
+	// can't reorder and drop newer events from disk.
 	if l.writes >= l.max {
 		l.writes = 0
 		snapshot := make([]event.Event, len(l.recent))

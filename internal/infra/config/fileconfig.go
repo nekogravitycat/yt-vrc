@@ -17,12 +17,11 @@ import (
 // .env instead (see dotenv.go); config.yaml is meant to be committed.
 const ConfigYAMLFile = "config.yaml"
 
-// fileConfig mirrors config.yaml. Scalar fields are pointers so an absent
-// key can be told apart from an explicit zero value (e.g.
-// "gate_enabled: false" must win over the built-in default; a missing
-// key must not). Durations and byte sizes are read as strings and parsed
-// the same way their env var counterparts are (time.ParseDuration /
-// parseBytes), so "10m" and "50GB" work in both places.
+// fileConfig mirrors config.yaml.
+// NOTE: scalar fields are pointers so an absent key is distinguishable
+// from an explicit zero (e.g. "gate_enabled: false" must beat the default).
+// Durations and byte sizes are strings, parsed like their env counterparts
+// (time.ParseDuration / parseBytes).
 type fileConfig struct {
 	DefaultQuality   *string `yaml:"default_quality"`
 	MaxQuality       *string `yaml:"max_quality"`
@@ -74,9 +73,8 @@ type fileConfig struct {
 }
 
 // loadFileConfig reads path into a fileConfig. A missing or empty file is
-// not an error -- config.yaml is optional, same as .env (see
-// LoadDotEnv); an unrecognized key is, so a typo doesn't silently fall
-// back to the default.
+// not an error (config.yaml is optional); an unrecognized key is, so a
+// typo doesn't silently fall back to the default.
 func loadFileConfig(path string) (*fileConfig, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {

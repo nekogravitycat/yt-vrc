@@ -18,11 +18,13 @@ import (
 	"github.com/nekogravitycat/yt-vrc/internal/domain/video"
 )
 
-// Architecture Note: singleflight here is anti-throttle, not a perf
-// cache — YouTube bot-checks a video resolved too often. resolveGroup
-// keys "{id}_{quality}" (the format selector depends on quality);
-// prepareGroup keys the full cache key. Shared work runs under
-// context.WithoutCancel, so one caller leaving can't cancel others'.
+// Architecture Note:
+//   - singleflight here is anti-throttle, not a perf cache: YouTube
+//     bot-checks a video resolved too often.
+//   - resolveGroup keys "{id}_{quality}" (format selector depends on
+//     quality); prepareGroup keys the full cache key.
+//   - shared work runs under context.WithoutCancel, so one caller leaving
+//     can't cancel others'.
 type UseCase struct {
 	Resolver    port.Resolver
 	Fetcher     port.MediaFetcher
@@ -33,16 +35,15 @@ type UseCase struct {
 	// PrepareTimeout bounds shared preparation work, which outlives any
 	// single caller's request context.
 	PrepareTimeout time.Duration
-	// TempDir holds downloaded tracks; they are deleted once remuxed.
-	TempDir string
-	// MaxJobs caps concurrent distinct-video preparations (disk/CPU;
-	// singleflight above only dedups repeats of the *same* video).
+	TempDir        string
+	// MaxJobs caps concurrent distinct-video preparations; singleflight
+	// above only dedups repeats of the *same* video.
 	MaxJobs int
-	// Health receives the outcome of every resolve, feeding the rolling
-	// success rate /s reports. Optional.
+	// Health receives every resolve outcome for /s's rolling success rate.
+	// Optional.
 	Health port.ResolveRecorder
 
-	// prepareGroup/resolveGroup: see Architecture Note above.
+	// prepareGroup/resolveGroup: see Architecture Note.
 	prepareGroup singleflight.Group
 	resolveGroup singleflight.Group
 
@@ -53,8 +54,8 @@ type UseCase struct {
 	jobs   map[video.CacheKey]*jobState
 }
 
-// jobState backs /w and progress reads while a job runs; deleted once
-// the artifact lands in the store, which then answers those questions.
+// jobState backs /w and progress reads while a job runs; deleted once the
+// artifact lands in the store.
 type jobState struct {
 	Title      string
 	Stage      string
@@ -87,9 +88,8 @@ func (u *UseCase) jobUpdate(key video.CacheKey, f func(*jobState)) {
 	}
 }
 
-// Progress reports how far a running preparation has got.
-// Estimate covers only the download stage: resolve is one opaque call
-// and remux is near-instant, so blending them in would be less honest.
+// Progress reports how far a running preparation has got. Estimate covers
+// only the download stage; resolve is opaque and remux is near-instant.
 func (u *UseCase) Progress(key video.CacheKey) (string, video.Progress, bool) {
 	u.jobsMu.RLock()
 	defer u.jobsMu.RUnlock()
@@ -112,13 +112,12 @@ func (u *UseCase) Progress(key video.CacheKey) (string, video.Progress, bool) {
 }
 
 // Warm prepares an artifact without a player waiting (used by /w and /r).
-// It blocks up to grace so fast failures (bad video, spent budget, full
-// job slots) return synchronously; report still fires after grace so a
-// later failure isn't lost once the caller has stopped listening.
+// Blocks up to grace so fast failures return synchronously; report still
+// fires after grace so a later failure isn't lost once the caller left.
 func (u *UseCase) Warm(ctx context.Context, id video.ID, spec video.OutputSpec, grace time.Duration, report func(error)) error {
 	done := make(chan error, 1)
 	go func() {
-		// Detached: must survive the request that started it.
+		// NOTE: detached via WithoutCancel — must survive the request that started it.
 		_, err := u.Prepare(context.WithoutCancel(ctx), id, spec)
 		if report != nil {
 			report(err)
@@ -134,8 +133,7 @@ func (u *UseCase) Warm(ctx context.Context, id video.ID, spec video.OutputSpec, 
 	}
 }
 
-// acquire takes a job slot without waiting; false means already at
-// MaxJobs — an immediate refusal beats a stalled spinner.
+// acquire takes a job slot without waiting; false means already at MaxJobs.
 func (u *UseCase) acquire() bool {
 	sem := u.semaphore()
 	if sem == nil {
@@ -155,8 +153,8 @@ func (u *UseCase) release() {
 	}
 }
 
-// semaphore lazily builds the slot channel; always read through here —
-// reading the field directly would race with ActiveJobs().
+// semaphore lazily builds the slot channel.
+// NOTE: always read through here; reading the field directly races with ActiveJobs().
 func (u *UseCase) semaphore() chan struct{} {
 	u.semOnce.Do(func() {
 		if u.MaxJobs > 0 {
@@ -169,9 +167,9 @@ func (u *UseCase) semaphore() chan struct{} {
 // ActiveJobs reports how many preparations are running, for /s.
 func (u *UseCase) ActiveJobs() int { return len(u.semaphore()) }
 
-// Drain waits until no preparation is running, so a yt-dlp swap can't
-// land under an in-flight job. Polls rather than signals — this runs a
-// few times a year, not worth adding sync overhead to the request path.
+// Drain waits until no preparation is running, so a yt-dlp swap can't land
+// under an in-flight job. Polls rather than signals; runs a few times a
+// year, not worth sync overhead on the request path.
 func (u *UseCase) Drain(ctx context.Context) error {
 	const poll = 250 * time.Millisecond
 	for {
@@ -215,9 +213,8 @@ func (u *UseCase) Prepare(ctx context.Context, id video.ID, spec video.OutputSpe
 	return asset, nil
 }
 
-// waitShared blocks for a singleflight result while still honoring ctx
-// cancellation locally; the work itself (started under
-// context.WithoutCancel by the caller) keeps running for other waiters.
+// waitShared blocks for a singleflight result while honoring ctx locally;
+// the shared work (started under WithoutCancel) keeps running for other waiters.
 func waitShared[T any](ctx context.Context, ch <-chan singleflight.Result) (val T, shared bool, err error) {
 	select {
 	case <-ctx.Done():
@@ -232,8 +229,8 @@ func waitShared[T any](ctx context.Context, ch <-chan singleflight.Result) (val 
 
 // prepare does the actual work for one cache key.
 func (u *UseCase) prepare(ctx context.Context, id video.ID, spec video.OutputSpec, key video.CacheKey) (*video.MediaAsset, error) {
-	// Re-check: a concurrent job for this key may have finished between
-	// the miss above and this call being scheduled.
+	// Re-check: a concurrent job for this key may have finished between the
+	// miss above and this call being scheduled.
 	if a, ok := u.Store.Get(key); ok {
 		return a, nil
 	}

@@ -18,9 +18,9 @@ import (
 //
 // CRITICAL: messages are content-addressed on disk (spec §4.3.3), but a
 // status message's hash changes every poll (live counters) while VRChat
-// caches whatever URL it resolved for a request. Serving by hash
-// directly would leave it replaying a stale frame, or 404ing once that
-// hash is pruned. Slot URLs are fixed and always served no-store.
+// caches whatever URL it resolved. Serving by hash directly would replay a
+// stale frame, or 404 once that hash is pruned. Slot URLs are fixed and
+// always served no-store.
 type slotTable struct {
 	path string // persisted here so the mapping survives a restart
 	max  int
@@ -40,17 +40,17 @@ func newSlotTable(statePath string, max int) *slotTable {
 	return t
 }
 
-// slotFor names a slot by what the message is about, not what it
-// currently says, so repeated requests land on the same URL. The
-// {name}_{container} shape matches a cache key's, letting resolve fall
-// through to a direct hash lookup for names outside the table.
+// slotFor names a slot by what the message is about, not what it currently
+// says, so repeated requests land on the same URL. The {name}_{container}
+// shape matches a cache key's, letting resolve fall through to a direct
+// hash lookup for names outside the table.
 func slotFor(name string, c video.Container) string {
 	return name + "_" + string(c)
 }
 
 // pathSlot names a slot for a path with no identity of its own (e.g. an
-// unrecognised command); hashing keeps it stable per input without
-// putting arbitrary user text in a served URL.
+// unrecognised command); hashing keeps it stable per input without putting
+// arbitrary user text in a served URL.
 func pathSlot(p string) string {
 	sum := sha256.Sum256([]byte(p))
 	return "x-" + hex.EncodeToString(sum[:])[:8]

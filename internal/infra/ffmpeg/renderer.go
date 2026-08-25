@@ -153,10 +153,8 @@ func MessageEntrypoint(c video.Container) string {
 // and removed once the encode is done.
 const pagesList = "pages.txt"
 
-// videoInput builds the video input for the clip. One page loops a
-// single still for the whole duration; several are held in turn by the
-// concat demuxer, which is all paging costs -- no transitions, just a
-// cut when each page's share of the running time is up.
+// videoInput builds the video input: one page loops a still, several are
+// held in turn by the concat demuxer.
 func (m *MessageRenderer) videoInput(frames []string, dir string) ([]string, error) {
 	if len(frames) == 1 {
 		return []string{"-loop", "1", "-i", frames[0]}, nil
@@ -166,13 +164,10 @@ func (m *MessageRenderer) videoInput(frames []string, dir string) ([]string, err
 	for _, f := range frames[:len(frames)-1] {
 		fmt.Fprintf(&b, "file '%s'\nduration %.3f\n", filepath.Base(f), per)
 	}
-	// CRITICAL: the concat demuxer ignores the last entry's duration, so
-	// the final page must be listed twice or it flashes past in a single
-	// frame -- and the two entries have to *split* that page's own slot,
-	// never add one on top. The list must total exactly m.Seconds:
-	// encode's -t trims on the input side, so an entry starting at
-	// exactly -t is dropped along with the hold on the frame before it,
-	// ending the clip the instant the last page turns up.
+	// CRITICAL: concat ignores the last entry's duration, so the final
+	// page is listed twice — splitting its own slot, never adding one —
+	// keeping the list's total at exactly m.Seconds; encode's -t trims
+	// input-side, dropping an entry that starts at exactly -t.
 	last := filepath.Base(frames[len(frames)-1])
 	fmt.Fprintf(&b, "file '%s'\nduration %.3f\nfile '%s'\nduration %.3f\n", last, per/2, last, per/2)
 

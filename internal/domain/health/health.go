@@ -1,9 +1,8 @@
 // Package health scores the service against the thresholds of spec §4.6.
 //
-// The operator is wearing a headset, so /s is the only place these
-// numbers are ever read. That shapes the design: the point is not to
-// collect metrics but to answer "is this thing still working, and if
-// not, which part broke" in one frame.
+// /s is the only place these numbers are read (operator is in a headset),
+// so the goal is answering "is it working, and if not which part broke"
+// in one frame -- not collecting metrics.
 package health
 
 import (
@@ -33,8 +32,8 @@ func Worse(a, b Level) Level {
 // Sample is the outcome of one resolve attempt.
 //
 // NOTE: only resolves are sampled, not packaging failures (those go to
-// events) -- resolve success rate is the early warning for this
-// project's real threat, YouTube shutting the door (spec §3.2).
+// events) -- resolve success rate is the early warning for YouTube
+// shutting the door (spec §3.2).
 type Sample struct {
 	At    time.Time     `json:"at"`
 	OK    bool          `json:"ok"`
@@ -50,9 +49,9 @@ type Stats struct {
 	LastFailureAt time.Time
 }
 
-// SuccessRate is 0..1, or -1 when nothing has been sampled yet. The
-// distinction matters: a fresh service has no evidence of health, which
-// is not the same as evidence of ill health.
+// SuccessRate is 0..1, or -1 when nothing has been sampled yet. NOTE: the
+// -1 distinction matters -- no evidence of health is not evidence of ill
+// health, and must not raise an alarm.
 func (s Stats) SuccessRate() float64 {
 	if s.Samples == 0 {
 		return -1

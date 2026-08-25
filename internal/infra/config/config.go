@@ -39,20 +39,16 @@ type Config struct {
 	// enough to loop unobtrusively (spec §4.3.3).
 	MessageSeconds      int
 	MessageCacheEntries int
-	// MessageContainer is what a command response is delivered as when
-	// the URL didn't say. Separate from DefaultContainer because the
-	// tradeoff is the opposite one: a message is a 15s still frame, so
-	// HLS's playlist indirection costs five extra round trips (master ->
-	// media -> segments) to deliver what one MP4 request does.
+	// MessageContainer defaults a command response's container when the
+	// URL didn't say. Separate from DefaultContainer: a message is a 15s
+	// still, so HLS's playlist indirection costs extra round trips MP4 avoids.
 	MessageContainer video.Container
 
 	ResolveTimeout time.Duration
 	PrepareTimeout time.Duration
 	MaxDuration    time.Duration
-	// PrepareGrace is how long a video request blocks on a cache miss
-	// before answering with a progress message instead. It bounds the
-	// wait a player sees, not the job: preparation keeps running, so the
-	// next request for the same URL finds it finished or further along.
+	// PrepareGrace bounds how long a video request blocks on a cache miss
+	// before answering with a progress message; preparation keeps running.
 	PrepareGrace time.Duration
 
 	// MaxConcurrentJobs bounds simultaneous preparations (spec §8).
@@ -121,10 +117,8 @@ type Config struct {
 }
 
 func Load() (*Config, error) {
-	// .env supplements the environment; an explicit env var always wins
-	// (see LoadDotEnv). config.yaml supplies the built-in default for
-	// its own keys below -- an env var of the same name still wins over
-	// it, same precedence as .env.
+	// Precedence: explicit env var > .env > config.yaml > built-in default
+	// (see LoadDotEnv).
 	if err := LoadDotEnv(DotEnvFile); err != nil {
 		return nil, fmt.Errorf("reading %s: %w", DotEnvFile, err)
 	}
@@ -134,8 +128,7 @@ func Load() (*Config, error) {
 	}
 
 	c := &Config{
-		// .env only: deployment-specific facts and secrets never live in
-		// config.yaml (see CLAUDE.md's Configuration reference).
+		// .env only: deployment-specific facts and secrets, never in config.yaml.
 		ListenAddr:      env("LISTEN_ADDR", ":8080"),
 		PublicBaseURL:   strings.TrimRight(env("PUBLIC_BASE_URL", "http://localhost:8080"), "/"),
 		DataDir:         env("DATA_DIR", "./data"),

@@ -11,11 +11,9 @@ import (
 
 // HealthStore persists the rolling resolve window to health.json
 // (spec §7.1).
-//
-// Without it, every restart resets the success rate to "no evidence",
-// which is the one answer /s must not give after a crash loop: the
-// operator restarts precisely when something looks wrong, and that is
-// when the recent history matters most.
+// CRITICAL: must persist — a restart resets the success rate to "no
+// evidence" exactly when an operator restarts after trouble and recent
+// history matters most.
 type HealthStore struct {
 	path string
 	mu   sync.Mutex

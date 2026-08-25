@@ -2,8 +2,8 @@
 //
 // The only interface a VRChat user has is a video player, so every
 // response is eventually rendered to playable media (spec §4.3). This
-// package holds the structured form; how it is drawn and encoded lives
-// further out.
+// package holds the structured form; rendering and encoding live further
+// out.
 package message
 
 import (
@@ -32,9 +32,8 @@ type Row struct {
 
 // View is a complete message, ready to be drawn.
 //
-// Display text is English. Video titles are data, not display text, and
-// stay in their original script, so the rendering font must still cover
-// CJK.
+// NOTE: display text is English, but video titles are data kept in their
+// original script, so the rendering font must cover CJK.
 type View struct {
 	Kind     Kind     `json:"kind"`
 	Title    string   `json:"title"`
@@ -46,21 +45,16 @@ type View struct {
 	Footer   string   `json:"footer,omitempty"`
 }
 
-// Deck is a message shown as a sequence of frames inside one clip.
-//
-// Almost every message is a single frame. A deck exists for output that
-// genuinely does not fit one -- the cache listing -- which is paged
-// across the clip's running time instead of truncated. There are no
-// transitions: each page simply holds for its share of the duration and
-// cuts to the next.
+// Deck is a message shown as a sequence of frames inside one clip. Almost
+// every message is a single frame; a deck exists for output that does not
+// fit one (the cache listing), paged across the clip's duration.
 type Deck []View
 
-// One wraps a single view as a deck, which is what all but one caller
-// wants.
+// One wraps a single view as a deck.
 func One(v View) Deck { return Deck{v} }
 
 // Hash identifies a whole deck by content, so an unchanged message is
-// rendered once and reused, exactly as a single view is.
+// rendered once and reused.
 func (d Deck) Hash() string {
 	b, err := json.Marshal(d)
 	if err != nil {

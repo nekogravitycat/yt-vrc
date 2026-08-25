@@ -14,8 +14,8 @@ import (
 	"github.com/nekogravitycat/yt-vrc/internal/domain/video"
 )
 
-// Probe resolves a known-good video on a schedule so /s health data
-// doesn't go stale between bursts of actual use (spec §4.6).
+// Probe resolves a known-good video on a schedule to keep /s health data
+// fresh (spec §4.6).
 type Probe struct {
 	Resolver port.Resolver
 	Recorder *health.Recorder
@@ -45,7 +45,7 @@ func (p *Probe) Run(ctx context.Context) {
 	}
 }
 
-// Once probes exactly one video per tick, round-robin through the list.
+// Once probes one video per tick, round-robin through the list.
 //
 // CRITICAL: resolving the same video repeatedly triggers YouTube's bot
 // check; probing the whole list each tick would reintroduce that. Rotation

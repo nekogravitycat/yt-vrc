@@ -9,11 +9,11 @@ import (
 	"github.com/nekogravitycat/yt-vrc/internal/usecase/upgrade"
 )
 
-// UpgradeProgress reports a run that is still going (spec §4.5); carries
-// the "re-enter /u" instruction since the work continues async behind it.
+// UpgradeProgress reports a run still in flight (spec §4.5); carries the
+// "re-enter /u" instruction since the work continues async behind it.
 func UpgradeProgress(s upgrade.State, started bool) message.View {
 	v := message.View{Kind: message.KindProgress}
-	// Names the actual verb: /u/back must show "Rollback", not a generic "Upgrade".
+	// Names the actual verb: /u/back must show "Rollback", not "Upgrade".
 	what := "Upgrade"
 	if s.Kind == upgrade.KindRollback {
 		what = "Rollback"
@@ -82,7 +82,7 @@ func UpgradeOutcome(s upgrade.State) message.View {
 			v.AddRow("Tried", r.To)
 		}
 		// Names the failing test: "the upgrade broke" vs. "this release
-		// can't resolve video" are different problems needing different responses.
+		// can't resolve video" need different responses.
 		for _, t := range r.SmokeTests {
 			if !t.OK {
 				v.AddRow("Failed test", t.Name)

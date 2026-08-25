@@ -1,8 +1,6 @@
-// Package availability decides whether the service should be serving
-// video at all (spec §4.4). Detection stays pluggable behind Signal;
-// Discord presence is merely the first source, chosen because it needs
-// nothing installed on the gaming machine. See Gate (gate.go) for the
-// combination logic.
+// Package availability decides whether the service should serve video at
+// all (spec §4.4). Detection is pluggable behind Signal; Discord presence
+// is the first source. See Gate (gate.go) for the combination logic.
 package availability
 
 import (
@@ -11,8 +9,7 @@ import (
 )
 
 // Confidence expresses how much a source's answer should be trusted when
-// sources disagree. Unused today (one source), reserved for arbitrating
-// multiple sources later (spec §6.3.1).
+// sources disagree. Reserved for arbitrating multiple sources (spec §6.3.1).
 type Confidence int
 
 const (

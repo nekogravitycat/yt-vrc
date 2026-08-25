@@ -21,9 +21,9 @@ const (
 	KindRollback Kind = "rollback"
 )
 
-// State is what /u reports; an upgrade runs in the background rather than
-// blocking the request (would outrun AVPro's load timeout and Cloudflare's
-// 100s origin timeout) — re-poll /u to see progress (spec §4.2.3).
+// State is what /u reports. The run happens in the background rather than
+// blocking the request, which would outrun AVPro's load timeout and
+// Cloudflare's 100s origin timeout — re-poll /u for progress (spec §4.2.3).
 type State struct {
 	Running    bool
 	Kind       Kind
@@ -45,11 +45,10 @@ type UseCase struct {
 	// binary is swapped (spec §4.5.3 step 2). Nil skips the wait.
 	Drain        func(ctx context.Context) error
 	DrainTimeout time.Duration
-	// Timeout bounds a whole run, which outlives the request that
-	// triggered it.
+	// Timeout bounds a whole run, which outlives the request that triggered it.
 	Timeout time.Duration
-	// CheckInterval is how often upstream is polled; Auto decides whether
-	// a found version also installs — off by default, spec §4.5.4.
+	// CheckInterval is how often upstream is polled; Auto decides whether a
+	// found version also installs — off by default (spec §4.5.4).
 	CheckInterval time.Duration
 	Auto          bool
 
@@ -115,8 +114,8 @@ func (u *UseCase) Trigger(ctx context.Context, kind Kind) (State, bool) {
 	s := u.state
 	u.mu.Unlock()
 
-	// Detached: cancelling a swap mid-flight is worse than finishing it
-	// after the requester is gone.
+	// NOTE: detached via WithoutCancel — cancelling a swap mid-flight is worse
+	// than finishing it after the requester is gone.
 	work := context.WithoutCancel(ctx)
 	go u.run(work, kind)
 	return s, true
@@ -132,9 +131,8 @@ func (u *UseCase) run(ctx context.Context, kind Kind) {
 	u.maintenance.Store(true)
 	defer u.maintenance.Store(false)
 
-	// Read the outgoing version here rather than in Trigger: it shells
-	// out to yt-dlp, and doing that under the state lock would block
-	// every /s for as long as the binary takes to answer.
+	// NOTE: read the outgoing version here, not in Trigger — it shells out
+	// to yt-dlp, and doing so under the state lock would block every /s.
 	if from, err := u.Tool.CurrentVersion(ctx); err == nil {
 		u.mu.Lock()
 		u.state.From = from
@@ -173,9 +171,8 @@ func (u *UseCase) execute(ctx context.Context, kind Kind) (*port.UpgradeResult, 
 			defer cancel()
 		}
 		if err := u.Drain(drainCtx); err != nil && u.Log != nil {
-			// Timing out here is survivable: a job that outlives the
-			// drain keeps using the binary it already launched, and the
-			// swap only affects the next resolve.
+			// Survivable: a job outliving the drain keeps its already-launched
+			// binary; the swap only affects the next resolve.
 			u.Log.Warn("upgrade drain did not complete", "err", err)
 		}
 	}
@@ -224,16 +221,15 @@ func (u *UseCase) record(kind Kind, res *port.UpgradeResult) {
 	}
 }
 
-// Run polls upstream on a schedule (spec §4.5.4). It only records what
-// it finds unless Auto is set, so /s can show "a newer version exists"
-// without anything changing underfoot.
+// Run polls upstream on a schedule (spec §4.5.4). It only records findings
+// unless Auto is set, so /s can show "a newer version exists" without
+// changing anything underfoot.
 func (u *UseCase) Run(ctx context.Context) {
 	if u.CheckInterval <= 0 {
 		return
 	}
-	// A check on start makes /s useful immediately rather than after the
-	// first interval, which for a 24-hour period would mean a whole day
-	// of "unknown".
+	// Check on start so /s is useful immediately, not after the first
+	// (possibly 24h) interval.
 	u.check(ctx)
 	t := time.NewTicker(u.CheckInterval)
 	defer t.Stop()

@@ -28,10 +28,8 @@ const (
 	bodySize   = 38 // >= Height/20, the legibility floor of spec §4.3.3
 	footerSize = 28
 	lineH      = 56
-	// valueX: the label column has to hold a cache row's
-	// "133.5 MB · 1080p HLS" without truncating, which is the widest
-	// label any view produces; the value column keeps ample room for a
-	// video title even so.
+	// valueX: label column must fit the widest label any view produces
+	// ("133.5 MB · 1080p HLS") without truncating.
 	valueX = 520
 )
 

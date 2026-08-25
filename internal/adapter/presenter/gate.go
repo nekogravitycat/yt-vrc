@@ -9,12 +9,12 @@ import (
 	"github.com/nekogravitycat/yt-vrc/internal/domain/message"
 )
 
-// GateClosed is what a video request gets while the service is not
-// serving (spec §4.4.1); a message, not an HTTP error, so the player
-// renders it and the viewer sees the way back in (/on).
+// GateClosed is what a video request gets while the service is not serving
+// (spec §4.4.1) — a message, not an HTTP error, so the player renders it
+// and the viewer sees the way back in (/on).
 func GateClosed(r availability.Reason) message.View {
 	if r.Source == "mode:whitelist" {
-		// Not a presence issue: "/on" advice here would mislead.
+		// Not a presence issue: "/on" advice would mislead.
 		return message.View{
 			Kind:     message.KindGate,
 			Title:    "Access Restricted",
@@ -134,8 +134,8 @@ func Errors(events []event.Event) message.View {
 	return v
 }
 
-// ago renders a timestamp as an elapsed duration, which is what the
-// operator actually wants to know and needs no timezone.
+// ago renders a timestamp as elapsed duration — what the operator wants,
+// and needs no timezone.
 func ago(t time.Time) string {
 	if t.IsZero() {
 		return "never"

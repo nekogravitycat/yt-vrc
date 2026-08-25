@@ -54,11 +54,7 @@ func (m *Manager) binaryFor(version string) string {
 	return filepath.Join(m.versionDir(version), m.asset())
 }
 
-// setMarker points name at a version directory atomically.
-//
-// Both forms write to a temporary path and rename over the marker, so a
-// reader never sees a half-written pointer and a crash mid-switch leaves
-// the old version live.
+// setMarker points name at a version directory atomically (see Architecture Note).
 func (m *Manager) setMarker(name, version string) error {
 	path := filepath.Join(m.Root, name)
 	tmp := path + ".tmp"

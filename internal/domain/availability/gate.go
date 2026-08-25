@@ -6,8 +6,17 @@ import (
 	"time"
 )
 
-// SourceStatus is one source's reading, plus whatever went wrong
-// obtaining it, for display by /s.
+// Architecture Note:
+//   - Gate folds signals into one open/closed decision (spec §4.4.3): OR
+//     across Signals; offline->closed debounced by Grace.
+//   - CRITICAL: fail-closed -- zero configured sources means closed, only
+//     /on opens it; command endpoints always bypass the gate.
+//   - Mutations that persist (SetMode, applyOverride) save while holding
+//     mu, so concurrent writers can't land out of order and restore stale
+//     state after a restart. Persistence is best-effort; a restart falls
+//     back to ModeDefault (see CLAUDE.md).
+
+// SourceStatus is one source's reading and any error obtaining it, for /s.
 type SourceStatus struct {
 	Name       string
 	Status     Status
@@ -19,41 +28,37 @@ type SourceStatus struct {
 type Reason struct {
 	Open bool
 	// Source names what decided: a signal name, "manual", "grace" while
-	// debouncing, or "no signal" when nothing is configured.
+	// debouncing, or "no signal".
 	Source string
 	Detail string
 	// Since is when the gate last changed state.
 	Since time.Time
 	// LastOnline is the most recent moment any source reported online;
-	// zero if that has never happened since startup.
+	// zero if never since startup.
 	LastOnline time.Time
 }
 
-// Gate aggregates signals into the single yes/no the HTTP layer asks for
-// (spec §4.4.3): OR across Signals; offline->closed debounced by Grace
-// (Discord's gateway drops routinely). CRITICAL: fail-closed -- zero
-// configured sources means closed, only /on opens it; command endpoints
-// always bypass the gate.
+// Gate aggregates signals into the single open/closed decision the HTTP
+// layer asks for (see Architecture Note).
 type Gate struct {
 	Signals []Signal
 	// Grace is how long the gate stays open after the last source went
 	// offline.
 	Grace time.Duration
-	// PollInterval is how often the background loop re-evaluates; needed
-	// because the grace window measures from the last observed online
-	// moment, which nobody observes while no requests arrive.
+	// PollInterval re-evaluates in the background; needed because the
+	// grace window measures from the last observed online moment, which
+	// nobody observes while no requests arrive.
 	PollInterval time.Duration
 	Now          func() time.Time
 	Overrides    OverrideStore
-	// OnTransition is called whenever the decision flips, for the event
-	// log /e reads (spec §4.4.3).
+	// OnTransition fires whenever the decision flips, for the /e event log.
 	OnTransition func(Reason)
 
 	// ModeStore persists the /mode selection; nil keeps mode fixed at
-	// ModeDefault (gate-less/mode-unaware deployments, and tests).
+	// ModeDefault (mode-unaware deployments, and tests).
 	ModeStore ModeStore
 	// WhitelistIPs is consulted only in ModeWhitelist: plain client
-	// addresses, not CIDRs -- the allowed set is small and fixed.
+	// addresses, not CIDRs.
 	WhitelistIPs []string
 
 	mu         sync.Mutex
@@ -76,8 +81,7 @@ func (g *Gate) now() time.Time {
 	return time.Now()
 }
 
-// Start brings up every source and begins re-evaluating in the
-// background.
+// Start brings up every source and begins background re-evaluation.
 func (g *Gate) Start(ctx context.Context) error {
 	g.mu.Lock()
 	if g.Overrides != nil {
@@ -142,7 +146,7 @@ func (g *Gate) Close() error {
 }
 
 // IsOpen re-reads the sources rather than waiting for the next tick, so a
-// source that just came online takes effect on the next request.
+// source that just came online takes effect immediately.
 func (g *Gate) IsOpen(ctx context.Context) (bool, Reason) {
 	g.evaluate(ctx)
 	g.mu.Lock()
@@ -189,16 +193,14 @@ func (g *Gate) CurrentMode() AccessMode {
 	return g.mode
 }
 
-// SetMode switches the access mode (spec-adjacent /mode command).
+// SetMode switches the access mode (/mode command).
 func (g *Gate) SetMode(m AccessMode) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.mode = m
-	// NOTE: persist while still holding the lock, so two concurrent
-	// writers (SetMode, applyOverride) can't land out of order and
-	// silently restore stale state after a restart.
+	// NOTE: persist while holding the lock (see Architecture Note).
 	if g.ModeStore != nil {
-		_ = g.ModeStore.Save(m) // best-effort; a restart falls back to ModeDefault (see CLAUDE.md)
+		_ = g.ModeStore.Save(m) // best-effort
 	}
 }
 
@@ -256,9 +258,9 @@ func (g *Gate) applyOverride(o Override) {
 		g.since = g.now()
 		reason.Since = g.since
 	}
-	// NOTE: persist while locked — same ordering guarantee as SetMode.
+	// NOTE: persist while locked (see Architecture Note).
 	if g.Overrides != nil {
-		_ = g.Overrides.Save(o) // best-effort; same fallback as ModeStore above
+		_ = g.Overrides.Save(o) // best-effort
 	}
 	hook := g.OnTransition
 	g.mu.Unlock()
@@ -302,7 +304,7 @@ func (g *Gate) evaluate(ctx context.Context) {
 	case len(readings) == 0:
 		g.open, g.source, g.detail = false, "no signal", "no detection source is configured"
 	case !g.lastOnline.IsZero() && now.Sub(g.lastOnline) < g.Grace:
-		// Debouncing. Stay open, but say why, so /s does not read as a
+		// Debouncing: stay open but say why, so /s does not read as a
 		// confident "they are playing".
 		remain := g.Grace - now.Sub(g.lastOnline)
 		g.open, g.source = true, "grace"

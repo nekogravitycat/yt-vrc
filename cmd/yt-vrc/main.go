@@ -1,7 +1,9 @@
 // Command yt-vrc serves YouTube videos re-muxed for VRChat's players.
 //
-// This file is the only place where concrete implementations are wired
-// to the interfaces the inner layers declare (spec §6.1).
+// Architecture Note:
+//   - Sole composition root: concrete impls wired to inner-layer interfaces here (spec §6.1).
+//   - One throttle budget is shared across every YouTube path (viewers, probe, smoke test).
+//   - yt-dlp acquisition is mode-dependent: managed (hot-swappable) vs path (dev, spec §4.5.2).
 package main
 
 import (
@@ -57,8 +59,7 @@ func run() error {
 	if err := os.MkdirAll(tmp, 0o755); err != nil {
 		return err
 	}
-	// Clear anything left by an interrupted run: these are partial
-	// downloads with no value.
+	// Clear partial downloads left by an interrupted run.
 	clearDir(tmp)
 
 	events, err := state.NewEventLog(cfg.StateDir(), cfg.EventLogEntries)
@@ -90,9 +91,8 @@ func run() error {
 	recorder := &health.Recorder{Persist: healthStore.Save}
 	recorder.Restore(healthStore.Load())
 
-	// Shared across every path that reaches YouTube (viewers, probe, smoke
-	// test): splitting it per caller would let usage drift past what
-	// YouTube actually rate-limits, which is this IP.
+	// NOTE: single shared budget — splitting per caller would let usage drift
+	// past YouTube's per-IP rate limit.
 	budget := &throttle.Limiter{
 		PerKey: cfg.ResolveLimitPerVideo,
 		Global: cfg.ResolveLimitGlobal,
@@ -100,8 +100,8 @@ func run() error {
 	}
 
 	resolver := &ytdlp.Resolver{
-		// Locate, not a fixed path: a hot upgrade moves a marker on
-		// disk and the next resolve must pick it up (spec §4.5.2).
+		// Locate, not a fixed path: a hot upgrade moves the on-disk marker and
+		// the next resolve must pick it up (spec §4.5.2).
 		Locate:     toolchain.BinaryPath,
 		Proxy:      os.Getenv("RESOLVER_PROXY"),
 		Timeout:    cfg.ResolveTimeout,
@@ -142,8 +142,7 @@ func run() error {
 			Clients:    cfg.YtdlpClients,
 			JSRuntimes: cfg.YtdlpJSRuntimes,
 			Log:        log,
-			// Charged but never refused: blocking would stop the upgrade
-			// rather than protect anything, yet these requests do hit YouTube.
+			// Charged but never refused: refusal would stall the upgrade, yet these still hit YouTube.
 			Charge: budget.Charge,
 		},
 		Drain:         play.Drain,
@@ -219,16 +218,14 @@ func run() error {
 		Addr:              cfg.ListenAddr,
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
-		// Generous, but no longer because a request waits out a prepare —
-		// PrepareGrace bounds that now. It covers serving a multi-GB
-		// artifact to a slow client, which is the long write that remains.
+		// WriteTimeout covers serving a multi-GB artifact to a slow client;
+		// PrepareGrace (not this) bounds prepare waits.
 		WriteTimeout: cfg.PrepareTimeout + time.Minute,
 	}
 
 	if gate != nil {
 		if err := gate.Start(ctx); err != nil {
-			// Fail loudly: silently continuing would mask a stuck-closed
-			// gate as normal startup.
+			// CRITICAL: fail loudly — continuing would mask a stuck-closed gate as normal startup.
 			return err
 		}
 		defer func() {
@@ -264,10 +261,8 @@ func run() error {
 	return nil
 }
 
-// buildToolchain decides how yt-dlp is obtained (spec §4.5.2): managed mode
-// owns a versioned dir and can hot-swap the binary; path mode uses whatever
-// is on PATH (the dev setup), so /u refuses there rather than replacing a
-// binary this service didn't install.
+// buildToolchain selects the yt-dlp acquisition mode (spec §4.5.2). Path mode
+// refuses /u since it can't replace a binary this service didn't install.
 func buildToolchain(ctx context.Context, cfg *config.Config, log *slog.Logger) port.ToolchainManager {
 	if !strings.EqualFold(cfg.YtdlpMode, "managed") {
 		return &ytdlp.PathManager{Bin: cfg.YtdlpPath}
@@ -278,10 +273,8 @@ func buildToolchain(ctx context.Context, cfg *config.Config, log *slog.Logger) p
 		Fallback: cfg.YtdlpPath,
 		Log:      log,
 	}
-	// Deliberately non-fatal: a fresh volume needs this download (image
-	// ships no yt-dlp, spec §9.1), but failing startup over a transient
-	// GitHub outage would take down a service whose own endpoints could
-	// have explained the problem.
+	// NOTE: non-fatal — a transient GitHub outage must not take down startup;
+	// a fresh volume needs this download since the image ships no yt-dlp (spec §9.1).
 	if err := m.Ensure(ctx); err != nil {
 		log.Error("yt-dlp bootstrap failed; falling back to PATH", "err", err, "fallback", cfg.YtdlpPath)
 	}
@@ -289,7 +282,7 @@ func buildToolchain(ctx context.Context, cfg *config.Config, log *slog.Logger) p
 }
 
 // thresholds builds spec §4.6 domain thresholds; only staleness is
-// configurable, since the rest describe the service, not the deployment.
+// configurable.
 func thresholds(cfg *config.Config) health.Thresholds {
 	t := health.DefaultThresholds
 	if cfg.YtdlpStaleDays > 0 {
@@ -317,11 +310,9 @@ func parseVideoIDs(raw []string, log *slog.Logger) []video.ID {
 }
 
 // buildGate assembles the availability gate from configured sources
-// (spec §4.4.2); nil means the gate is switched off entirely.
+// (spec §4.4.2); nil means the gate is off.
 //
-// NOTE: fail-closed — zero configured sources still closes the gate (an
-// unconfigured detector isn't evidence anyone's playing); only /on,
-// which bypasses the gate, can open it.
+// NOTE: fail-closed — zero sources still closes the gate; only /on can open it.
 func buildGate(cfg *config.Config, log *slog.Logger, events *state.EventLog) (*availability.Gate, error) {
 	if !cfg.GateEnabled {
 		log.Warn("availability gate disabled; every video endpoint is open")

@@ -8,8 +8,8 @@ import (
 	"time"
 )
 
-// ID is a YouTube video identifier. It is always exactly 11 characters,
-// which is what lets the router tell IDs apart from commands (spec §4.1.1).
+// ID is a YouTube video identifier, always exactly 11 characters, which
+// is what lets the router tell IDs from commands (spec §4.1.1).
 type ID string
 
 var idPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{11}$`)
@@ -25,8 +25,8 @@ func ParseID(s string) (ID, error) {
 func (id ID) String() string { return string(id) }
 
 // Track is one downloadable elementary stream. A Resolution normally
-// carries two (YouTube has no progressive formats, spec §2.4); when it
-// doesn't, Video and Audio are identical.
+// carries two (YouTube has no progressive formats, spec §2.4); otherwise
+// Video and Audio are identical.
 type Track struct {
 	URL       string
 	Codec     string

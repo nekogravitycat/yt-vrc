@@ -1,8 +1,13 @@
 // Package presenter turns domain results into message views.
 //
-// Display text is English throughout; titles pass through in their
-// original script. Message frames hold ~6-7 rows, so Status/Help/
-// CacheList curate which fields show rather than dumping everything.
+// Architecture Note:
+//   - Display text is English throughout; titles pass through in their
+//     original script.
+//   - Message frames hold ~6-7 rows, so Status/Help/CacheList curate which
+//     fields show rather than dumping everything.
+//   - Every distinct render costs an ffmpeg encode (~0.5s) and a cache
+//     entry, so live figures are bucketed/coarsened to stay cache-stable
+//     across polls (see progressBucket, coarseWait).
 package presenter
 
 import (
@@ -59,7 +64,7 @@ func PrepareError(id video.ID, err error) message.View {
 		v.Footer = "/s to see how many jobs are running"
 	case errors.Is(err, video.ErrThrottled):
 		// NOTE: states who refused (this service, not YouTube) —
-		// misattributing it sends the user chasing a problem that hasn't happened.
+		// misattributing sends the user chasing a problem that hasn't happened.
 		v.Title = "Slowing Down"
 		v.Kind = message.KindWarning
 		v.Lines = throttleLines(err)
@@ -172,9 +177,9 @@ type StatusData struct {
 	Budget throttle.Usage
 }
 
-// Status summarises the service (spec §4.6): ranks by what changes, what
-// breaks, and what's actionable from inside VRChat; static config goes
-// in the subtitle instead.
+// Status summarises the service (spec §4.6), ranked by what changes,
+// breaks, and is actionable from inside VRChat; static config goes in the
+// subtitle.
 func Status(d StatusData) message.View {
 	v := message.View{
 		Kind:     message.KindStatus,
@@ -189,8 +194,8 @@ func Status(d StatusData) message.View {
 	if d.Gate.Source != "" {
 		gate += " · " + d.Gate.Source
 	}
-	// Leads: the one setting that stops every video endpoint, and the
-	// only one changeable from inside VRChat.
+	// Leads: the one setting that stops every video endpoint, and the only
+	// one changeable from inside VRChat.
 	v.AddRow("Availability", gate)
 	// Shown only for a non-default mode, which silently overrides the row above.
 	if d.Mode != "" && d.Mode != availability.ModeDefault {
@@ -207,10 +212,9 @@ func Status(d StatusData) message.View {
 		if src.Status.Detail != "" && src.Err == "" {
 			state += " · " + src.Status.Detail
 		}
-		// NOTE: no indent prefix. Labels draw at a fixed x in a
-		// proportional face, so leading spaces read as a row that failed
-		// to line up rather than as nesting; order already tells the
-		// reader these belong to Availability.
+		// NOTE: no indent prefix — labels draw at a fixed x in a
+		// proportional face, so leading spaces read as a misaligned row,
+		// not nesting; order already ties these to Availability.
 		v.AddRow(src.Name, state)
 	}
 
@@ -226,18 +230,18 @@ func Status(d StatusData) message.View {
 	}
 	v.AddRow("Cache", cache)
 	v.AddRow("Jobs", fmt.Sprintf("%d of %d running", d.ActiveJobs, d.MaxJobs))
-	// Shown only when low — no room in the frame for rows that are always fine.
+	// Shown only when low — no room for rows that are always fine.
 	if d.Report.Disk != health.LevelOK {
 		v.AddRow("Disk free", humanBytes(d.DiskFree)+" (low)")
 	}
-	// Same rule for the resolve budget: shown only once a refusal is
-	// close enough to surprise — prevents an unexplained "Slowing Down".
+	// Same for the resolve budget: shown only once a refusal is close
+	// enough to surprise — prevents an unexplained "Slowing Down".
 	if line, show := budgetSummary(d.Budget); show {
 		v.AddRow("Lookups", line)
 	}
 
-	// The header colour is the only part of this frame readable across
-	// a room, so it tracks the worst metric rather than just the gate.
+	// The header colour is the only part readable across a room, so it
+	// tracks the worst metric, not just the gate.
 	switch {
 	case d.Report.Overall == health.LevelCritical:
 		v.Kind = message.KindError
@@ -274,7 +278,7 @@ func budgetSummary(u throttle.Usage) (string, bool) {
 }
 
 // humanWindow and humanWait render durations the way a person says them
-// (Go's own format, e.g. "10m0s", reads poorly on a status panel).
+// (Go's "10m0s" reads poorly on a status panel).
 func humanWindow(d time.Duration) string {
 	switch {
 	case d == time.Hour:
@@ -414,21 +418,17 @@ func Info(id video.ID, assets []*video.MediaAsset) message.View {
 	return v
 }
 
-// cacheRowsPerPage is the frame's row budget (render.Height / lineH,
-// measured against the real layout). The page indicator goes in the
-// footer rather than the subtitle on purpose: the footer draws at a
-// fixed baseline and so costs no row, while a subtitle would push the
-// budget down to six.
+// cacheRowsPerPage is the frame's row budget (render.Height / lineH). The
+// page indicator goes in the footer, not the subtitle: the footer draws at
+// a fixed baseline and costs no row, while a subtitle would drop the budget
+// to six.
 const cacheRowsPerPage = 8
 
 // CacheList renders the cache contents (spec §4.1.3), largest first --
-// the listing exists to answer "what is filling the cache up", and size
-// is the order that answers it.
-//
-// Anything past one frame is paged across the clip rather than dropped
-// (see message.Deck). maxPages bounds that: past some point the pages
-// turn over too fast to read, and showing fewer is better than showing
-// all of them illegibly, so the footer says what was left out.
+// size is what answers "what is filling the cache up". Overflow is paged
+// across the clip (see message.Deck); maxPages bounds that, since past
+// some point pages turn over too fast to read, and the footer says what
+// was left out.
 func CacheList(items []*video.MediaAsset, maxPages int) message.Deck {
 	if len(items) == 0 {
 		v := message.View{Kind: message.KindStatus, Title: "Cache"}
@@ -440,7 +440,7 @@ func CacheList(items []*video.MediaAsset, maxPages int) message.Deck {
 		maxPages = 1
 	}
 
-	// Sorted on a copy: the slice belongs to the store, not to us.
+	// Sorted on a copy: the slice belongs to the store, not us.
 	sorted := make([]*video.MediaAsset, len(items))
 	copy(sorted, items)
 	sort.SliceStable(sorted, func(i, j int) bool {
@@ -457,10 +457,9 @@ func CacheList(items []*video.MediaAsset, maxPages int) message.Deck {
 	for p := range pages {
 		v := message.View{Kind: message.KindStatus, Title: "Cache"}
 		for _, a := range sorted[p*cacheRowsPerPage : min((p+1)*cacheRowsPerPage, shown)] {
-			// Size leads: it is what the listing is sorted by and what the
-			// reader is comparing. The label column is narrow enough that
-			// this row can truncate, so the order also decides what
-			// survives -- container last, being the least informative.
+			// Size leads: it's the sort order and what the reader compares.
+			// The label column can truncate, so order also decides what
+			// survives -- container last, being least informative.
 			v.AddRow(fmt.Sprintf("%s · %dp %s", humanBytes(a.SizeBytes), a.Height,
 				strings.ToUpper(string(a.Spec.Container))), a.Title)
 		}
@@ -479,27 +478,26 @@ func CacheList(items []*video.MediaAsset, maxPages int) message.Deck {
 
 // progressBucket is the granularity Preparing rounds its numbers to.
 //
-// CRITICAL: every distinct rendering costs an ffmpeg encode (~0.5s) and
-// a cache entry, and a view carrying a live byte count hashes
-// differently on every poll -- so an exact figure would re-encode the
-// frame each time the viewer asks, which is precisely when they can
-// least afford the wait. Ten buckets per job keeps the bar visibly
-// moving while everything in between is a cache hit.
+// CRITICAL: a view carrying a live byte count hashes differently every
+// poll, and each distinct render costs an ffmpeg encode (~0.5s) plus a
+// cache entry -- so an exact figure re-encodes the frame each time the
+// viewer asks, which is when they can least afford the wait. Ten buckets
+// per job keeps the bar visibly moving; everything between is a cache hit.
 const progressBucket = 0.1
 
-// Preparing is shown while a video is still being made ready (spec
-// §4.2.3) -- both by /w and, once PrepareGrace expires, by playback
-// itself. Every figure on it is deliberately coarse; see progressBucket.
+// Preparing is shown while a video is still being made ready (spec §4.2.3)
+// -- by /w and, once PrepareGrace expires, by playback. Every figure is
+// deliberately coarse; see progressBucket.
 func Preparing(title string, spec video.OutputSpec, p video.Progress) message.View {
 	v := message.View{Kind: message.KindProgress, Title: "Preparing Video", Subtitle: title}
 	v.AddRow("Output", fmt.Sprintf("%dp %s", spec.Quality, strings.ToUpper(string(spec.Container))))
-	// Shown explicitly: once download completes, a frozen progress bar
-	// reads as a stall rather than the remux stage it actually is.
+	// Shown explicitly: once download completes, a frozen bar reads as a
+	// stall rather than the remux stage it is.
 	if p.Stage != "" {
 		v.AddRow("Stage", p.Stage)
 	}
-	// Total, not "done / total": the total is fixed once resolved, so it
-	// informs without changing between polls.
+	// Total, not "done / total": fixed once resolved, so it informs
+	// without changing between polls.
 	if p.BytesTotal > 0 {
 		v.AddRow("Size", humanBytes(p.BytesTotal))
 	}
@@ -515,10 +513,8 @@ func Preparing(title string, spec video.OutputSpec, p video.Progress) message.Vi
 	return v
 }
 
-// coarseWait buckets a remaining-time estimate onto a ladder that moves
-// slowly, for the same caching reason as progressBucket -- a figure that
-// ticks every second defeats the render cache and tells the viewer
-// nothing they can act on beyond "wait, or come back later".
+// coarseWait buckets a remaining-time estimate onto a slow-moving ladder,
+// for the same caching reason as progressBucket.
 func coarseWait(d time.Duration) string {
 	switch {
 	case d < time.Minute:
@@ -561,7 +557,7 @@ func humanBytes(n int64) string {
 
 // throttleLines explains a self-imposed refusal; per-video and
 // service-wide scopes need different advice (former is fixed by playing
-// something else, latter isn't).
+// something else).
 func throttleLines(err error) []string {
 	var t *video.ThrottledError
 	if !errors.As(err, &t) {
@@ -584,8 +580,7 @@ func throttleLines(err error) []string {
 	}
 }
 
-// AlreadyWarm reports that /w had nothing to do, which is the answer a
-// viewer actually wants: the video will start instantly.
+// AlreadyWarm reports that /w had nothing to do — the video starts instantly.
 func AlreadyWarm(a *video.MediaAsset) message.View {
 	v := message.View{Kind: message.KindSuccess, Title: "Ready To Play", Subtitle: a.Title}
 	v.AddRow("Output", fmt.Sprintf("%dp %s", a.Height, strings.ToUpper(string(a.Spec.Container))))

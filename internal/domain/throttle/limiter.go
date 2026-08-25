@@ -107,8 +107,8 @@ func (l *Limiter) prune(now time.Time) {
 	}
 }
 
-// after returns the timestamps strictly newer than cut. The slice is
-// appended in order, so a scan from the front is enough.
+// after returns the timestamps strictly newer than cut. Appended in
+// order, so a front scan suffices.
 func after(ts []time.Time, cut time.Time) []time.Time {
 	i := sort.Search(len(ts), func(i int) bool { return ts[i].After(cut) })
 	if i == 0 {

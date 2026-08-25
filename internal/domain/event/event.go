@@ -1,10 +1,9 @@
 // Package event models the small set of occurrences worth surfacing
 // inside VRChat (spec §11).
 //
-// This is not general logging. Structured logs go to stdout for Docker
-// to collect; what lives here is only what /e and /s must be able to
-// answer, because the operator is wearing a headset and cannot read a
-// terminal.
+// Not general logging: structured logs go to stdout. Only what /e and /s
+// must answer lives here, since the operator is in a headset and cannot
+// read a terminal.
 package event
 
 import "time"
@@ -29,10 +28,8 @@ type Event struct {
 	VideoID string    `json:"video_id,omitempty"`
 }
 
-// Log records events and hands back the most recent ones.
-//
-// Retention is bounded and lossy by design: nothing here is worth
-// keeping once it has scrolled past what a message frame can show.
+// Log records events and hands back the most recent ones. Retention is
+// bounded and lossy by design.
 type Log interface {
 	Append(Event)
 	// Recent returns the newest events first. A zero or negative limit

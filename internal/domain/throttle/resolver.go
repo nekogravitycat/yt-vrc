@@ -7,9 +7,9 @@ import (
 	"github.com/nekogravitycat/yt-vrc/internal/domain/video"
 )
 
-// Resolver decorates a port.Resolver with the limiter so every path that
-// reaches YouTube -- viewer request or scheduled probe -- shares one
-// budget, without ytdlp.Resolver itself knowing throttling policy.
+// Resolver decorates a port.Resolver with the limiter so every path to
+// YouTube -- viewer request or scheduled probe -- shares one budget,
+// without ytdlp.Resolver knowing throttling policy.
 type Resolver struct {
 	Next    port.Resolver
 	Limiter *Limiter

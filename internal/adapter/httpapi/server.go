@@ -56,8 +56,8 @@ type Server struct {
 	// AdminIPs restricts side-effecting commands (/on /off /p /d /u
 	// /mode) to these client addresses. Empty means unrestricted.
 	AdminIPs []string
-	// AdminToken is an alternate credential for those same commands,
-	// checked as ?key=... when the address isn't in AdminIPs; empty disables it.
+	// AdminToken is an alternate credential checked as ?key=... when the
+	// address isn't in AdminIPs; empty disables it.
 	AdminToken string
 	// CacheLimitBytes is reported by /s; enforcement lives in the store.
 	CacheLimitBytes int64
@@ -142,18 +142,15 @@ const messagePrefix = "m"
 
 // toolVersionTTL bounds how stale the yt-dlp version reported by /s may be.
 //
-// NOTE: port.ToolchainManager deliberately does NOT cache CurrentVersion
-// -- the binary can change underneath us and the upgrade path must see
-// that. This cache belongs to /s alone. Asking the binary costs a process
-// spawn, ~0.9s for the managed standalone build (which unpacks itself on
-// every invocation), and /s is polled orders of magnitude more often than
-// yt-dlp is replaced; measured against a live deployment that one
-// subprocess was the single largest cost of the endpoint.
+// NOTE: port.ToolchainManager deliberately does NOT cache CurrentVersion --
+// the binary can change underneath us and the upgrade path must see that.
+// This cache belongs to /s alone: asking the binary costs a ~0.9s process
+// spawn (managed standalone unpacks on every call) and /s is polled far
+// more often than yt-dlp is replaced.
 const toolVersionTTL = 60 * time.Second
 
-// toolVersion is CurrentVersion for display purposes only. Concurrent
-// callers share one lookup rather than each spawning a process: a player
-// commonly fetches the same URL twice in a row.
+// toolVersion is CurrentVersion for /s display only, cached so concurrent
+// pollers share one lookup instead of each spawning a process.
 func (s *Server) toolVersion(ctx context.Context) (string, error) {
 	s.verMu.Lock()
 	defer s.verMu.Unlock()
@@ -161,15 +158,14 @@ func (s *Server) toolVersion(ctx context.Context) (string, error) {
 		return s.verVal, s.verErr
 	}
 	v, err := s.Toolchain.CurrentVersion(ctx)
-	// Failures are cached alongside successes: a binary that cannot run
-	// would otherwise spawn a failing process on every single poll.
+	// Cache failures too: a binary that cannot run would otherwise spawn a
+	// failing process on every poll.
 	s.verVal, s.verErr, s.verAt = v, err, time.Now()
 	return v, err
 }
 
 const (
-	// cacheImmutable: video artifacts are content-addressed and never
-	// mutate once complete, so repeat viewers can be served from cache.
+	// cacheImmutable: video artifacts are content-addressed, never mutate.
 	cacheImmutable = "public, max-age=31536000, immutable"
 	// cacheNever: message URLs resolve to different content over time (see slots.go).
 	cacheNever = "no-store"
@@ -188,12 +184,10 @@ func isAssetFile(name string) bool {
 }
 
 // isCacheKeySegment reports whether seg has the shape OutputSpec.CacheKey
-// produces: "{id}_{quality}_{container}". A video ID may itself contain
-// underscores (the id pattern allows them, spec §4.1.1), so this parses
-// from the tail -- quality and container never do -- rather than counting
-// underscores in the whole segment, which undercounts for such an ID and
-// sends its HLS sub-resources (media.m3u8, every .ts segment) through
-// ParsePath instead, where they don't match anything.
+// produces: "{id}_{quality}_{container}". Parses from the tail because a
+// video ID may itself contain underscores (spec §4.1.1); counting
+// underscores instead would misroute an HLS video's sub-resources
+// (media.m3u8, .ts segments) through ParsePath, where they match nothing.
 func isCacheKeySegment(seg string) bool {
 	i := strings.LastIndex(seg, "_")
 	if i < 0 {
@@ -218,7 +212,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 	segs := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 
 	// Rendered message media: /m/{slot}/{file}, falling back to a bare
-	// {hash}_{container} for anything not currently held by a slot (see slots.go).
+	// {hash}_{container} for anything not held by a slot (see slots.go).
 	if len(segs) == 3 && segs[0] == messagePrefix && isAssetFile(segs[2]) {
 		key, stable := s.slotTable().resolve(segs[1])
 		cache := cacheImmutable
@@ -258,17 +252,15 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 // defaultPrepareGrace is the fallback when PrepareGrace is unset.
 const defaultPrepareGrace = 8 * time.Second
 
-// errStillPreparing is not a failure: it reports that the grace period
-// ran out with the job still running, which calls for a progress frame
-// rather than an error one.
+// errStillPreparing is not a failure: the grace period ran out with the
+// job still running, which calls for a progress frame, not an error one.
 var errStillPreparing = errors.New("still preparing")
 
 func (s *Server) serveVideo(w http.ResponseWriter, r *http.Request, route Route) {
 	msgSpec := route.messageSpec(s.Defaults)
 
-	// Checked before the gate: a version swap is a wait-it-out state, and
-	// reporting "offline" instead would send the user to /on to fix
-	// something that isn't broken.
+	// Checked before the gate: an upgrade is a wait-it-out state, and
+	// reporting "offline" would send the user to /on to fix a non-problem.
 	if s.Upgrade != nil {
 		if active, stage := s.Upgrade.Maintenance(); active {
 			st := s.Upgrade.State()
@@ -294,11 +286,9 @@ func (s *Server) serveVideo(w http.ResponseWriter, r *http.Request, route Route)
 		if errors.Is(err, errStillPreparing) {
 			title, p, _ := s.Play.Progress(route.Spec.CacheKey(route.VideoID))
 			s.Log.Info("still preparing", "id", route.VideoID, "stage", p.Stage, "waited", time.Since(started))
-			// The prewarmed deck is a snapshot from a reserve ago, and is
-			// preferred over this fresher reading precisely because it is
-			// already encoded: re-reading progress here would hash to a
-			// frame nobody has drawn yet and put the encode back on the
-			// viewer's clock.
+			// CRITICAL: prefer the prewarmed deck (a snapshot from a reserve
+			// ago) over a fresh progress read -- it is already encoded, so
+			// re-reading here would put the encode back on the viewer's clock.
 			deck := warm
 			if deck == nil {
 				deck = message.One(presenter.Preparing(title, route.Spec, p))
@@ -322,18 +312,15 @@ func (s *Server) serveVideo(w http.ResponseWriter, r *http.Request, route Route)
 	s.serveFrom(w, r, s.Play.Open, asset.Key, "video.mp4", cacheImmutable)
 }
 
-// prepareWithinGrace waits out at most PrepareGrace for a ready artifact,
-// returning it if it landed in time or -- alongside errStillPreparing --
+// prepareWithinGrace waits at most PrepareGrace for a ready artifact,
+// returning it if it lands in time or -- alongside errStillPreparing --
 // the progress frame prewarmed during the wait (see prewarmReserve).
 //
-// CRITICAL: the deadline bounds the *wait*, not the job. Prepare runs its
-// work under context.WithoutCancel, so letting this context expire leaves
-// preparation going for whoever asks next -- which is the entire point. A
-// long video takes minutes to fetch and remux, and a player left without
-// a response for that whole time reports the URL as broken (on the
-// Cloudflare deployment the tunnel gives up at 100s regardless). A
-// progress frame turns that dead wait into something the viewer can see
-// and act on.
+// CRITICAL: the deadline bounds the *wait*, not the job. Prepare runs
+// under context.WithoutCancel, so expiring this context leaves preparation
+// going for the next caller -- the entire point. Without it, a minutes-long
+// fetch+remux leaves the player with no response and it reports the URL as
+// broken (the Cloudflare tunnel gives up at 100s regardless).
 func (s *Server) prepareWithinGrace(r *http.Request, route Route, msgSpec video.OutputSpec) (*video.MediaAsset, message.Deck, error) {
 	grace := s.PrepareGrace
 	if grace <= 0 {
@@ -352,9 +339,9 @@ func (s *Server) prepareWithinGrace(r *http.Request, route Route, msgSpec video.
 		warmMu.Lock()
 		warm = deck
 		warmMu.Unlock()
-		// Detached from the wait it runs beside: this render IS the
-		// response the wait is heading for, so the deadline that ends the
-		// wait must not kill it half-encoded.
+		// CRITICAL: detached from the wait it runs beside -- this render IS
+		// the response the wait heads for, so the deadline ending the wait
+		// must not kill it half-encoded.
 		rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), prewarmRenderTimeout)
 		defer rcancel()
 		if _, err := s.Messages.Render(rctx, deck, msgSpec); err != nil {
@@ -367,8 +354,8 @@ func (s *Server) prepareWithinGrace(r *http.Request, route Route, msgSpec video.
 	if err == nil {
 		return asset, nil, nil
 	}
-	// Only our own deadline means "come back later": the caller hanging
-	// up, and the job failing on its own, are both real errors to report.
+	// Only our own deadline means "come back later": the caller hanging up
+	// and the job failing on its own are both real errors to report.
 	if errors.Is(err, context.DeadlineExceeded) && ctx.Err() != nil && r.Context().Err() == nil {
 		warmMu.Lock()
 		defer warmMu.Unlock()
@@ -381,20 +368,15 @@ func (s *Server) prepareWithinGrace(r *http.Request, route Route, msgSpec video.
 // 15s still frame is a second of work, so anything near this is stuck.
 const prewarmRenderTimeout = 30 * time.Second
 
-// prewarmReserve is how much of the grace goes on having the progress
-// frame ready instead of on waiting for the artifact.
+// prewarmReserve is how much of the grace is spent having the progress
+// frame ready instead of waiting for the artifact.
 //
-// CRITICAL: PrepareGrace bounds the *wait*, but the reply that wait ends
-// in costs a message render on top of it -- a PNG draw plus an ffmpeg
-// encode, ~0.6s on an idle box and several times that while the very job
-// being waited on is saturating the CPU, which is exactly when this frame
-// gets asked for. Measured through the tunnel, an 8s grace answered a
-// cold 1h video in 11.1s, past the point a player gives up on a URL. So
-// the frame is snapshotted and encoded a reserve early, in parallel with
-// the rest of the wait, and the deadline finds it already in the message
-// cache. The wait itself is not shortened -- an artifact that lands in
-// the last two seconds still plays, and the spent encode is cached for
-// the next poll either way.
+// CRITICAL: the reply the wait ends in costs a render on top of the wait
+// (~0.6s idle, several times that while the awaited job saturates the CPU
+// -- exactly when it's asked for), so an 8s grace answered a cold 1h video
+// in 11.1s through the tunnel, past where a player gives up. Snapshotting
+// and encoding a reserve early, in parallel, lands it in cache before the
+// deadline without shortening the wait.
 func prewarmReserve(grace time.Duration) time.Duration {
 	const reserve = 2 * time.Second
 	if grace/2 < reserve {
@@ -406,16 +388,15 @@ func prewarmReserve(grace time.Duration) time.Duration {
 // deliver renders a view under a stable slot URL (name identifies the
 // message, e.g. a command or video ID; see slotFor) and serves it.
 //
-// CRITICAL: the real response is always 200/206 via http.ServeContent —
-// code only affects the ?debug=1 text branch. A player won't render a
-// 4xx body, so classification goes to the log and ?debug=1 instead.
+// CRITICAL: the real response is always 200/206 via http.ServeContent;
+// code only affects the ?debug=1 text branch. A player won't render a 4xx
+// body, so classification goes to the log and ?debug=1 instead.
 func (s *Server) deliver(w http.ResponseWriter, r *http.Request, name string, v message.View, spec video.OutputSpec, code int) {
 	s.deliverDeck(w, r, name, message.One(v), spec, code)
 }
 
-// minPageSeconds is the shortest a page of a paged message may hold for.
-// Below this the frames turn over faster than they can be read, so the
-// deck is capped at what fits instead (see presenter.CacheList).
+// minPageSeconds is the shortest a page of a paged message may hold for;
+// below this, frames turn over faster than they can be read.
 const minPageSeconds = 5
 
 // messagePages is how many frames a paged message may use, derived from
@@ -476,12 +457,10 @@ func (s *Server) serveFrom(w http.ResponseWriter, r *http.Request, open opener, 
 	switch {
 	case strings.HasSuffix(name, ".m3u8"):
 		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-		// A playlist is a few hundred bytes of text -- the one asset type
-		// here Cloudflare's edge will recompress on the fly. On a cache
-		// miss that has produced a corrupted stream for the first viewer
-		// (net::ERR_CONTENT_DECODING_FAILED, gone on reload once the
-		// object is cached and served as-is). no-transform opts the whole
-		// class of bug out; compression buys nothing at this size anyway.
+		// CRITICAL: no-transform. A playlist is small text, the one asset
+		// type Cloudflare's edge recompresses on the fly, which has served
+		// a corrupted stream to the first viewer on a cache miss
+		// (net::ERR_CONTENT_DECODING_FAILED). Compression buys nothing here.
 		cacheControl += ", no-transform"
 	case strings.HasSuffix(name, ".ts"):
 		w.Header().Set("Content-Type", "video/mp2t")
@@ -490,8 +469,7 @@ func (s *Server) serveFrom(w http.ResponseWriter, r *http.Request, open opener, 
 	}
 	w.Header().Set("Cache-Control", cacheControl)
 	// ServeContent handles Range, 206 and Content-Length correctly;
-	// hand-rolling those semantics is a known source of player bugs
-	// (spec §4.2.4).
+	// hand-rolling those is a known source of player bugs (spec §4.2.4).
 	http.ServeContent(w, r, name, modTime, f)
 }
 
@@ -548,9 +526,8 @@ func (s *Server) logRequest(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		next.ServeHTTP(w, r)
-		// User-Agent and Range distinguish which component is fetching:
-		// VRChat resolves through yt-dlp before AVPro loads anything, and
-		// the two behave very differently when a stream is rejected.
+		// UA and Range tell apart which component is fetching: VRChat
+		// resolves via yt-dlp before AVPro loads, and they diverge on reject.
 		s.Log.Debug("request",
 			"method", r.Method,
 			"path", r.URL.Path,
@@ -605,9 +582,8 @@ func (s *Server) servePlaylist(w http.ResponseWriter, r *http.Request, open open
 	body := strings.Join(lines, "\n")
 
 	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-	// See the matching comment in serveFrom: a playlist is small text,
-	// the type Cloudflare recompresses on a cache miss, and that has
-	// corrupted the stream for a first-time viewer.
+	// CRITICAL: no-transform — see serveFrom (edge recompression corrupts
+	// the stream on a cache miss).
 	w.Header().Set("Cache-Control", cacheControl+", no-transform")
 	http.ServeContent(w, r, ffmpeg.MasterName, modTime, strings.NewReader(body))
 }

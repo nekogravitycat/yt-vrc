@@ -72,8 +72,7 @@ func (s OutputSpec) FormatSelector() string {
 }
 
 // CacheKey names one packaged artifact. Different qualities and
-// containers are genuinely different artifacts, so each caches
-// separately (spec §4.7.1).
+// containers are distinct artifacts and cache separately (spec §4.7.1).
 type CacheKey string
 
 func (s OutputSpec) CacheKey(id ID) CacheKey {

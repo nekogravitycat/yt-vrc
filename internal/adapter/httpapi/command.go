@@ -17,7 +17,7 @@ import (
 )
 
 // adminCommands mutate state, spend resources, change who is served, or
-// expose internal details (cache contents, error text, per-video status).
+// expose internals (cache contents, error text, per-video status).
 // NOTE: checked independent of /mode — a friend allowed to watch in
 // whitelist mode must not thereby gain purge/mode/info power.
 var adminCommands = map[string]bool{
@@ -31,10 +31,10 @@ var adminCommands = map[string]bool{
 // reachable to fix a wrongly closed gate; warm/refresh are the exception
 // — see Server.warm.
 func (s *Server) serveCommand(w http.ResponseWriter, r *http.Request, route Route) {
-	// CRITICAL: two specs, and they are not interchangeable. spec is what
-	// /w and /r actually prepare -- swapping in the message container
-	// there would warm a variant nobody is going to play. msgSpec is only
-	// ever the container the response frame is delivered as.
+	// CRITICAL: spec and msgSpec are not interchangeable. spec is what /w
+	// and /r actually prepare -- using the message container there would
+	// warm a variant nobody plays. msgSpec is only the response frame's
+	// delivery container.
 	spec := route.Spec
 	msgSpec := route.messageSpec(s.Defaults)
 
@@ -53,7 +53,7 @@ func (s *Server) serveCommand(w http.ResponseWriter, r *http.Request, route Rout
 
 	case "list":
 		// Listed unbounded, then paged: the cap belongs to how many frames
-		// fit in the clip, not to how many the store will hand over.
+		// fit in the clip, not how many the store hands over.
 		s.deliverDeck(w, r, "list", presenter.CacheList(s.Play.Store.List(0), s.messagePages()), msgSpec, http.StatusOK)
 
 	case "errors":
@@ -97,13 +97,13 @@ func (s *Server) serveCommand(w http.ResponseWriter, r *http.Request, route Rout
 }
 
 // warmGrace is how long /w waits to see whether the job fails before
-// answering. Long enough to cover one resolve (Phase 0 median 1.6s), so
-// a bad link is reported as a bad link rather than as "preparing".
+// answering — long enough for one resolve (Phase 0 median 1.6s), so a bad
+// link is reported as such rather than as "preparing".
 const warmGrace = 4 * time.Second
 
-// warm serves /w (prepare ahead of playback) and /r (do it again from
-// scratch). They are one handler because they differ in exactly one
-// step: whether what is already cached is thrown away first.
+// warm serves /w (prepare ahead of playback) and /r (redo from scratch);
+// one handler because they differ in one step: whether the cached variant
+// is thrown away first.
 func (s *Server) warm(w http.ResponseWriter, r *http.Request, route Route, spec, msgSpec video.OutputSpec, refresh bool) {
 	cmd := "warm"
 	if refresh {
@@ -116,9 +116,9 @@ func (s *Server) warm(w http.ResponseWriter, r *http.Request, route Route, spec,
 	}
 
 	// CRITICAL: warm/refresh spend a real yt-dlp resolve against the
-	// outgoing budget, same as serveVideo — without this check, anyone
-	// who knows the domain could call /w on distinct IDs while the gate
-	// is closed and drain the global budget with nobody watching.
+	// outgoing budget, same as serveVideo. Without this check, anyone
+	// knowing the domain could call /w on distinct IDs while the gate is
+	// closed and drain the global budget with nobody watching.
 	if s.Gate != nil {
 		if open, reason := s.Gate.Allow(r.Context(), clientIP(r)); !open {
 			s.Log.Info("gate closed", "id", id, "cmd", cmd, "source", reason.Source)
@@ -131,9 +131,8 @@ func (s *Server) warm(w http.ResponseWriter, r *http.Request, route Route, spec,
 	key := spec.CacheKey(id)
 
 	if refresh {
-		// Drop every cached variant, not just the requested one — a
-		// viewer reaching for /r has no reason to know quality is a
-		// separate cache key.
+		// Drop every cached variant, not just the requested one — a viewer
+		// reaching for /r has no reason to know quality is a separate key.
 		var dropped int
 		for _, a := range s.Play.Store.List(0) {
 			if a.VideoID == id {
@@ -151,8 +150,7 @@ func (s *Server) warm(w http.ResponseWriter, r *http.Request, route Route, spec,
 		return
 	}
 
-	// Already running: report the live job instead of waiting out the
-	// grace period to say nothing.
+	// Already running: report the live job instead of waiting out the grace.
 	if title, p, ok := s.Play.Progress(key); ok {
 		s.deliver(w, r, slot, presenter.Preparing(title, spec, p), msgSpec, http.StatusAccepted)
 		return
@@ -163,8 +161,8 @@ func (s *Server) warm(w http.ResponseWriter, r *http.Request, route Route, spec,
 			s.Log.Info("warmed", "id", id, "key", key, "cmd", cmd)
 			return
 		}
-		// The response has almost certainly gone out by now, so the
-		// event log is the only place this failure can surface.
+		// Response has almost certainly gone out; the event log is the only
+		// place this failure can surface.
 		s.Log.Error("warm failed", "id", id, "key", key, "cmd", cmd, "err", err)
 		s.record(event.Event{Kind: event.KindError, VideoID: id.String(),
 			Summary: presenter.ErrorSummary(err), Detail: err.Error()})
@@ -253,9 +251,9 @@ func (s *Server) thresholds() health.Thresholds {
 	return s.Thresholds
 }
 
-// upgrade handles /u and /u/back (spec §4.5). It answers immediately and
-// lets the work run behind it; re-entering the URL reports progress and
-// then the outcome (see upgrade.State).
+// upgrade handles /u and /u/back (spec §4.5): answers immediately and
+// runs the work behind it; re-entering the URL reports progress then
+// outcome (see upgrade.State).
 func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, route Route, msgSpec video.OutputSpec) {
 	if s.Upgrade == nil {
 		s.deliver(w, r, "upgrade", presenter.NotImplemented("u"), msgSpec, http.StatusNotImplemented)
@@ -283,8 +281,8 @@ func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, route Route, ms
 		s.deliver(w, r, "upgrade", presenter.UpgradeProgress(state, started), msgSpec, http.StatusAccepted)
 		return
 	}
-	// Not running and not started: a recent run's result is still the
-	// most useful thing to show.
+	// Not running and not started: a recent run's result is still the most
+	// useful thing to show.
 	s.deliver(w, r, "upgrade", presenter.UpgradeOutcome(state), msgSpec, http.StatusOK)
 }
 
@@ -311,9 +309,9 @@ func (s *Server) disableGate(w http.ResponseWriter, r *http.Request, msgSpec vid
 	s.deliver(w, r, "disable", presenter.GateReleased(reason), msgSpec, http.StatusOK)
 }
 
-// setMode serves /mode (report the current access mode) and
-// /mode/{default|open|whitelist} (switch it). It is one handler because
-// it differs in exactly one step, the same shape as /w and /r.
+// setMode serves /mode (report current access mode) and
+// /mode/{default|open|whitelist} (switch it); one handler differing in one
+// step, same shape as /w and /r.
 func (s *Server) setMode(w http.ResponseWriter, r *http.Request, route Route, msgSpec video.OutputSpec) {
 	if s.Gate == nil {
 		s.deliver(w, r, "mode", presenter.NotImplemented("mode"), msgSpec, http.StatusNotImplemented)
@@ -407,8 +405,7 @@ func videoIDArg(args []string) (video.ID, error) {
 		if a == "" {
 			continue
 		}
-		// Strip a container extension so /i/{id}.mp4 works like every
-		// other endpoint.
+		// Strip a container extension so /i/{id}.mp4 works like every other endpoint.
 		head, _ := splitExt(a)
 		return video.ParseID(head)
 	}
@@ -439,8 +436,8 @@ func (s *Server) consumePurgeToken(got string) bool {
 	if s.purgeToken == "" || time.Now().After(s.purgeExpiry) {
 		return false
 	}
-	// Case-insensitive: the alphabet is upper-case only, and requiring
-	// the shift key in VR buys nothing.
+	// Case-insensitive: the alphabet is upper-case only, and requiring the
+	// shift key in VR buys nothing.
 	if !strings.EqualFold(got, s.purgeToken) {
 		return false
 	}
